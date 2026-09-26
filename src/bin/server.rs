@@ -8,5 +8,5 @@
 
 fn main() {
     // TODO: Not implemented yet
-    println!("Hello, world!");
+    println!("42");
 }
