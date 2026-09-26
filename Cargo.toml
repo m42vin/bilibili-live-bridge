@@ -2,5 +2,7 @@
 name = "bilibili-live-bridge"
 version = "0.1.0"
 edition = "2024"
+authors = ["Marvine <15258427350@163.com>"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
