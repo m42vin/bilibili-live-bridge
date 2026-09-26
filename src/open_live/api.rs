@@ -103,7 +103,8 @@ impl Client {
 
     /// 用主播身份码开启一场互动。
     ///
-    /// 成功后保存 `game_id`，连接 `wss_link`，并在结束时调用 [`Client::end`]。
+    /// 成功后用 [`crate::open_live::ws::Connection::from_start`] 连接返回的 `wss_link`，
+    /// 并在结束时调用 [`Client::end`]。项目心跳仍然走 [`Client::heartbeat`]。
     #[must_use = "开启失败时需要处理 ApiError"]
     pub async fn start(&self, code: &str) -> Result<StartResult, ApiError> {
         let code = required_text(code, "身份码不能为空")?;

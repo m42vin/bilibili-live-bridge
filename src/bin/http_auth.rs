@@ -1,7 +1,7 @@
 //! 测试 HTTP 鉴权
 //! 通过单次的 HTTP 请求，获取游戏 ID，并进行心跳和结束游戏
 //! 用于测试 HTTP 鉴权是否正常工作
-//! 
+//!
 //! 需要从环境变量读取 `AUTH_CODE` 作为身份码
 
 use bilibili_live_bridge::config::Config;

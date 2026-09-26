@@ -5,3 +5,4 @@
 pub mod api;
 mod auth;
 pub mod error;
+pub mod ws;
