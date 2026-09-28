@@ -1,0 +1,701 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::sync::{mpsc, watch};
+use tokio::time::timeout;
+
+use super::super::platform::{BoxFuture, LiveSocket, Platform};
+use super::{Manager, RecvError};
+use crate::open_live::api::{Anchor, StartResult};
+use crate::open_live::error::{ApiError, ErrorCode};
+use crate::open_live::ws::{Danmaku, InteractionEnd, LiveEvent, WsError};
+use crate::session::SessionError;
+
+const QUIET: Duration = Duration::from_secs(3600);
+const CODE: &str = "super-secret-code";
+
+#[test]
+fn rejects_zero_heartbeat_and_debug_hides_the_access_key() {
+    let api =
+        crate::open_live::api::Client::new("access-key-id-value", "access-key-secret-value", 7)
+            .unwrap();
+    let error = Manager::new(api, Duration::ZERO, Duration::from_secs(20)).unwrap_err();
+    assert_eq!(error.to_string(), "心跳间隔必须大于 0");
+
+    let api =
+        crate::open_live::api::Client::new("access-key-id-value", "access-key-secret-value", 7)
+            .unwrap();
+    let manager = Manager::new(api, Duration::from_secs(20), Duration::from_secs(20)).unwrap();
+    let rendered = format!("{manager:?}");
+    assert!(!rendered.contains("access-key-secret-value"));
+    assert!(!rendered.contains("access-key-id-value"));
+    assert!(!manager.is_shutting_down());
+}
+
+#[tokio::test]
+async fn rejects_blank_identity_code_without_calling_start() {
+    let mock = Mock::new();
+    let manager = manager(&mock, QUIET);
+    let error = manager.attach("  ").await.unwrap_err();
+    assert_eq!(
+        error,
+        SessionError::Invalid {
+            message: "身份码不能为空".to_owned(),
+        }
+    );
+    assert!(mock.start_codes().is_empty());
+}
+
+#[tokio::test]
+async fn same_code_shares_one_upstream_and_fans_events_out() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+
+    let mut first = manager.attach("  super-secret-code  ").await.unwrap();
+    let mut second = manager.attach(CODE).await.unwrap();
+
+    assert_eq!(mock.start_codes(), [CODE.to_owned()]);
+    assert_eq!(first.room_id(), 7);
+    assert_eq!(second.game_id(), "game-1");
+    assert_eq!(first.anchor().room_id, 7);
+    assert_eq!(mock.connections().len(), 1);
+    let rendered = format!("{manager:?} {first:?}");
+    assert!(!rendered.contains(CODE));
+    assert!(!rendered.contains("auth-body"));
+
+    let socket = mock.connection(0);
+    socket.emit(danmaku("hello"));
+    assert_eq!(text(&first.recv().await.unwrap()), "hello");
+    assert_eq!(text(&second.recv().await.unwrap()), "hello");
+    assert!(mock.ends().is_empty());
+    assert!(!socket.is_closed());
+
+    drop(second);
+    socket.emit(danmaku("still-open"));
+    assert_eq!(text(&first.recv().await.unwrap()), "still-open");
+    assert!(mock.ends().is_empty());
+
+    drop(first);
+    mock.wait_ends(1).await;
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+    assert!(socket.is_closed());
+}
+
+#[tokio::test]
+async fn concurrent_attaches_with_the_same_code_start_once() {
+    let mock = Mock::new();
+    mock.hold_starts();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+
+    let first = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    mock.wait_entered(1).await;
+    let second = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::task::yield_now().await;
+            if mock.start_codes().len() > 1 {
+                panic!("同一个身份码发起了两次 start");
+            }
+            if second.is_finished() {
+                panic!("第二路接入在 start 返回前就结束了");
+            }
+            // 给第二路几次调度机会去撞上正在进行的 start。
+            if mock.start_codes().len() == 1 {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                break;
+            }
+        }
+    })
+    .await
+    .expect("second attach did not park");
+    assert!(!second.is_finished());
+
+    mock.release_starts();
+    let (first, second) = timeout(Duration::from_secs(2), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("attach hung");
+    let first = first.unwrap().unwrap();
+    let second = second.unwrap().unwrap();
+    assert_eq!(first.game_id(), "game-1");
+    assert_eq!(second.game_id(), "game-1");
+    assert_eq!(mock.start_codes(), [CODE.to_owned()]);
+    assert_eq!(mock.connections().len(), 1);
+}
+
+#[tokio::test]
+async fn different_codes_for_one_room_share_the_first_session() {
+    let mock = Mock::new();
+    mock.hold_starts();
+    mock.push_ok("game-a", 42);
+    mock.push_ok("game-b", 42);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+
+    let first = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach("code-a").await })
+    };
+    let second = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach("code-b").await })
+    };
+    mock.wait_entered(2).await;
+    mock.release_starts();
+
+    let (first, second) = timeout(Duration::from_secs(2), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("attach hung");
+    let mut first = first.unwrap().unwrap();
+    let mut second = second.unwrap().unwrap();
+    assert_eq!(first.game_id(), second.game_id());
+    assert_eq!(first.room_id(), 42);
+    assert_eq!(mock.connections().len(), 1);
+
+    let winner = first.game_id().to_owned();
+    let loser = if winner == "game-a" {
+        "game-b"
+    } else {
+        "game-a"
+    };
+    assert_eq!(mock.ends(), [loser.to_owned()]);
+
+    mock.connection(0).emit(danmaku("shared"));
+    assert_eq!(text(&first.recv().await.unwrap()), "shared");
+    assert_eq!(text(&second.recv().await.unwrap()), "shared");
+
+    drop(first);
+    drop(second);
+    mock.wait_ends(2).await;
+    assert!(mock.ends().contains(&"game-a".to_owned()));
+    assert!(mock.ends().contains(&"game-b".to_owned()));
+}
+
+#[tokio::test]
+async fn interaction_end_is_delivered_and_closes_the_session() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let mut sub = manager.attach(CODE).await.unwrap();
+
+    mock.connection(0)
+        .emit(LiveEvent::InteractionEnd(InteractionEnd {
+            game_id: "game-1".to_owned(),
+            timestamp: 10,
+        }));
+
+    match &*sub.recv().await.unwrap() {
+        LiveEvent::InteractionEnd(end) => assert_eq!(end.game_id, "game-1"),
+        other => panic!("unexpected event {other:?}"),
+    }
+    assert_eq!(sub.recv().await.unwrap_err(), RecvError::Closed);
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+    assert!(mock.connection(0).is_closed());
+}
+
+#[tokio::test]
+async fn upstream_close_ends_the_session() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let mut sub = manager.attach(CODE).await.unwrap();
+
+    mock.connection(0).hangup();
+    assert_eq!(sub.recv().await.unwrap_err(), RecvError::Closed);
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+    assert!(mock.connection(0).is_closed());
+}
+
+#[tokio::test]
+async fn platform_heartbeat_error_ends_the_session() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    mock.fail_heartbeats_with_platform();
+    let manager = manager(&mock, Duration::from_millis(20));
+    let mut sub = manager.attach(CODE).await.unwrap();
+
+    assert_eq!(sub.recv().await.unwrap_err(), RecvError::Closed);
+    assert_eq!(mock.heartbeats(), ["game-1".to_owned()]);
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+}
+
+#[tokio::test]
+async fn repeated_transport_heartbeat_errors_end_the_session() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    mock.fail_heartbeats_with_transport();
+    let manager = manager(&mock, Duration::from_millis(20));
+    let mut sub = manager.attach(CODE).await.unwrap();
+
+    assert_eq!(
+        timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("heartbeat did not close the session")
+            .unwrap_err(),
+        RecvError::Closed
+    );
+    assert_eq!(mock.heartbeats().len(), 3);
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+}
+
+#[tokio::test]
+async fn start_error_does_not_end_and_can_be_retried() {
+    let mock = Mock::new();
+    mock.push_start(Err(ApiError::Platform {
+        code: ErrorCode::IdentityCode,
+        message: "身份码错误".to_owned(),
+        request_id: Some("req-1".to_owned()),
+    }));
+    let manager = manager(&mock, QUIET);
+    let error = manager.attach(CODE).await.unwrap_err();
+    assert_eq!(error.platform_code(), Some(ErrorCode::IdentityCode));
+    assert!(error.to_string().contains("7007"));
+    assert!(mock.ends().is_empty());
+    assert!(mock.connections().is_empty());
+
+    mock.push_ok("game-2", 9);
+    mock.push_connect_ok();
+    let sub = manager.attach(CODE).await.unwrap();
+    assert_eq!(sub.game_id(), "game-2");
+    assert_eq!(sub.room_id(), 9);
+}
+
+#[tokio::test]
+async fn connect_error_ends_the_game_and_reports_a_failed_end() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_err("官方长连接全部失败");
+    mock.fail_end();
+    let manager = manager(&mock, QUIET);
+    let error = manager.attach(CODE).await.unwrap_err();
+    let rendered = error.to_string();
+    assert!(rendered.contains("官方长连接全部失败"), "{rendered}");
+    assert!(rendered.contains("关闭场次失败"), "{rendered}");
+    assert!(mock.ends().is_empty());
+    assert_eq!(mock.end_attempts(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_during_start_ends_the_game_and_rejects_new_attaches() {
+    let mock = Mock::new();
+    mock.hold_starts();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let attach = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    mock.wait_entered(1).await;
+
+    let shutdown = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.shutdown().await })
+    };
+    timeout(Duration::from_secs(2), async {
+        while !manager.is_shutting_down() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown did not start");
+
+    mock.release_starts();
+    let error = timeout(Duration::from_secs(2), attach)
+        .await
+        .expect("attach hung")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error, SessionError::ShuttingDown);
+    timeout(Duration::from_secs(2), shutdown)
+        .await
+        .expect("shutdown hung")
+        .unwrap();
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+    assert!(mock.connections().is_empty());
+
+    let error = manager.attach("other-code").await.unwrap_err();
+    assert_eq!(error, SessionError::ShuttingDown);
+}
+
+#[tokio::test]
+async fn next_attach_waits_until_the_previous_game_ends() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_ok("game-2", 7);
+    mock.push_connect_ok();
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let sub = manager.attach(CODE).await.unwrap();
+    mock.hold_end();
+    drop(sub);
+
+    let next = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    mock.wait_end_entered(1).await;
+    timeout(Duration::from_millis(200), async {
+        while mock.start_codes().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect_err("second start ran before the first game ended");
+    assert_eq!(mock.start_codes(), [CODE.to_owned()]);
+
+    mock.release_end();
+    let sub = timeout(Duration::from_secs(2), next)
+        .await
+        .expect("second attach hung")
+        .unwrap()
+        .unwrap();
+    assert_eq!(sub.game_id(), "game-2");
+    assert_eq!(mock.start_codes(), [CODE.to_owned(), CODE.to_owned()]);
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+}
+
+fn manager(mock: &Arc<Mock>, app_heartbeat: Duration) -> Manager {
+    let mock = Arc::clone(mock);
+    let platform: Arc<dyn Platform> = mock;
+    Manager::from_platform(platform, app_heartbeat, 16)
+}
+
+fn danmaku(msg: &str) -> LiveEvent {
+    LiveEvent::Danmaku(Danmaku {
+        msg: msg.to_owned(),
+        room_id: 7,
+        ..Danmaku::default()
+    })
+}
+
+fn text(event: &LiveEvent) -> &str {
+    match event {
+        LiveEvent::Danmaku(danmaku) => &danmaku.msg,
+        other => panic!("unexpected event {other:?}"),
+    }
+}
+
+fn room(game_id: &str, room_id: i64) -> StartResult {
+    StartResult::from_parts(
+        game_id,
+        "auth-body",
+        vec!["wss://example.invalid/live".to_owned()],
+        Anchor {
+            room_id,
+            uname: "anchor".to_owned(),
+            uface: String::new(),
+            uid: 1,
+            open_id: "anchor-open".to_owned(),
+            union_id: String::new(),
+        },
+    )
+}
+
+struct Mock {
+    inner: Mutex<MockInner>,
+    entered: watch::Sender<usize>,
+    start_gate: watch::Sender<bool>,
+    hold_starts: AtomicBool,
+    end_gate: watch::Sender<bool>,
+    hold_end: AtomicBool,
+    end_entered: AtomicUsize,
+    fail_end: AtomicBool,
+}
+
+struct MockInner {
+    starts: VecDeque<Result<StartResult, ApiError>>,
+    connects: VecDeque<ConnectPlan>,
+    connections: Vec<TestConn>,
+    start_codes: Vec<String>,
+    heartbeats: Vec<String>,
+    heartbeat_mode: HeartbeatMode,
+    ends: Vec<String>,
+}
+
+enum ConnectPlan {
+    Ok,
+    Err(String),
+}
+
+#[derive(Clone, Copy)]
+enum HeartbeatMode {
+    Ok,
+    Platform,
+    Unavailable,
+}
+
+#[derive(Clone)]
+struct TestConn {
+    tx: mpsc::UnboundedSender<Option<LiveEvent>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl TestConn {
+    fn emit(&self, event: LiveEvent) {
+        self.tx
+            .send(Some(event))
+            .expect("session dropped the socket");
+    }
+
+    fn hangup(&self) {
+        self.tx.send(None).expect("session dropped the socket");
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+struct MockSocket {
+    incoming: mpsc::UnboundedReceiver<Option<LiveEvent>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl Mock {
+    fn new() -> Arc<Self> {
+        let (entered, _) = watch::channel(0);
+        let (start_gate, _) = watch::channel(false);
+        let (end_gate, _) = watch::channel(false);
+        Arc::new(Self {
+            inner: Mutex::new(MockInner {
+                starts: VecDeque::new(),
+                connects: VecDeque::new(),
+                connections: Vec::new(),
+                start_codes: Vec::new(),
+                heartbeats: Vec::new(),
+                heartbeat_mode: HeartbeatMode::Ok,
+                ends: Vec::new(),
+            }),
+            entered,
+            start_gate,
+            hold_starts: AtomicBool::new(false),
+            end_gate,
+            hold_end: AtomicBool::new(false),
+            end_entered: AtomicUsize::new(0),
+            fail_end: AtomicBool::new(false),
+        })
+    }
+
+    fn hold_starts(&self) {
+        self.hold_starts.store(true, Ordering::SeqCst);
+    }
+
+    fn release_starts(&self) {
+        self.start_gate.send(true).expect("start gate closed");
+    }
+
+    fn hold_end(&self) {
+        self.hold_end.store(true, Ordering::SeqCst);
+    }
+
+    fn release_end(&self) {
+        self.end_gate.send(true).expect("end gate closed");
+    }
+
+    fn fail_end(&self) {
+        self.fail_end.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_heartbeats_with_platform(&self) {
+        super::lock(&self.inner).heartbeat_mode = HeartbeatMode::Platform;
+    }
+
+    fn fail_heartbeats_with_transport(&self) {
+        super::lock(&self.inner).heartbeat_mode = HeartbeatMode::Unavailable;
+    }
+
+    fn push_ok(&self, game_id: &str, room_id: i64) {
+        self.push_start(Ok(room(game_id, room_id)));
+    }
+
+    fn push_start(&self, result: Result<StartResult, ApiError>) {
+        super::lock(&self.inner).starts.push_back(result);
+    }
+
+    fn push_connect_ok(&self) {
+        super::lock(&self.inner).connects.push_back(ConnectPlan::Ok);
+    }
+
+    fn push_connect_err(&self, message: impl Into<String>) {
+        super::lock(&self.inner)
+            .connects
+            .push_back(ConnectPlan::Err(message.into()));
+    }
+
+    fn start_codes(&self) -> Vec<String> {
+        super::lock(&self.inner).start_codes.clone()
+    }
+
+    fn ends(&self) -> Vec<String> {
+        super::lock(&self.inner).ends.clone()
+    }
+
+    fn heartbeats(&self) -> Vec<String> {
+        super::lock(&self.inner).heartbeats.clone()
+    }
+
+    fn connections(&self) -> Vec<TestConn> {
+        super::lock(&self.inner).connections.clone()
+    }
+
+    fn connection(&self, index: usize) -> TestConn {
+        self.connections()
+            .into_iter()
+            .nth(index)
+            .expect("missing connection")
+    }
+
+    fn end_attempts(&self) -> usize {
+        self.end_entered.load(Ordering::SeqCst)
+    }
+
+    async fn wait_entered(&self, count: usize) {
+        let mut entered = self.entered.subscribe();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if *entered.borrow() >= count {
+                    return;
+                }
+                entered.changed().await.expect("entered closed");
+            }
+        })
+        .await
+        .expect("start did not begin");
+    }
+
+    async fn wait_end_entered(&self, count: usize) {
+        timeout(Duration::from_secs(2), async {
+            while self.end_entered.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("end did not begin");
+    }
+
+    async fn wait_ends(&self, count: usize) {
+        timeout(Duration::from_secs(2), async {
+            while self.ends().len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("end was not called");
+    }
+}
+
+impl Platform for Mock {
+    fn start<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<StartResult, ApiError>> {
+        Box::pin(async move {
+            let result = {
+                let mut inner = super::lock(&self.inner);
+                inner.start_codes.push(code.to_owned());
+                inner.starts.pop_front().expect("unexpected start")
+            };
+            self.entered.send_modify(|count| *count += 1);
+            if self.hold_starts.load(Ordering::SeqCst) {
+                let mut gate = self.start_gate.subscribe();
+                while !*gate.borrow() {
+                    gate.changed().await.expect("start gate closed");
+                }
+            }
+            result
+        })
+    }
+
+    fn heartbeat<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async move {
+            let mode = {
+                let mut inner = super::lock(&self.inner);
+                inner.heartbeats.push(game_id.to_owned());
+                inner.heartbeat_mode
+            };
+            match mode {
+                HeartbeatMode::Ok => Ok(()),
+                HeartbeatMode::Platform => Err(ApiError::Platform {
+                    code: ErrorCode::HeartbeatExpired,
+                    message: "心跳过期".to_owned(),
+                    request_id: None,
+                }),
+                HeartbeatMode::Unavailable => Err(ApiError::Status { status: 503 }),
+            }
+        })
+    }
+
+    fn end<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async move {
+            self.end_entered.fetch_add(1, Ordering::SeqCst);
+            if self.hold_end.load(Ordering::SeqCst) {
+                let mut gate = self.end_gate.subscribe();
+                while !*gate.borrow() {
+                    gate.changed().await.expect("end gate closed");
+                }
+            }
+            if self.fail_end.load(Ordering::SeqCst) {
+                return Err(ApiError::Status { status: 500 });
+            }
+            super::lock(&self.inner).ends.push(game_id.to_owned());
+            Ok(())
+        })
+    }
+
+    fn connect<'a>(
+        &'a self,
+        _started: &'a StartResult,
+    ) -> BoxFuture<'a, Result<Box<dyn LiveSocket>, WsError>> {
+        Box::pin(async move {
+            let plan = super::lock(&self.inner)
+                .connects
+                .pop_front()
+                .expect("unexpected connect");
+            match plan {
+                ConnectPlan::Err(message) => Err(WsError::Connect { message }),
+                ConnectPlan::Ok => {
+                    let (tx, incoming) = mpsc::unbounded_channel();
+                    let closed = Arc::new(AtomicBool::new(false));
+                    super::lock(&self.inner).connections.push(TestConn {
+                        tx,
+                        closed: Arc::clone(&closed),
+                    });
+                    let socket: Box<dyn LiveSocket> = Box::new(MockSocket { incoming, closed });
+                    Ok(socket)
+                }
+            }
+        })
+    }
+}
+
+impl LiveSocket for MockSocket {
+    fn recv(&mut self) -> BoxFuture<'_, Result<Option<LiveEvent>, WsError>> {
+        Box::pin(async move { Ok(self.incoming.recv().await.unwrap_or_default()) })
+    }
+
+    fn close(&mut self) -> BoxFuture<'_, Result<(), WsError>> {
+        Box::pin(async move {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}

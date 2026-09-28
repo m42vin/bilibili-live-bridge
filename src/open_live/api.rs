@@ -247,6 +247,21 @@ impl StartResult {
     pub fn anchor(&self) -> &Anchor {
         &self.anchor
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        game_id: impl Into<String>,
+        auth_body: impl Into<String>,
+        wss_link: Vec<String>,
+        anchor: Anchor,
+    ) -> Self {
+        Self {
+            game_id: game_id.into(),
+            auth_body: auth_body.into(),
+            wss_link,
+            anchor,
+        }
+    }
 }
 
 impl fmt::Debug for StartResult {
