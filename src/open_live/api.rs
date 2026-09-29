@@ -311,6 +311,11 @@ impl BatchHeartbeatResult {
     pub fn all_succeeded(&self) -> bool {
         self.failed_game_ids.is_empty()
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_failed(failed_game_ids: Vec<String>) -> Self {
+        Self { failed_game_ids }
+    }
 }
 
 #[derive(Serialize)]

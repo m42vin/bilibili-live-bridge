@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use super::super::platform::{BoxFuture, LiveSocket, Platform};
 use super::{Manager, RecvError};
-use crate::open_live::api::{Anchor, StartResult};
+use crate::open_live::api::{Anchor, BatchHeartbeatResult, StartResult};
 use crate::open_live::error::{ApiError, ErrorCode};
 use crate::open_live::ws::{Danmaku, InteractionEnd, LiveEvent, WsError};
 use crate::session::SessionError;
@@ -260,6 +260,49 @@ async fn repeated_transport_heartbeat_errors_end_the_session() {
 }
 
 #[tokio::test]
+async fn two_rooms_share_one_batch_heartbeat() {
+    let mock = Mock::new();
+    mock.push_ok("game-a", 1);
+    mock.push_ok("game-b", 2);
+    mock.push_connect_ok();
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let _first = manager.attach("code-a").await.unwrap();
+    let _second = manager.attach("code-b").await.unwrap();
+
+    manager.beat_once().await;
+
+    let batches = mock.batches();
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    let mut ids = batches[0].clone();
+    ids.sort();
+    assert_eq!(ids, ["game-a".to_owned(), "game-b".to_owned()]);
+    assert!(mock.ends().is_empty());
+}
+
+#[tokio::test]
+async fn failed_game_id_closes_only_that_session() {
+    let mock = Mock::new();
+    mock.push_ok("game-a", 1);
+    mock.push_ok("game-b", 2);
+    mock.push_connect_ok();
+    mock.push_connect_ok();
+    mock.fail_game_ids(&["game-a"]);
+    let manager = manager(&mock, QUIET);
+    let mut closed = manager.attach("code-a").await.unwrap();
+    let mut live = manager.attach("code-b").await.unwrap();
+
+    manager.beat_once().await;
+
+    assert_eq!(closed.recv().await.unwrap_err(), RecvError::Closed);
+    assert_eq!(mock.ends(), ["game-a".to_owned()]);
+    mock.connection(1).emit(danmaku("still-live"));
+    assert_eq!(text(&live.recv().await.unwrap()), "still-live");
+    assert!(mock.ends().contains(&"game-a".to_owned()));
+    assert!(!mock.ends().contains(&"game-b".to_owned()));
+}
+
+#[tokio::test]
 async fn start_error_does_not_end_and_can_be_retried() {
     let mock = Mock::new();
     mock.push_start(Err(ApiError::Platform {
@@ -429,7 +472,8 @@ struct MockInner {
     connects: VecDeque<ConnectPlan>,
     connections: Vec<TestConn>,
     start_codes: Vec<String>,
-    heartbeats: Vec<String>,
+    batches: Vec<Vec<String>>,
+    failed_ids: Vec<String>,
     heartbeat_mode: HeartbeatMode,
     ends: Vec<String>,
 }
@@ -484,7 +528,8 @@ impl Mock {
                 connects: VecDeque::new(),
                 connections: Vec::new(),
                 start_codes: Vec::new(),
-                heartbeats: Vec::new(),
+                batches: Vec::new(),
+                failed_ids: Vec::new(),
                 heartbeat_mode: HeartbeatMode::Ok,
                 ends: Vec::new(),
             }),
@@ -519,7 +564,18 @@ impl Mock {
     }
 
     fn fail_heartbeats_with_platform(&self) {
-        super::lock(&self.inner).heartbeat_mode = HeartbeatMode::Platform;
+        let mut inner = super::lock(&self.inner);
+        inner.heartbeat_mode = HeartbeatMode::Platform;
+        inner.failed_ids.clear();
+    }
+
+    fn fail_game_ids(&self, game_ids: &[&str]) {
+        let mut inner = super::lock(&self.inner);
+        inner.heartbeat_mode = HeartbeatMode::Platform;
+        inner.failed_ids = game_ids
+            .iter()
+            .map(|game_id| (*game_id).to_owned())
+            .collect();
     }
 
     fn fail_heartbeats_with_transport(&self) {
@@ -553,7 +609,16 @@ impl Mock {
     }
 
     fn heartbeats(&self) -> Vec<String> {
-        super::lock(&self.inner).heartbeats.clone()
+        super::lock(&self.inner)
+            .batches
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn batches(&self) -> Vec<Vec<String>> {
+        super::lock(&self.inner).batches.clone()
     }
 
     fn connections(&self) -> Vec<TestConn> {
@@ -625,20 +690,30 @@ impl Platform for Mock {
         })
     }
 
-    fn heartbeat<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>> {
+    fn batch_heartbeat<'a>(
+        &'a self,
+        game_ids: &'a [String],
+    ) -> BoxFuture<'a, Result<BatchHeartbeatResult, ApiError>> {
         Box::pin(async move {
-            let mode = {
+            let (mode, failed_ids) = {
                 let mut inner = super::lock(&self.inner);
-                inner.heartbeats.push(game_id.to_owned());
-                inner.heartbeat_mode
+                inner.batches.push(game_ids.to_vec());
+                (inner.heartbeat_mode, inner.failed_ids.clone())
             };
             match mode {
-                HeartbeatMode::Ok => Ok(()),
-                HeartbeatMode::Platform => Err(ApiError::Platform {
-                    code: ErrorCode::HeartbeatExpired,
-                    message: "心跳过期".to_owned(),
-                    request_id: None,
-                }),
+                HeartbeatMode::Ok => Ok(BatchHeartbeatResult::from_failed(Vec::new())),
+                HeartbeatMode::Platform => {
+                    let failed = if failed_ids.is_empty() {
+                        game_ids.to_vec()
+                    } else {
+                        game_ids
+                            .iter()
+                            .filter(|game_id| failed_ids.contains(game_id))
+                            .cloned()
+                            .collect()
+                    };
+                    Ok(BatchHeartbeatResult::from_failed(failed))
+                }
                 HeartbeatMode::Unavailable => Err(ApiError::Status { status: 503 }),
             }
         })

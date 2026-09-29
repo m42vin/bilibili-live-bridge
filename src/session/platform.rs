@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::open_live::api::{Client, StartResult};
+use crate::open_live::api::{BatchHeartbeatResult, Client, StartResult};
 use crate::open_live::error::ApiError;
 use crate::open_live::ws::{Connection, LiveEvent, WsError};
 
@@ -15,7 +15,10 @@ pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub(super) trait Platform: Send + Sync + 'static {
     fn start<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<StartResult, ApiError>>;
-    fn heartbeat<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>>;
+    fn batch_heartbeat<'a>(
+        &'a self,
+        game_ids: &'a [String],
+    ) -> BoxFuture<'a, Result<BatchHeartbeatResult, ApiError>>;
     fn end<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>>;
     fn connect<'a>(
         &'a self,
@@ -47,8 +50,15 @@ impl Platform for LivePlatform {
         Box::pin(self.api.start(code))
     }
 
-    fn heartbeat<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>> {
-        Box::pin(self.api.heartbeat(game_id))
+    fn batch_heartbeat<'a>(
+        &'a self,
+        game_ids: &'a [String],
+    ) -> BoxFuture<'a, Result<BatchHeartbeatResult, ApiError>> {
+        Box::pin(async move {
+            self.api
+                .batch_heartbeat(game_ids.iter().map(String::as_str))
+                .await
+        })
     }
 
     fn end<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>> {

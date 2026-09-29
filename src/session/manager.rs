@@ -33,7 +33,7 @@ pub struct Manager {
 impl Manager {
     /// 用已经构造好的应用 API 客户端创建会话管理器。
     ///
-    /// `websocket_heartbeat` 传给官方长连接，`app_heartbeat` 是 `/v2/app/heartbeat` 的间隔。
+    /// `websocket_heartbeat` 传给官方长连接，`app_heartbeat` 是 `/v2/app/batchHeartbeat` 的间隔。
     /// 两个间隔都必须大于 0。
     #[must_use = "创建失败时需要处理 SessionError"]
     pub fn new(
@@ -77,7 +77,7 @@ impl Manager {
         }
     }
 
-    /// 关闭全部会话，并等待每一场都调用完 `/v2/app/end`。
+    /// 停止批量心跳，关闭全部会话，并等待每一场都调用完 `/v2/app/end`。
     ///
     /// 返回之后，新的 [`Manager::attach`] 得到 [`SessionError::ShuttingDown`]。
     /// 可以再次调用；已经结束的会话不会再关闭一次。
@@ -107,6 +107,11 @@ impl Manager {
                     by_room: HashMap::new(),
                 }),
                 shutdown: AtomicBool::new(false),
+                beats: Mutex::new(HashMap::new()),
+                heartbeat_started: Mutex::new(false),
+                heartbeat_stop: Stop::new(),
+                heartbeat_finished: AtomicBool::new(false),
+                heartbeat_done: Notify::new(),
             }),
         }
     }
@@ -119,6 +124,11 @@ impl Manager {
     ) -> Self {
         assert!(event_capacity > 0, "事件缓冲至少为 1");
         Self::from_parts(platform, app_heartbeat, event_capacity)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn beat_once(&self) {
+        pump(&self.state).await;
     }
 }
 
@@ -231,6 +241,16 @@ struct State {
     event_capacity: usize,
     tables: Mutex<Tables>,
     shutdown: AtomicBool,
+    beats: Mutex<HashMap<String, BeatSlot>>,
+    heartbeat_started: Mutex<bool>,
+    heartbeat_stop: Stop,
+    heartbeat_finished: AtomicBool,
+    heartbeat_done: Notify,
+}
+
+struct BeatSlot {
+    session: Weak<Session>,
+    transport_failures: u8,
 }
 
 struct Tables {
@@ -394,6 +414,7 @@ impl State {
             self.shutdown.store(true, Ordering::SeqCst);
             snapshot(&tables)
         };
+        self.stop_heartbeat().await;
         for session in &sessions {
             session.begin_close();
         }
@@ -422,6 +443,66 @@ impl State {
                 tables.by_code.remove(code);
             }
         }
+    }
+
+    fn register_beat(self: &Arc<Self>, game_id: &str, session: &Arc<Session>) {
+        lock(&self.beats).insert(
+            game_id.to_owned(),
+            BeatSlot {
+                session: Arc::downgrade(session),
+                transport_failures: 0,
+            },
+        );
+        self.ensure_heartbeat();
+    }
+
+    fn unregister_beat(&self, game_id: &str) {
+        lock(&self.beats).remove(game_id);
+    }
+
+    fn ensure_heartbeat(self: &Arc<Self>) {
+        let mut started = lock(&self.heartbeat_started);
+        if self.shutdown.load(Ordering::SeqCst) || *started {
+            return;
+        }
+        *started = true;
+        let weak = Arc::downgrade(self);
+        let stop = self.heartbeat_stop.clone();
+        let every = self.app_heartbeat;
+        tokio::spawn(async move {
+            run_heartbeats(weak, stop, every).await;
+        });
+    }
+
+    async fn stop_heartbeat(&self) {
+        let started = {
+            let started = lock(&self.heartbeat_started);
+            self.heartbeat_stop.cancel();
+            if *started {
+                true
+            } else {
+                self.mark_heartbeat_finished();
+                false
+            }
+        };
+        if started {
+            self.until_heartbeat_finished().await;
+        }
+    }
+
+    fn mark_heartbeat_finished(&self) {
+        self.heartbeat_finished.store(true, Ordering::SeqCst);
+        self.heartbeat_done.notify_waiters();
+    }
+
+    async fn until_heartbeat_finished(&self) {
+        let notified = self.heartbeat_done.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        if self.heartbeat_finished.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -520,15 +601,9 @@ fn spawn_upstream(
     events: broadcast::Sender<Arc<LiveEvent>>,
     game_id: String,
 ) {
-    let app_heartbeat = state.app_heartbeat;
-    let stop = session.stop.clone();
-    let heartbeat_state = Arc::clone(&state);
-    let heartbeat_game = game_id.clone();
+    state.register_beat(&game_id, &session);
     tokio::spawn(async move {
-        // 项目心跳放在另一边，避免每 20 秒取消一次 `Connection::recv`。
-        // `recv` 只在会话停止时被打断，此时连接马上就要关掉。
-        let heartbeat = tokio::spawn(beat(heartbeat_state, stop, heartbeat_game, app_heartbeat));
-
+        // 项目心跳在管理器的批量任务里发送，这里只在会话停止时打断 `recv`。
         loop {
             tokio::select! {
                 biased;
@@ -549,7 +624,6 @@ fn spawn_upstream(
 
         session.begin_close();
         session.stop.cancel();
-        let _ = heartbeat.await;
         let _ = socket.close().await;
         let _ = state.platform.end(&game_id).await;
         state.unlink(&session);
@@ -558,36 +632,6 @@ fn spawn_upstream(
         drop(events);
         session.mark_finished();
     });
-}
-
-async fn beat(state: Arc<State>, stop: Stop, game_id: String, every: Duration) {
-    let mut ticker = interval(every);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // `start` 刚刚成功，第一次项目心跳等一个完整间隔。
-    ticker.tick().await;
-    let mut transport_failures = 0u8;
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => return,
-            _ = ticker.tick() => {
-                match state.platform.heartbeat(&game_id).await {
-                    Ok(()) => transport_failures = 0,
-                    Err(error) if error.platform_code().is_some() => {
-                        stop.cancel();
-                        return;
-                    }
-                    Err(_) => {
-                        transport_failures = transport_failures.saturating_add(1);
-                        if transport_failures >= HEARTBEAT_TRANSPORT_LIMIT {
-                            stop.cancel();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 struct Session {
@@ -730,6 +774,24 @@ impl Session {
     fn begin_close(&self) {
         lock(&self.subscribers).closing = true;
         self.stop.cancel();
+        self.leave_heartbeat();
+    }
+
+    fn leave_heartbeat(&self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some(game_id) = self.game_id() else {
+            return;
+        };
+        state.unregister_beat(&game_id);
+    }
+
+    fn game_id(&self) -> Option<String> {
+        match &*self.phase.borrow() {
+            Phase::Ready { game_id, .. } => Some(game_id.clone()),
+            _ => None,
+        }
     }
 
     fn fail(self: &Arc<Self>, error: SessionError) {
@@ -784,6 +846,10 @@ impl Stop {
         self.0.notify.notify_waiters();
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
     async fn cancelled(&self) {
         let notified = self.0.notify.notified();
         let mut notified = std::pin::pin!(notified);
@@ -792,6 +858,132 @@ impl Stop {
             return;
         }
         notified.await;
+    }
+}
+
+#[derive(Clone)]
+struct PendingBeat {
+    game_id: String,
+    session: Weak<Session>,
+}
+
+async fn run_heartbeats(state: Weak<State>, stop: Stop, every: Duration) {
+    let mut ticker = interval(every);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut armed = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => {
+                finish_heartbeats(&state);
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+        let Some(current) = state.upgrade() else {
+            return;
+        };
+        if current.heartbeat_stop.is_cancelled() {
+            current.mark_heartbeat_finished();
+            return;
+        }
+        // `interval` 的第一次 tick 会立刻就绪。先把它丢掉，让刚开启的场次等满一个间隔。
+        if !armed {
+            armed = true;
+            continue;
+        }
+        pump(&current).await;
+        if current.heartbeat_stop.is_cancelled() {
+            current.mark_heartbeat_finished();
+            return;
+        }
+    }
+}
+
+fn finish_heartbeats(state: &Weak<State>) {
+    if let Some(state) = state.upgrade() {
+        state.mark_heartbeat_finished();
+    }
+}
+
+async fn pump(state: &State) {
+    let pending: Vec<PendingBeat> = {
+        let beats = lock(&state.beats);
+        beats
+            .iter()
+            .map(|(game_id, slot)| PendingBeat {
+                game_id: game_id.clone(),
+                session: slot.session.clone(),
+            })
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    for chunk in pending.chunks(api::MAX_BATCH_HEARTBEAT) {
+        let current: Vec<PendingBeat> = {
+            let beats = lock(&state.beats);
+            chunk
+                .iter()
+                .filter(|beat| {
+                    beats
+                        .get(&beat.game_id)
+                        .is_some_and(|slot| Weak::ptr_eq(&slot.session, &beat.session))
+                })
+                .cloned()
+                .collect()
+        };
+        if current.is_empty() {
+            continue;
+        }
+        dispatch_chunk(state, &current).await;
+    }
+}
+
+async fn dispatch_chunk(state: &State, chunk: &[PendingBeat]) {
+    let game_ids: Vec<String> = chunk.iter().map(|beat| beat.game_id.clone()).collect();
+    let failed = match state.platform.batch_heartbeat(&game_ids).await {
+        Ok(result) => Some(
+            result
+                .failed_game_ids()
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+        ),
+        Err(error) if error.platform_code().is_some() => Some(game_ids.iter().cloned().collect()),
+        Err(_) => None,
+    };
+    let mut closing = Vec::new();
+    {
+        let mut beats = lock(&state.beats);
+        for beat in chunk {
+            let Some(slot) = beats.get_mut(&beat.game_id) else {
+                continue;
+            };
+            if !Weak::ptr_eq(&slot.session, &beat.session) {
+                continue;
+            }
+            let close = match &failed {
+                Some(failed) => failed.contains(&beat.game_id),
+                None => {
+                    slot.transport_failures = slot.transport_failures.saturating_add(1);
+                    slot.transport_failures >= HEARTBEAT_TRANSPORT_LIMIT
+                }
+            };
+            if close {
+                closing.push((beat.game_id.clone(), beat.session.clone()));
+            } else if failed.is_some() {
+                slot.transport_failures = 0;
+            }
+        }
+        for (game_id, _) in &closing {
+            beats.remove(game_id);
+        }
+    }
+    for (_, session) in closing {
+        if let Some(session) = session.upgrade() {
+            session.begin_close();
+        }
     }
 }
 
