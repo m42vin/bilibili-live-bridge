@@ -387,8 +387,16 @@ struct AnchorBody {
 
 #[derive(Deserialize)]
 struct BatchBody {
-    #[serde(default)]
+    /// 平台成功时也会把这个数组写成 JSON `null`。
+    #[serde(default, deserialize_with = "empty_if_null")]
     failed_game_ids: Vec<String>,
+}
+
+fn empty_if_null<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn signed_headers(access_key_id: &str, signed: &Signature) -> Result<HeaderMap, ApiError> {
@@ -503,7 +511,11 @@ fn batch_result_from_value(value: Value) -> Result<BatchHeartbeatResult, ApiErro
         other => serde_json::from_value(other).map_err(ApiError::decode)?,
     };
     Ok(BatchHeartbeatResult {
-        failed_game_ids: body.failed_game_ids,
+        failed_game_ids: body
+            .failed_game_ids
+            .into_iter()
+            .filter(|game_id| !game_id.is_empty())
+            .collect(),
     })
 }
 

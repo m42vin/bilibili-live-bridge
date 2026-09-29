@@ -248,6 +248,17 @@ async fn heartbeat_end_and_batch_use_their_paths() {
 }
 
 #[tokio::test]
+async fn batch_heartbeat_treats_null_failures_as_success() {
+    let (origin, _request) = stub(r#"{"code":0,"message":"ok","data":{"failed_game_ids":null}}"#);
+    let client = Client::with_origin("key-id", "super-secret", 42, &origin).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), client.batch_heartbeat(["game-1"]))
+        .await
+        .expect("batch heartbeat timed out")
+        .unwrap();
+    assert!(result.all_succeeded());
+}
+
+#[tokio::test]
 async fn http_error_status_is_not_parsed_as_a_platform_code() {
     let (origin, _request) = stub_response(
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
