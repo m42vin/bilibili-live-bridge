@@ -12,45 +12,47 @@ use bilibili_live_bridge::open_live::ws::Connection;
 use tokio::time::{MissedTickBehavior, interval};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    bilibili_live_bridge::logging::init()?;
+    run().await
+}
+
+#[tracing::instrument(name = "ws_listen", skip_all, err(Display))]
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
     let client = Client::from_config(&config)?;
     let auth_code = std::env::var("AUTH_CODE")?;
 
     let started = client.start(&auth_code).await?;
-    println!(
-        "已开启场次 {}，房间 {}（{}）",
-        started.game_id(),
-        started.anchor().room_id,
-        started.anchor().uname
-    );
-
     let session = tokio::select! {
         result = listen(&client, &config, &started) => result,
         result = tokio::signal::ctrl_c() => {
             result?;
-            println!("收到中断，准备关闭场次");
+            tracing::info!("收到中断，准备关闭场次");
             Ok(())
         }
     };
 
     let ended = client.end(started.game_id()).await;
-    match &ended {
-        Ok(()) => println!("已关闭场次 {}", started.game_id()),
-        Err(error) => eprintln!("关闭场次失败：{error}"),
+    if let Err(error) = &ended {
+        tracing::error!(game_id = started.game_id(), %error, "关闭场次失败");
     }
     session?;
     ended?;
     Ok(())
 }
 
+#[tracing::instrument(
+    name = "session",
+    skip_all,
+    fields(game_id = started.game_id(), room_id = started.anchor().room_id)
+)]
 async fn listen(
     client: &Client,
     config: &Config,
     started: &StartResult,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut connection = Connection::from_start(started, config.websocket_heartbeat()).await?;
-    println!("已连接 {}", connection.endpoint());
 
     let mut ticks = interval(config.app_heartbeat());
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -62,21 +64,21 @@ async fn listen(
                 match incoming? {
                     Some(event) => {
                         let stop = event.ends_push();
-                        println!("{} {event:?}", event.cmd());
+                        tracing::info!(cmd = event.cmd(), "收到直播间事件");
+                        tracing::debug!(?event, "直播间事件内容");
                         if stop {
-                            println!("平台已停止这场推送");
+                            tracing::info!("平台已停止这场推送");
                             break;
                         }
                     }
                     None => {
-                        println!("长连接已关闭");
+                        tracing::info!("长连接已关闭");
                         break;
                     }
                 }
             }
             _ = ticks.tick() => {
                 client.heartbeat(started.game_id()).await?;
-                println!("项目心跳");
             }
         }
     }

@@ -3,6 +3,7 @@ use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
+use tracing::instrument::WithSubscriber;
 
 use super::super::auth::{
     SIGNATURE_METHOD, SIGNATURE_VERSION, canonical_string, content_md5, hmac_sha256_hex,
@@ -168,6 +169,7 @@ async fn rejects_invalid_calls_before_sending() {
 
 #[tokio::test]
 async fn start_signs_the_posted_json_and_parses_the_session() {
+    let (dispatch, logs) = crate::logging::logging_test::capture("trace");
     let (origin, request) = stub(
         r#"{
             "code": 0,
@@ -193,6 +195,7 @@ async fn start_signs_the_posted_json_and_parses_the_session() {
     let client =
         Client::with_origin("key-id", "super-secret", 165_032_067_539_475, &origin).unwrap();
     let started = tokio::time::timeout(Duration::from_secs(3), client.start(" CODE123 "))
+        .with_subscriber(dispatch)
         .await
         .expect("start timed out")
         .unwrap();
@@ -205,6 +208,20 @@ async fn start_signs_the_posted_json_and_parses_the_session() {
     assert_signed(&raw, "key-id", "super-secret");
     let (_, body) = split_http(&raw);
     assert_eq!(body, r#"{"code":"CODE123","app_id":165032067539475}"#);
+    let output = logs.output();
+    assert!(output.contains("path=\"/v2/app/start\""), "{output}");
+    assert!(output.contains("game_id=\"game-1\""), "{output}");
+    assert!(output.contains("room_id=42"), "{output}");
+    let (headers, _) = split_http(&raw);
+    for secret in [
+        "key-id",
+        "super-secret",
+        "CODE123",
+        "secret-auth-body",
+        header(&headers, "authorization"),
+    ] {
+        assert!(!output.contains(secret), "{output}");
+    }
 }
 
 #[tokio::test]
@@ -260,11 +277,13 @@ async fn batch_heartbeat_treats_null_failures_as_success() {
 
 #[tokio::test]
 async fn http_error_status_is_not_parsed_as_a_platform_code() {
+    let (dispatch, logs) = crate::logging::logging_test::capture("warn");
     let (origin, _request) = stub_response(
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     let client = Client::with_origin("key-id", "super-secret", 1, &origin).unwrap();
     let error = tokio::time::timeout(Duration::from_secs(3), client.heartbeat("game-1"))
+        .with_subscriber(dispatch)
         .await
         .expect("heartbeat timed out")
         .unwrap_err();
@@ -272,6 +291,10 @@ async fn http_error_status_is_not_parsed_as_a_platform_code() {
     assert!(matches!(error, ApiError::Status { status: 500 }));
     assert_eq!(error.platform_code(), None);
     assert_eq!(error.to_string(), "开放平台返回 HTTP 500");
+    let output = logs.output();
+    assert!(output.contains("WARN"), "{output}");
+    assert!(output.contains("/v2/app/heartbeat"), "{output}");
+    assert!(output.contains("HTTP 500"), "{output}");
 }
 
 fn assert_signed(raw: &str, access_key_id: &str, secret: &str) {

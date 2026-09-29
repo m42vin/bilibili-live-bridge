@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::time::{MissedTickBehavior, interval};
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
 
 use super::error::SessionError;
 use super::platform::{LivePlatform, LiveSocket, Platform};
@@ -67,14 +69,21 @@ impl Manager {
     ///
     /// 返回的 [`Subscription`] 被丢弃时记一次离开。最后一个离开的下游会触发 `/v2/app/end`。
     #[must_use = "接入失败时需要处理 SessionError"]
+    #[tracing::instrument(skip_all, err(Display, level = "warn"))]
     pub async fn attach(&self, code: &str) -> Result<Subscription, SessionError> {
         let code = normalize_code(code)?;
-        match self.state.attach_once(code).await {
+        let subscription = match self.state.attach_once(code).await {
             Err(SessionError::Closed) if !self.is_shutting_down() => {
                 self.state.attach_once(code).await
             }
             other => other,
-        }
+        }?;
+        tracing::info!(
+            room_id = subscription.room_id(),
+            game_id = subscription.game_id(),
+            "订阅已接入会话"
+        );
+        Ok(subscription)
     }
 
     /// 停止批量心跳，关闭全部会话，并等待每一场都调用完 `/v2/app/end`。
@@ -264,6 +273,7 @@ impl State {
         if leader {
             self.lead(session, code).await
         } else {
+            tracing::debug!("复用已有或正在建立的会话");
             follow(session).await
         }
     }
@@ -319,6 +329,11 @@ impl State {
             }
         };
         leader.game_id = Some(started.game_id().to_owned());
+        tracing::debug!(
+            room_id = started.anchor().room_id,
+            game_id = started.game_id(),
+            "官方场次已开启，准备建立会话"
+        );
 
         if self.stopping(&session) {
             return abort(&mut leader, &session, SessionError::ShuttingDown).await;
@@ -334,7 +349,14 @@ impl State {
                     .game_id
                     .clone()
                     .unwrap_or_else(|| started.game_id().to_owned());
-                let _ = self.platform.end(&game_id).await;
+                tracing::info!(
+                    room_id = started.anchor().room_id,
+                    %game_id,
+                    "房间已有会话，关闭重复场次并复用"
+                );
+                if let Err(error) = self.platform.end(&game_id).await {
+                    tracing::warn!(%game_id, %error, "关闭重复场次失败");
+                }
                 leader.game_id = None;
                 leader.committed = true;
                 session.redirect(&existing);
@@ -356,7 +378,9 @@ impl State {
         };
 
         if self.stopping(&session) {
-            let _ = socket.close().await;
+            if let Err(error) = socket.close().await {
+                tracing::warn!(game_id = started.game_id(), %error, "接入中止时关闭长连接失败");
+            }
             return abort(&mut leader, &session, SessionError::ShuttingDown).await;
         }
 
@@ -367,7 +391,9 @@ impl State {
             events.clone(),
         );
         let Some(subscription) = session.try_subscribe() else {
-            let _ = socket.close().await;
+            if let Err(error) = socket.close().await {
+                tracing::warn!(game_id = started.game_id(), %error, "接入中止时关闭长连接失败");
+            }
             return abort(&mut leader, &session, SessionError::ShuttingDown).await;
         };
 
@@ -379,6 +405,7 @@ impl State {
             socket,
             events,
             started.game_id().to_owned(),
+            started.anchor().room_id,
         );
         Ok(subscription)
     }
@@ -414,6 +441,7 @@ impl State {
             self.shutdown.store(true, Ordering::SeqCst);
             snapshot(&tables)
         };
+        tracing::info!(session_count = sessions.len(), "开始关闭会话管理器");
         self.stop_heartbeat().await;
         for session in &sessions {
             session.begin_close();
@@ -421,6 +449,7 @@ impl State {
         for session in &sessions {
             session.until_finished().await;
         }
+        tracing::info!("会话管理器已关闭");
     }
 
     fn unlink(&self, session: &Arc<Session>) {
@@ -469,9 +498,16 @@ impl State {
         let weak = Arc::downgrade(self);
         let stop = self.heartbeat_stop.clone();
         let every = self.app_heartbeat;
-        tokio::spawn(async move {
-            run_heartbeats(weak, stop, every).await;
-        });
+        let span = tracing::info_span!(parent: None, "app_heartbeats", interval_secs = every.as_secs_f64());
+        tokio::spawn(
+            async move {
+                tracing::debug!("批量项目心跳任务已启动");
+                run_heartbeats(weak, stop, every).await;
+                tracing::debug!("批量项目心跳任务已停止");
+            }
+            .instrument(span)
+            .with_current_subscriber(),
+        );
     }
 
     async fn stop_heartbeat(&self) {
@@ -529,9 +565,17 @@ impl Drop for Leader {
         self.session.fail(SessionError::Closed);
         if let Some(game_id) = game_id {
             let platform = Arc::clone(&self.platform);
-            tokio::spawn(async move {
-                let _ = platform.end(&game_id).await;
-            });
+            let span = tracing::info_span!("session_cleanup", %game_id);
+            tokio::spawn(
+                async move {
+                    tracing::info!("接入任务取消，关闭已开启场次");
+                    if let Err(error) = platform.end(&game_id).await {
+                        tracing::warn!(%game_id, %error, "接入取消后关闭场次失败");
+                    }
+                }
+                .instrument(span)
+                .with_current_subscriber(),
+            );
         }
     }
 }
@@ -542,7 +586,9 @@ async fn abort(
     error: SessionError,
 ) -> Result<Subscription, SessionError> {
     if let Some(game_id) = leader.game_id.clone() {
-        let _ = leader.platform.end(&game_id).await;
+        if let Err(error) = leader.platform.end(&game_id).await {
+            tracing::warn!(%game_id, %error, "接入中止后关闭场次失败");
+        }
         leader.game_id = None;
     }
     leader.committed = true;
@@ -600,38 +646,66 @@ fn spawn_upstream(
     mut socket: Box<dyn LiveSocket>,
     events: broadcast::Sender<Arc<LiveEvent>>,
     game_id: String,
+    room_id: i64,
 ) {
     state.register_beat(&game_id, &session);
-    tokio::spawn(async move {
-        // 项目心跳在管理器的批量任务里发送，这里只在会话停止时打断 `recv`。
-        loop {
-            tokio::select! {
-                biased;
-                _ = session.stop.cancelled() => break,
-                incoming = socket.recv() => {
-                    match incoming {
-                        Ok(Some(event)) => {
-                            let ends = event.ends_push();
-                            if events.send(Arc::new(event)).is_err() || ends {
+    let span = tracing::info_span!("session", room_id, %game_id);
+    tokio::spawn(
+        async move {
+            tracing::info!("直播间会话已建立");
+            // 项目心跳在管理器的批量任务里发送，这里只在会话停止时打断 `recv`。
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = session.stop.cancelled() => {
+                        tracing::debug!("会话收到关闭信号");
+                        break;
+                    }
+                    incoming = socket.recv() => {
+                        match incoming {
+                            Ok(Some(event)) => {
+                                let ends = event.ends_push();
+                                tracing::debug!(cmd = event.cmd(), "转发直播间事件");
+                                if events.send(Arc::new(event)).is_err() {
+                                    tracing::info!("订阅者已全部离开，关闭会话");
+                                    break;
+                                }
+                                if ends {
+                                    tracing::info!("平台已停止互动推送，关闭会话");
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::info!("官方长连接已关闭，结束会话");
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(room_id, %game_id, %error, "官方长连接读取失败，结束会话");
                                 break;
                             }
                         }
-                        Ok(None) | Err(_) => break,
                     }
                 }
             }
-        }
 
-        session.begin_close();
-        session.stop.cancel();
-        let _ = socket.close().await;
-        let _ = state.platform.end(&game_id).await;
-        state.unlink(&session);
-        // `send` 在没有接收者时会丢掉新值。会话创建时没有人订阅 phase，必须用 replace。
-        session.phase.send_replace(Phase::Closed);
-        drop(events);
-        session.mark_finished();
-    });
+            session.begin_close();
+            session.stop.cancel();
+            if let Err(error) = socket.close().await {
+                tracing::warn!(room_id, %game_id, %error, "关闭官方长连接失败");
+            }
+            if let Err(error) = state.platform.end(&game_id).await {
+                tracing::warn!(room_id, %game_id, %error, "关闭官方场次失败");
+            }
+            state.unlink(&session);
+            // `send` 在没有接收者时会丢掉新值。会话创建时没有人订阅 phase，必须用 replace。
+            session.phase.send_replace(Phase::Closed);
+            drop(events);
+            tracing::info!("直播间会话已结束");
+            session.mark_finished();
+        }
+        .instrument(span)
+        .with_current_subscriber(),
+    );
 }
 
 struct Session {
@@ -943,15 +1017,28 @@ async fn pump(state: &State) {
 async fn dispatch_chunk(state: &State, chunk: &[PendingBeat]) {
     let game_ids: Vec<String> = chunk.iter().map(|beat| beat.game_id.clone()).collect();
     let failed = match state.platform.batch_heartbeat(&game_ids).await {
-        Ok(result) => Some(
-            result
-                .failed_game_ids()
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>(),
-        ),
-        Err(error) if error.platform_code().is_some() => Some(game_ids.iter().cloned().collect()),
-        Err(_) => None,
+        Ok(result) => {
+            tracing::debug!(
+                batch_size = game_ids.len(),
+                failed_count = result.failed_game_ids().len(),
+                "会话批量心跳完成"
+            );
+            Some(
+                result
+                    .failed_game_ids()
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(batch_size = game_ids.len(), %error, "会话批量心跳失败");
+            if error.platform_code().is_some() {
+                Some(game_ids.iter().cloned().collect())
+            } else {
+                None
+            }
+        }
     };
     let mut closing = Vec::new();
     {
@@ -980,8 +1067,19 @@ async fn dispatch_chunk(state: &State, chunk: &[PendingBeat]) {
             beats.remove(game_id);
         }
     }
-    for (_, session) in closing {
+    for (game_id, session) in closing {
         if let Some(session) = session.upgrade() {
+            let reason = if failed.is_some() {
+                "platform_rejected"
+            } else {
+                "transport_failure_limit"
+            };
+            tracing::warn!(
+                %game_id,
+                room_id = ?session.room_id(),
+                reason,
+                "项目心跳失效，关闭会话"
+            );
             session.begin_close();
         }
     }

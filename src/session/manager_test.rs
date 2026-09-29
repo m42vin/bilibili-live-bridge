@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
+use tracing::instrument::WithSubscriber;
 
 use super::super::platform::{BoxFuture, LiveSocket, Platform};
 use super::{Manager, RecvError};
@@ -15,6 +16,71 @@ use crate::session::SessionError;
 
 const QUIET: Duration = Duration::from_secs(3600);
 const CODE: &str = "super-secret-code";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_session_logs_keep_context_and_hide_credentials() {
+    let (dispatch, logs) = crate::logging::logging_test::capture("trace");
+    async {
+        let mock = Mock::new();
+        mock.push_ok("game-1", 7);
+        mock.push_connect_ok();
+        let manager = manager(&mock, QUIET);
+        let mut subscription = manager.attach(CODE).await.unwrap();
+        mock.connection(0).emit(danmaku("private-danmaku-content"));
+        subscription.recv().await.unwrap();
+        let _ = manager.shutdown().await;
+    }
+    .with_subscriber(dispatch)
+    .await;
+
+    let output = logs.output();
+    for message in ["直播间会话已建立", "转发直播间事件", "直播间会话已结束"]
+    {
+        let line = output
+            .lines()
+            .find(|line| line.contains(message))
+            .unwrap_or_else(|| panic!("missing {message}: {output}"));
+        assert!(line.contains("room_id=7"), "{line}");
+        assert!(line.contains("game_id=game-1"), "{line}");
+    }
+    assert!(!output.contains(CODE));
+    assert!(!output.contains("auth-body"));
+    assert!(!output.contains("private-danmaku-content"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_and_background_cleanup_failures_are_logged() {
+    let (dispatch, logs) = crate::logging::logging_test::capture("warn");
+    async {
+        let mock = Mock::new();
+        mock.push_ok("game-1", 7);
+        mock.push_connect_ok();
+        mock.fail_heartbeats_with_transport();
+        mock.fail_end();
+        let manager = manager(&mock, QUIET);
+        let _subscription = manager.attach(CODE).await.unwrap();
+        for _ in 0..super::HEARTBEAT_TRANSPORT_LIMIT {
+            manager.beat_once().await;
+        }
+        let _ = manager.shutdown().await;
+    }
+    .with_subscriber(dispatch)
+    .await;
+
+    let output = logs.output();
+    assert!(output.contains("会话批量心跳失败"));
+    assert!(output.contains("HTTP 503"));
+    assert!(output.contains("transport_failure_limit"), "{output}");
+    let cleanup = output
+        .lines()
+        .find(|line| line.contains("关闭官方场次失败"))
+        .unwrap();
+    assert!(cleanup.contains("WARN"), "{cleanup}");
+    assert!(cleanup.contains("HTTP 500"), "{cleanup}");
+    assert!(cleanup.contains("room_id=7"), "{cleanup}");
+    assert!(cleanup.contains("game_id=game-1"), "{cleanup}");
+    assert!(!output.contains(CODE));
+}
 
 #[test]
 fn rejects_zero_heartbeat_and_debug_hides_the_access_key() {

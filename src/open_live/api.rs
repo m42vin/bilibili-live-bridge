@@ -106,6 +106,7 @@ impl Client {
     /// 成功后用 [`crate::open_live::ws::Connection::from_start`] 连接返回的 `wss_link`，
     /// 并在结束时调用 [`Client::end`]。项目心跳仍然走 [`Client::heartbeat`]。
     #[must_use = "开启失败时需要处理 ApiError"]
+    #[tracing::instrument(skip_all, fields(app_id = self.app_id))]
     pub async fn start(&self, code: &str) -> Result<StartResult, ApiError> {
         let code = required_text(code, "身份码不能为空")?;
         let value = self
@@ -117,11 +118,18 @@ impl Client {
                 },
             )
             .await?;
-        start_result_from_value(value)
+        let started = start_result_from_value(value)?;
+        tracing::info!(
+            game_id = started.game_id(),
+            room_id = started.anchor().room_id,
+            "已开启官方场次"
+        );
+        Ok(started)
     }
 
     /// 关闭一场互动，并同步下线互动道具。
     #[must_use = "关闭失败时需要处理 ApiError"]
+    #[tracing::instrument(skip_all, fields(game_id = game_id))]
     pub async fn end(&self, game_id: &str) -> Result<(), ApiError> {
         let game_id = required_text(game_id, "game_id 不能为空")?;
         self.execute(
@@ -132,6 +140,7 @@ impl Client {
             },
         )
         .await?;
+        tracing::info!("已关闭官方场次");
         Ok(())
     }
 
@@ -143,6 +152,7 @@ impl Client {
         let game_id = required_text(game_id, "game_id 不能为空")?;
         self.execute(HEARTBEAT_PATH, &HeartbeatRequest { game_id: &game_id })
             .await?;
+        tracing::debug!(%game_id, "项目心跳成功");
         Ok(())
     }
 
@@ -163,10 +173,28 @@ impl Client {
                 },
             )
             .await?;
-        batch_result_from_value(value)
+        let result = batch_result_from_value(value)?;
+        tracing::debug!(
+            batch_size = game_ids.len(),
+            failed_count = result.failed_game_ids().len(),
+            "批量项目心跳完成"
+        );
+        Ok(result)
     }
 
+    #[tracing::instrument(
+        name = "open_live_request",
+        skip_all,
+        fields(path = path, app_id = self.app_id)
+    )]
     async fn execute(&self, path: &str, body: &impl Serialize) -> Result<Value, ApiError> {
+        self.send_request(path, body).await.inspect_err(|error| {
+            tracing::warn!(path, app_id = self.app_id, %error, "开放平台请求失败");
+        })
+    }
+
+    async fn send_request(&self, path: &str, body: &impl Serialize) -> Result<Value, ApiError> {
+        tracing::debug!("发送开放平台请求");
         let body = serde_json::to_string(body)
             .map_err(|error| ApiError::invalid(format!("构造请求体失败：{error}")))?;
         let signed = auth::sign(
@@ -187,6 +215,7 @@ impl Client {
             .await
             .map_err(|source| ApiError::transport("请求开放平台失败", source))?;
         let status = response.status();
+        tracing::debug!(status = status.as_u16(), "收到开放平台响应");
         if !status.is_success() {
             return Err(ApiError::Status {
                 status: status.as_u16(),

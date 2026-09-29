@@ -50,6 +50,7 @@ impl Connection {
     /// 连接、超时、或在鉴权回复前断开时会换下一个地址。鉴权回复明确失败时不再尝试其余地址。
     /// `heartbeat` 是 WebSocket 心跳间隔，必须大于 0。项目心跳要另外调用应用 API。
     #[must_use = "连接失败时需要处理 WsError"]
+    #[tracing::instrument(name = "websocket_connect", skip_all)]
     pub async fn connect(
         links: impl IntoIterator<Item = impl AsRef<str>>,
         auth_body: &str,
@@ -72,15 +73,28 @@ impl Connection {
         }
 
         let mut failures = Vec::new();
-        for link in &links {
+        for (index, link) in links.iter().enumerate() {
+            tracing::debug!(endpoint = %link, attempt = index + 1, "尝试连接官方 WebSocket");
             let attempt =
                 tokio::time::timeout(HANDSHAKE_TIMEOUT, establish(link, auth_body, heartbeat))
                     .await;
             match attempt {
-                Ok(Ok(connection)) => return Ok(connection),
-                Ok(Err(Attempt::Fatal(error))) => return Err(error),
-                Ok(Err(Attempt::Retry(message))) => failures.push(format!("{link}：{message}")),
-                Err(_elapsed) => failures.push(format!("{link}：连接超时")),
+                Ok(Ok(connection)) => {
+                    tracing::info!(endpoint = %link, "官方 WebSocket 已连接并完成鉴权");
+                    return Ok(connection);
+                }
+                Ok(Err(Attempt::Fatal(error))) => {
+                    tracing::warn!(endpoint = %link, %error, "官方 WebSocket 鉴权失败");
+                    return Err(error);
+                }
+                Ok(Err(Attempt::Retry(message))) => {
+                    tracing::warn!(endpoint = %link, error = %message, "官方 WebSocket 连接失败，尝试下一地址");
+                    failures.push(format!("{link}：{message}"));
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(endpoint = %link, "官方 WebSocket 连接超时，尝试下一地址");
+                    failures.push(format!("{link}：连接超时"));
+                }
             }
         }
         Err(WsError::connect(format!(
@@ -91,6 +105,7 @@ impl Connection {
 
     /// 用 [`StartResult`] 里的长连接信息建立连接。
     #[must_use = "连接失败时需要处理 WsError"]
+    #[tracing::instrument(skip_all, fields(game_id = started.game_id(), room_id = started.anchor().room_id))]
     pub async fn from_start(started: &StartResult, heartbeat: Duration) -> Result<Self, WsError> {
         Self::connect(started.wss_link(), started.auth_body(), heartbeat).await
     }
@@ -124,6 +139,7 @@ impl Connection {
                 _ = self.heartbeat.tick() => {
                     let packet = packet::encode(Operation::Heartbeat, &[])?;
                     self.pending_write = Some(Message::binary(packet));
+                    tracing::trace!(endpoint = %self.endpoint, "排入 WebSocket 心跳");
                 }
                 incoming = self.read.next() => {
                     self.consume(incoming)?;

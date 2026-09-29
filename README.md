@@ -12,6 +12,7 @@
 - **会话复用**：同一身份码的并发接入只开启一次场次；不同身份码关联同一房间时复用已有会话，共享一条官方长连接。
 - **共享心跳**：一个会话管理器统一维护项目心跳，每批最多包含 200 个 `game_id`；WebSocket 心跳由各自的官方连接维护。
 - **会话清理**：最后一个订阅者离开、互动结束、上游断开或心跳失败达到关闭条件时，尝试关闭官方场次；支持等待全部会话关闭。
+- **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
 
 ## 快速开始
 
@@ -61,7 +62,27 @@ cargo run --locked --bin multi_client
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 预留的下游监听地址，格式为 IP 和端口；当前没有启动监听服务 |
 | `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` | 否 | `20` | 官方 WebSocket 心跳间隔，整数秒，范围 `1..=29` |
 | `BRIDGE_APP_HEARTBEAT_SECS` | 否 | `20` | 项目心跳间隔，整数秒，范围 `1..=59` |
+| `RUST_LOG` | 否 | `info` | 日志级别和模块过滤，由日志初始化读取 |
 | `AUTH_CODE` | 示例程序需要 | 无 | 主播身份码，由示例程序单独读取，不属于 `Config` |
+
+### 日志
+
+所有二进制入口先调用 `logging::init()`，日志输出到 stderr，包含时间、级别、模块以及 span 上下文。默认使用 `info`，记录场次开启和关闭、会话接入与结束；连接候选地址失败、心跳异常和清理失败使用 `warn`，导致示例程序退出的错误使用 `error`。重定向到文件时自动关闭 ANSI 颜色：
+
+```sh
+cargo run --locked --bin multi_client 2>bridge.log
+```
+
+`RUST_LOG` 支持[EnvFilter 的级别与模块过滤语法](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)。例如，只查看警告及错误，或为桥和示例程序开启调试日志：
+
+```sh
+RUST_LOG=warn cargo run --locked --bin multi_client
+RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked --bin multi_client
+```
+
+`debug` 记录请求过程、事件转发，以及示例程序接收的事件详情；`trace` 还记录 WebSocket 心跳。库自身不记录完整事件正文。日志字段不包含 Access Key、身份码、签名、HTTP 请求正文或 WebSocket 鉴权正文；示例程序的事件详情可能包含弹幕等用户内容，按需开启。`RUST_LOG` 未设置或为空时使用 `info`，格式无效时启动返回错误。
+
+作为库接入时，日志事件由调用方的 subscriber 收集。可以在程序入口调用 `bilibili_live_bridge::logging::init()?` 使用同一套配置，也可以安装自己的 subscriber。全局初始化每个进程只调用一次。
 
 ### 示例程序
 
@@ -101,6 +122,7 @@ cargo doc --no-deps --open
 | 路径 | 内容 |
 | --- | --- |
 | [`src/config.rs`](src/config.rs) | 环境变量配置与校验 |
+| [`src/logging.rs`](src/logging.rs) | tracing 初始化与 `RUST_LOG` 过滤 |
 | [`src/open_live/`](src/open_live/) | 开放平台 API、鉴权、错误码与官方 WebSocket 客户端 |
 | [`src/session/`](src/session/) | 会话复用、订阅分发、批量心跳与生命周期管理 |
 | [`src/bin/`](src/bin/) | 示例程序与待实现的服务入口 |
