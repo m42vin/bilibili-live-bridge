@@ -1,6 +1,7 @@
 //! 长连接推送的直播间事件。
 //!
-//! `cmd` 决定变体。文档里列出的字段缺失时用零值或空字符串，未列出的 `cmd` 保留原文。
+//! `cmd` 决定变体。字段缺失时使用声明的默认值，类型不匹配时返回解析错误；
+//! 已知结构忽略未声明字段，未知命令保留 `cmd` 和原始 `data`。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +21,9 @@ const CMD_LIVE_END: &str = "LIVE_OPEN_PLATFORM_LIVE_END";
 const CMD_INTERACTION_END: &str = "LIVE_OPEN_PLATFORM_INTERACTION_END";
 
 /// 官方长连接推送的一条直播间事件。
+///
+/// 已知变体保存解析后的字段，[`LiveEvent::Unknown`] 保存未知命令。
+/// 此枚举尚未定义统一的 serde 消息封装，不能视为外部客户端的协议格式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveEvent {
     /// 本房间弹幕。
@@ -74,6 +78,9 @@ impl LiveEvent {
     }
 
     /// 收到后平台不会再为这场 `game_id` 推送。
+    ///
+    /// 只有 [`LiveEvent::InteractionEnd`] 返回 `true`，
+    /// [`LiveEvent::LiveEnd`] 的普通下播事件返回 `false`。
     #[must_use]
     pub const fn ends_push(&self) -> bool {
         matches!(self, Self::InteractionEnd(_))
@@ -496,6 +503,7 @@ pub struct InteractionEnd {
     pub timestamp: i64,
 }
 
+/// 从完整的命令 JSON 解析事件。已知命令缺失或为 null 的 data 按空对象处理。
 pub(super) fn parse_command(bytes: &[u8]) -> Result<LiveEvent, WsError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| WsError::decode(format!("开放平台推送不是 JSON：{error}")))?;

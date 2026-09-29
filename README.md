@@ -109,6 +109,8 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 
 当前没有断线自动重连：上游断开会结束会话，需要重新调用 `attach`。如果直接使用 `open_live::api::Client` 和 `open_live::ws::Connection`，调用方需要自行维护项目心跳、持续调用 `Connection::recv()` 驱动 WebSocket 心跳，并在结束时调用 `Client::end()`。完整示例见 [`ws_listen`](src/bin/ws_listen.rs) 和 [`multi_client`](src/bin/multi_client.rs)。
 
+[库入口的 rustdoc](src/lib.rs) 提供包含退出清理与订阅落后处理的接入示例，该示例由 doctest 检查编译。
+
 ## 开发与文档
 
 ```sh
@@ -121,6 +123,8 @@ cargo doc --no-deps --open
 
 | 路径 | 内容 |
 | --- | --- |
+| [架构说明](docs/architecture.md) | 模块边界、会话复用、心跳、事件分发与关闭流程 |
+| [开发指南](docs/development.md) | 开发环境、测试与调试、常见扩展方式和注释维护 |
 | [`src/config.rs`](src/config.rs) | 环境变量配置与校验 |
 | [`src/logging.rs`](src/logging.rs) | tracing 初始化与 `RUST_LOG` 过滤 |
 | [`src/open_live/`](src/open_live/) | 开放平台 API、鉴权、错误码与官方 WebSocket 客户端 |

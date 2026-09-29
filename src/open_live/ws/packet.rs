@@ -2,6 +2,7 @@
 //!
 //! 包头 16 字节，大端。`version = 0` 的正文是原文；`version = 2` 的正文是 zlib，
 //! 解压后仍是一串完整的包，可能再套一层压缩。
+//! 解码不跨帧缓存残包；长度、解压输出、包数量和嵌套深度的限制用于约束异常输入。
 
 use std::io::{Cursor, Read};
 
@@ -37,6 +38,7 @@ pub(super) enum Operation {
     AuthReply = 8,
 }
 
+/// 已验证包头并拆出的正文，压缩内容尚未展开。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct RawPacket {
     pub(super) version: u16,
@@ -51,10 +53,12 @@ pub(super) enum FrameItem {
     AuthReply(Vec<u8>),
 }
 
+/// 编码一个 version 为 0 的完整包，供鉴权和心跳发送使用。
 pub(super) fn encode(operation: Operation, body: &[u8]) -> Result<Vec<u8>, WsError> {
     encode_parts(0, operation as u32, body)
 }
 
+/// 拆出缓冲区中的完整包序列；残缺包或非法长度直接报错，不留到下一次解码。
 pub(super) fn decode_packets(input: &[u8]) -> Result<Vec<RawPacket>, WsError> {
     let mut packets = Vec::new();
     let mut rest = input;
@@ -85,6 +89,7 @@ pub(super) fn decode_packets(input: &[u8]) -> Result<Vec<RawPacket>, WsError> {
     Ok(packets)
 }
 
+/// 展开一帧中的包和嵌套压缩，解析事件或鉴权回复，忽略心跳回复和未知操作码。
 pub(super) fn decode_frame(input: &[u8]) -> Result<Vec<FrameItem>, WsError> {
     let mut count = 0;
     let mut items = Vec::new();

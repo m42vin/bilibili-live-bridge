@@ -33,6 +33,8 @@ type Reader = SplitStream<Upstream>;
 /// 已经完成鉴权的官方长连接。
 ///
 /// 由一个任务调用 [`Connection::recv`] 驱动。读的过程中会回答 Ping，并按给定间隔发送空正文的心跳包。
+/// 不启动独立后台任务；长时间停止轮询或阻塞在事件处理上会影响心跳。
+/// 连接断开后不会自动重连，丢弃此值也不会调用项目结束 API。
 pub struct Connection {
     endpoint: String,
     heartbeat_every: Duration,
@@ -49,6 +51,13 @@ impl Connection {
     ///
     /// 连接、超时、或在鉴权回复前断开时会换下一个地址。鉴权回复明确失败时不再尝试其余地址。
     /// `heartbeat` 是 WebSocket 心跳间隔，必须大于 0。项目心跳要另外调用应用 API。
+    /// 每个候选地址的连接和鉴权总共最多等待 10 秒。
+    ///
+    /// # Errors
+    ///
+    /// 鉴权正文为空、心跳间隔为零或没有非空地址时返回 [`WsError::Invalid`]；
+    /// 所有地址均无法完成连接时返回 [`WsError::Connect`]；
+    /// 鉴权回复明确失败时返回 [`WsError::Protocol`]。
     #[must_use = "连接失败时需要处理 WsError"]
     #[tracing::instrument(name = "websocket_connect", skip_all)]
     pub async fn connect(
@@ -104,6 +113,10 @@ impl Connection {
     }
 
     /// 用 [`StartResult`] 里的长连接信息建立连接。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Connection::connect`] 相同。失败后调用方仍需结束已经开启的场次。
     #[must_use = "连接失败时需要处理 WsError"]
     #[tracing::instrument(skip_all, fields(game_id = started.game_id(), room_id = started.anchor().room_id))]
     pub async fn from_start(started: &StartResult, heartbeat: Duration) -> Result<Self, WsError> {
@@ -119,6 +132,11 @@ impl Connection {
     /// 读下一条直播间事件。
     ///
     /// 连接正常关闭时返回 `Ok(None)`。同一帧里的多条事件会在后续调用里依次返回。
+    /// 等待期间也驱动心跳和 Ping/Pong；本方法不维护项目心跳。
+    ///
+    /// # Errors
+    ///
+    /// 读写失败、二进制协议不符或事件 JSON 无法解析时返回 [`WsError`]。
     #[must_use = "读取失败时需要处理 WsError"]
     pub async fn recv(&mut self) -> Result<Option<LiveEvent>, WsError> {
         loop {
@@ -148,7 +166,13 @@ impl Connection {
         }
     }
 
-    /// 发送关闭帧。重复调用没有额外效果。
+    /// 发送关闭帧。已经标记关闭后再次调用没有额外效果，也不会重试失败的发送。
+    ///
+    /// 本方法只处理官方长连接，不调用 [`crate::open_live::api::Client::end`]。
+    ///
+    /// # Errors
+    ///
+    /// 发送失败且连接尚未由底层确认关闭时返回 [`WsError::Transport`]。
     #[must_use = "关闭失败时需要处理 WsError"]
     pub async fn close(&mut self) -> Result<(), WsError> {
         if self.closed {

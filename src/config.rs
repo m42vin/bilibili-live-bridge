@@ -1,6 +1,7 @@
-//! 进程启动时读取一次的桥配置。
+//! 从进程环境变量加载的桥配置。
 //!
-//! Access Key 只存在于这个类型里，供直播桥对开放平台签名。下游客户端协议不携带这些字段。
+//! Access Key 由配置传给开放平台 HTTP 客户端用于签名。这里不自动读取 `.env`；
+//! `RUST_LOG` 由 [`crate::logging::init`] 读取，示例程序的 `AUTH_CODE` 由各入口读取。
 
 use std::env::VarError;
 use std::fmt;
@@ -13,7 +14,7 @@ pub const ENV_ACCESS_KEY_ID: &str = "BILIBILI_ACCESS_KEY_ID";
 pub const ENV_ACCESS_KEY_SECRET: &str = "BILIBILI_ACCESS_KEY_SECRET";
 /// 项目 ID，对应开放平台的 `app_id`，类型是 i64。
 pub const ENV_APP_ID: &str = "BILIBILI_APP_ID";
-/// 直播桥监听地址。未设置时绑定本机回环地址。
+/// 预留的直播桥监听地址。未设置时采用本机回环地址；当前没有实现监听服务。
 pub const ENV_LISTEN: &str = "BRIDGE_LISTEN";
 /// 官方 WebSocket 心跳间隔，单位秒。
 pub const ENV_WEBSOCKET_HEARTBEAT_SECS: &str = "BRIDGE_WEBSOCKET_HEARTBEAT_SECS";
@@ -28,7 +29,8 @@ const APP_HEARTBEAT_MAX_SECS: u64 = 60;
 
 /// 直播桥进程配置。
 ///
-/// 用 [`Config::from_env`] 加载。进程环境变量优先于当前目录的 `.env`。`Debug` 会隐去 Access Key Secret。
+/// 用 [`Config::from_env`] 加载，只读取进程环境变量，不自动加载 `.env`。
+/// `Debug` 会隐去 Access Key Secret。
 pub struct Config {
     access_key_id: String,
     access_key_secret: String,
@@ -45,6 +47,12 @@ impl Config {
     /// 可选：`BRIDGE_LISTEN`（默认 `127.0.0.1:8080`）、
     /// `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` 与 `BRIDGE_APP_HEARTBEAT_SECS`（默认都是 20）。
     /// WebSocket 心跳必须小于 30 秒，项目心跳必须小于 60 秒。
+    /// 读取的文本去掉首尾空白；空白的可选变量使用默认值。
+    ///
+    /// # Errors
+    ///
+    /// 必填变量缺失或为空时返回 [`ConfigError::Missing`]；值不是 Unicode、
+    /// 项目 ID 不为正整数、地址无法解析或间隔超出范围时返回 [`ConfigError::Invalid`]。
     #[must_use = "加载失败时需要处理 ConfigError"]
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_reader(|key| std::env::var(key))
@@ -99,7 +107,7 @@ impl Config {
         self.app_id
     }
 
-    /// 下游客户端接入直播桥时连接的地址。
+    /// 预留的下游监听地址。读取此值不会启动服务。
     #[must_use]
     pub const fn listen(&self) -> SocketAddr {
         self.listen
@@ -111,7 +119,7 @@ impl Config {
         self.websocket_heartbeat
     }
 
-    /// 项目心跳（`/v2/app/heartbeat`）发送间隔。
+    /// 项目心跳发送间隔。会话管理器使用批量 API，低层调用方也可用于单场心跳。
     #[must_use]
     pub const fn app_heartbeat(&self) -> Duration {
         self.app_heartbeat

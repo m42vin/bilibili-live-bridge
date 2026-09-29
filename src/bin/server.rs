@@ -1,3 +1,7 @@
+//! 预留的外部客户端服务入口。
+//!
+//! 当前只初始化日志并提示未实现，不绑定监听地址或提供接入协议。
+
 // Copyright (c) 2026 Marvine
 //
 // Licensed under the Apache License, Version 2.0 <LICENCE-APACHE or

@@ -1,7 +1,8 @@
 //! 开放平台应用 API。
 //!
 //! 覆盖 `/v2/app/start`、`/v2/app/heartbeat`、`/v2/app/batchHeartbeat` 和 `/v2/app/end`。
-//! 每次请求都按统一鉴权对这份 JSON 正文签名。Access Key 只留在 [`Client`] 里。
+//! 每次请求都按统一鉴权对实际发送的 JSON 正文签名，客户端保存签名凭据。
+//! HTTP 状态错误与平台业务错误分别由 [`ApiError::Status`] 和 [`ApiError::Platform`] 表达。
 
 use std::collections::HashSet;
 use std::fmt;
@@ -30,6 +31,8 @@ const BATCH_HEARTBEAT_PATH: &str = "/v2/app/batchHeartbeat";
 /// 对开放平台发起已签名的应用 API 请求。
 ///
 /// 用 [`Client::from_config`] 或 [`Client::new`] 创建。`Clone` 共享同一个 HTTP 连接池。
+/// 请求总超时为 10 秒、连接超时为 5 秒，不跟随重定向，也不使用系统代理。
+/// 此类型不启动心跳任务，不会在析构时关闭已开启的场次。
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -41,6 +44,11 @@ pub struct Client {
 
 impl Client {
     /// 用 Access Key 和项目 ID 创建客户端，请求发往 [`API_ORIGIN`]。
+    ///
+    /// # Errors
+    ///
+    /// 凭据去掉首尾空白后为空、Access Key Id 不能作为请求头或 `app_id <= 0` 时
+    /// 返回 [`ApiError::Invalid`]；HTTP 客户端初始化失败时返回 [`ApiError::Transport`]。
     #[must_use = "创建失败时需要处理 ApiError"]
     pub fn new(
         access_key_id: impl AsRef<str>,
@@ -51,6 +59,10 @@ impl Client {
     }
 
     /// 用进程配置创建客户端。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Client::new`] 相同，不在此处读取或修改进程环境变量。
     #[must_use = "创建失败时需要处理 ApiError"]
     pub fn from_config(config: &Config) -> Result<Self, ApiError> {
         Self::new(
@@ -104,7 +116,13 @@ impl Client {
     /// 用主播身份码开启一场互动。
     ///
     /// 成功后用 [`crate::open_live::ws::Connection::from_start`] 连接返回的 `wss_link`，
-    /// 并在结束时调用 [`Client::end`]。项目心跳仍然走 [`Client::heartbeat`]。
+    /// 并在结束时调用 [`Client::end`]。项目心跳使用 [`Client::heartbeat`] 或
+    /// [`Client::batch_heartbeat`]；丢弃返回值不会自动结束场次。
+    ///
+    /// # Errors
+    ///
+    /// 身份码去掉首尾空白后为空、响应缺少必要的场次信息、HTTP 请求失败、
+    /// 响应无法解析或平台拒绝开启时返回 [`ApiError`]。
     #[must_use = "开启失败时需要处理 ApiError"]
     #[tracing::instrument(skip_all, fields(app_id = self.app_id))]
     pub async fn start(&self, code: &str) -> Result<StartResult, ApiError> {
@@ -128,6 +146,10 @@ impl Client {
     }
 
     /// 关闭一场互动，并同步下线互动道具。
+    ///
+    /// # Errors
+    ///
+    /// `game_id` 去掉首尾空白后为空，或 HTTP 请求、响应解析和平台处理失败时返回错误。
     #[must_use = "关闭失败时需要处理 ApiError"]
     #[tracing::instrument(skip_all, fields(game_id = game_id))]
     pub async fn end(&self, game_id: &str) -> Result<(), ApiError> {
@@ -147,6 +169,11 @@ impl Client {
     /// 维持一场互动。开放平台建议每 20 秒调用一次。
     ///
     /// 互动玩法超过 60 秒、插件和工具超过 180 秒没有项目心跳时，平台会关闭这场 `game_id`。
+    /// 本方法只发送一次请求，不启动定时任务。
+    ///
+    /// # Errors
+    ///
+    /// `game_id` 去掉首尾空白后为空，或 HTTP 请求、响应解析和平台处理失败时返回错误。
     #[must_use = "心跳失败时需要处理 ApiError"]
     pub async fn heartbeat(&self, game_id: &str) -> Result<(), ApiError> {
         let game_id = required_text(game_id, "game_id 不能为空")?;
@@ -156,9 +183,15 @@ impl Client {
         Ok(())
     }
 
-    /// 一次为多场互动发送心跳。`game_ids` 去重后数量须在 1 到 [`MAX_BATCH_HEARTBEAT`] 之间。
+    /// 一次为多场互动发送心跳。`game_ids` 数量须在 1 到 [`MAX_BATCH_HEARTBEAT`] 之间。
     ///
+    /// 每个 ID 去掉首尾空白后必须非空且互不重复；本方法不会自动去重或拆分请求。
     /// 调用本身成功时，仍然可能有一部分 `game_id` 失败，结果在 [`BatchHeartbeatResult::failed_game_ids`]。
+    ///
+    /// # Errors
+    ///
+    /// 列表为空、包含空白或重复 ID、数量超过上限时，在发送请求前返回
+    /// [`ApiError::Invalid`]；HTTP 请求、响应解析或平台业务失败时也返回错误。
     #[must_use = "批量心跳失败时需要处理 ApiError"]
     pub async fn batch_heartbeat(
         &self,
@@ -197,6 +230,7 @@ impl Client {
         tracing::debug!("发送开放平台请求");
         let body = serde_json::to_string(body)
             .map_err(|error| ApiError::invalid(format!("构造请求体失败：{error}")))?;
+        // 签名与发送必须使用同一份序列化结果，重新序列化可能改变正文的 MD5。
         let signed = auth::sign(
             &self.access_key_id,
             &self.access_key_secret,
@@ -242,6 +276,9 @@ impl fmt::Debug for Client {
 }
 
 /// `/v2/app/start` 成功后的一场互动。
+///
+/// 保存场次、官方连接鉴权信息及主播资料，不持有网络连接。
+/// `Debug` 隐去鉴权正文；丢弃此值不调用 [`Client::end`]。
 #[derive(Clone, PartialEq, Eq)]
 pub struct StartResult {
     game_id: String,
@@ -258,6 +295,7 @@ impl StartResult {
     }
 
     /// 官方 WebSocket 鉴权包正文。原样放进长连接的第一个包。
+    /// 此内容属于连接凭据，不应记录到日志或转发给订阅者。
     #[must_use]
     pub fn auth_body(&self) -> &str {
         &self.auth_body
@@ -265,7 +303,8 @@ impl StartResult {
 
     /// 官方 WebSocket 地址，按平台返回的可用顺序排列。
     ///
-    /// 先连第一个，连接失败再换后面的集群。
+    /// [`crate::open_live::ws::Connection`] 在建连时按此顺序尝试地址。
+    /// 鉴权被明确拒绝时停止尝试；已建立连接断开后不会自动切换。
     #[must_use]
     pub fn wss_link(&self) -> &[String] {
         &self.wss_link

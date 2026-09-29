@@ -17,14 +17,17 @@ use crate::config::Config;
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
 
+/// 每个生产会话的广播缓冲容量；慢订阅者溢出后跳过旧事件，不拖住其他订阅者。
 const DEFAULT_EVENT_CAPACITY: usize = 256;
-/// 项目心跳连续传输失败达到这个次数后关闭会话。20 秒间隔下大约覆盖平台 60 秒的超时。
+/// 项目心跳连续非业务错误达到这个次数后关闭会话，包括传输、HTTP 状态和解码失败。
 const HEARTBEAT_TRANSPORT_LIMIT: u8 = 3;
 
 /// 直播桥上的全部会话。
 ///
 /// [`Manager::attach`] 用身份码加入一场互动。同一个身份码，或 `start` 返回的同一个房间，
 /// 共用一条官方长连接。`Clone` 共享这些会话。
+/// 分别构造的管理器不会共享会话。析构管理器不等待清理，退出前需要调用
+/// [`Manager::shutdown`] 并保持 Tokio runtime 存活。
 ///
 /// 生产环境用 [`Manager::from_config`] 创建。那里会限制 WebSocket 心跳小于 30 秒、项目心跳小于 60 秒。
 #[derive(Clone)]
@@ -36,7 +39,11 @@ impl Manager {
     /// 用已经构造好的应用 API 客户端创建会话管理器。
     ///
     /// `websocket_heartbeat` 传给官方长连接，`app_heartbeat` 是 `/v2/app/batchHeartbeat` 的间隔。
-    /// 两个间隔都必须大于 0。
+    /// 两个间隔都必须大于 0；本构造方法不检查平台心跳上限。
+    ///
+    /// # Errors
+    ///
+    /// 任一间隔为零时返回 [`SessionError::Invalid`]。
     #[must_use = "创建失败时需要处理 SessionError"]
     pub fn new(
         api: api::Client,
@@ -55,6 +62,10 @@ impl Manager {
     }
 
     /// 用进程配置创建会话管理器。
+    ///
+    /// # Errors
+    ///
+    /// HTTP 客户端初始化失败或心跳间隔无效时返回 [`SessionError::Invalid`]。
     #[must_use = "创建失败时需要处理 SessionError"]
     pub fn from_config(config: &Config) -> Result<Self, SessionError> {
         let api = api::Client::from_config(config)
@@ -65,9 +76,17 @@ impl Manager {
     /// 用身份码接入一场会话。
     ///
     /// 身份码前后的空白会去掉。同一个码的并发接入只会调用一次 `/v2/app/start`。
-    /// 另一个码如果开启了同一个房间，后一次开启会被关掉，调用方改挂到已有的那场。
+    /// 另一个码如果成功开启并返回同一个房间，会尝试关闭后一次场次，调用方改挂到已有的那场。
+    /// 平台拒绝另一个码的开启时直接返回错误，不会根据房间索引绕过该错误。
     ///
     /// 返回的 [`Subscription`] 被丢弃时记一次离开。最后一个离开的下游会触发 `/v2/app/end`。
+    /// 同码上一场正在清理时等待其完成；接入返回 `Closed` 且未关闭管理器时额外尝试一次。
+    /// 已运行会话断开后不自动重连，需要调用方重新接入。
+    ///
+    /// # Errors
+    ///
+    /// 空身份码、管理器正在关闭、开启或建连失败，以及接入完成前会话结束时，
+    /// 返回对应的 [`SessionError`]。
     #[must_use = "接入失败时需要处理 SessionError"]
     #[tracing::instrument(skip_all, err(Display, level = "warn"))]
     pub async fn attach(&self, code: &str) -> Result<Subscription, SessionError> {
@@ -86,10 +105,13 @@ impl Manager {
         Ok(subscription)
     }
 
-    /// 停止批量心跳，关闭全部会话，并等待每一场都调用完 `/v2/app/end`。
+    /// 停止批量心跳，关闭所管理的会话，并等待本地清理流程完成。
     ///
     /// 返回之后，新的 [`Manager::attach`] 得到 [`SessionError::ShuttingDown`]。
     /// 可以再次调用；已经结束的会话不会再关闭一次。
+    /// 官方连接或 `end` 清理失败会记录日志，不从本方法返回，也不自动重试；
+    /// 返回不保证平台已确认场次结束成功。调用方应等待此 future 完成再退出 runtime。
+    /// 被取消的接入任务派生的尽力清理不纳入此处等待，应先协调并发接入任务结束。
     #[must_use = "丢弃后不会等待场次关闭"]
     pub async fn shutdown(&self) {
         self.state.shutdown().await;
@@ -153,10 +175,11 @@ impl fmt::Debug for Manager {
     }
 }
 
-/// 下游收到的一场会话。
+/// 一场会话的进程内事件订阅。
 ///
-/// 丢弃这个值表示该下游离开。不要用 [`std::mem::forget`] 丢掉它，否则这场会话会计数泄漏，
-/// 官方侧会一直保持到心跳超时。
+/// 每个订阅独立读取，生产会话使用容量为 256 的广播缓冲。新订阅不回放加入前的事件。
+/// 丢弃这个值表示该订阅者离开，但不会等待网络清理。不要用 [`std::mem::forget`] 跳过析构，
+/// 否则订阅计数无法释放，场次可能持续存活，需要通过 [`Manager::shutdown`] 清理。
 #[must_use = "丢弃订阅会在没有其他接入方时关闭这场会话"]
 pub struct Subscription {
     room_id: i64,
@@ -190,6 +213,12 @@ impl Subscription {
     ///
     /// 落后的订阅者收到 [`RecvError::Lagged`]，官方连接和其他下游不会被拖住。
     /// 再调用一次即可从保留下来的事件继续读。会话结束且缓冲读完后返回 [`RecvError::Closed`]。
+    /// 被覆盖的事件不会补发；返回的 `Arc` 与其他订阅者共享同一份事件。
+    ///
+    /// # Errors
+    ///
+    /// 缓冲覆盖未读事件时返回 [`RecvError::Lagged`]；
+    /// 所有发送端释放且缓冲读完时返回 [`RecvError::Closed`]。
     #[must_use = "读取失败时需要处理 RecvError"]
     pub async fn recv(&mut self) -> Result<Arc<LiveEvent>, RecvError> {
         match self.events.recv().await {
@@ -244,6 +273,7 @@ impl fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
+/// 同一个管理器及其克隆共享的索引、心跳登记和关闭信号。
 struct State {
     platform: Arc<dyn Platform>,
     app_heartbeat: Duration,
@@ -262,6 +292,7 @@ struct BeatSlot {
     transport_failures: u8,
 }
 
+/// 两个索引可能指向同一会话；迁移与移除时需保持关联，并确认会话身份。
 struct Tables {
     by_code: HashMap<String, Arc<Session>>,
     by_room: HashMap<i64, Arc<Session>>,
@@ -442,6 +473,7 @@ impl State {
             snapshot(&tables)
         };
         tracing::info!(session_count = sessions.len(), "开始关闭会话管理器");
+        // 先等待统一心跳任务停止，再发起本次主动关闭。
         self.stop_heartbeat().await;
         for session in &sessions {
             session.begin_close();
@@ -548,6 +580,8 @@ enum RoomDecision {
     Abort,
 }
 
+/// 首个接入的清理守卫。取消时只为已经取得 ID 的场次派生尽力清理任务。
+/// 派生任务不加入会话完成等待，不能替代调用方协调接入任务和显式 shutdown。
 struct Leader {
     session: Arc<Session>,
     platform: Arc<dyn Platform>,
@@ -708,6 +742,7 @@ fn spawn_upstream(
     );
 }
 
+/// 被身份码和房间索引共享的会话。弱引用管理器，避免形成状态与会话的引用环。
 struct Session {
     state: Weak<State>,
     phase: watch::Sender<Phase>,
@@ -724,6 +759,7 @@ struct Subscribers {
     closing: bool,
 }
 
+/// 接入状态通过 watch 发布；正在关闭另由订阅计数中的 closing 标记表达。
 #[derive(Clone)]
 enum Phase {
     Starting,
@@ -819,6 +855,7 @@ impl Session {
             }
         }?;
         {
+            // Ready 与正在关闭可以同时存在，必须在计数锁内再次确认能否加入。
             let mut subscribers = lock(&self.subscribers);
             if subscribers.closing {
                 return None;
@@ -927,6 +964,7 @@ impl Stop {
     async fn cancelled(&self) {
         let notified = self.0.notify.notified();
         let mut notified = std::pin::pin!(notified);
+        // 先登记等待，再检查状态，避免 cancel 发生在检查与实际等待之间。
         notified.as_mut().enable();
         if self.0.cancelled.load(Ordering::SeqCst) {
             return;
@@ -961,7 +999,7 @@ async fn run_heartbeats(state: Weak<State>, stop: Stop, every: Duration) {
             current.mark_heartbeat_finished();
             return;
         }
-        // `interval` 的第一次 tick 会立刻就绪。先把它丢掉，让刚开启的场次等满一个间隔。
+        // 丢弃调度器第一次立即就绪的 tick；后来注册的场次参与下一轮统一心跳。
         if !armed {
             armed = true;
             continue;
@@ -997,6 +1035,7 @@ async fn pump(state: &State) {
     for chunk in pending.chunks(api::MAX_BATCH_HEARTBEAT) {
         let current: Vec<PendingBeat> = {
             let beats = lock(&state.beats);
+            // 快照之后可能关闭或替换会话，旧批次不能作用于新的登记项。
             chunk
                 .iter()
                 .filter(|beat| {
@@ -1016,6 +1055,7 @@ async fn pump(state: &State) {
 
 async fn dispatch_chunk(state: &State, chunk: &[PendingBeat]) {
     let game_ids: Vec<String> = chunk.iter().map(|beat| beat.game_id.clone()).collect();
+    // Some 表示有确定的业务结果；None 表示非业务错误，按场次累积失败次数。
     let failed = match state.platform.batch_heartbeat(&game_ids).await {
         Ok(result) => {
             tracing::debug!(

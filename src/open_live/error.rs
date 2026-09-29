@@ -7,9 +7,9 @@ use std::fmt;
 /// 调用应用 API 失败。
 #[derive(Debug)]
 pub enum ApiError {
-    /// 请求还没发出，参数不满足开放平台的约束。
+    /// 参数不满足约束，或成功响应缺少必要的场次信息。
     Invalid {
-        /// 哪一项不满足约束。不含密钥、身份码或鉴权正文。
+        /// 参数或响应哪里不满足约束。不含密钥、身份码或鉴权正文。
         message: String,
     },
     /// HTTP 客户端或传输失败。
@@ -19,7 +19,7 @@ pub enum ApiError {
         /// reqwest 返回的原因。
         source: Box<reqwest::Error>,
     },
-    /// 响应不是约定的 JSON 信封，或成功结果缺少字段。
+    /// 响应不是约定的 JSON 信封，或结果结构无法反序列化。
     Decode {
         /// serde 的解析说明。不含响应正文。
         message: String,
@@ -194,7 +194,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// 把平台返回的整数转成错误码。
+    /// 把平台返回的整数转成错误码，未识别的值保留在 [`ErrorCode::Other`]。
     #[must_use]
     pub const fn from_raw(code: i64) -> Self {
         match code {
