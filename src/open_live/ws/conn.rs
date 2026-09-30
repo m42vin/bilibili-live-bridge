@@ -53,6 +53,8 @@ impl Connection {
     /// 连接、超时、或在鉴权回复前断开时会换下一个地址。鉴权回复明确失败时不再尝试其余地址。
     /// `heartbeat` 是 WebSocket 心跳间隔，必须大于 0。项目心跳要另外调用应用 API。
     /// 每个候选地址的连接和鉴权总共最多等待 10 秒。
+    /// 鉴权成功前最多缓存 32 条事件；成功回复之后的同帧事件按正常帧上限处理，
+    /// 所有已缓存事件由 [`Connection::recv`] 按接收顺序返回。
     ///
     /// # Errors
     ///
@@ -310,7 +312,8 @@ async fn establish(
                             authenticated = true;
                         }
                         FrameItem::Event(event) => {
-                            if early_events.len() >= MAX_EARLY_EVENTS {
+                            // 同帧鉴权成功后的事件仅受正常帧预算约束。
+                            if !authenticated && early_events.len() >= MAX_EARLY_EVENTS {
                                 return Err(Attempt::Retry("鉴权完成前收到过多推送".to_owned()));
                             }
                             early_events.push_back(*event);

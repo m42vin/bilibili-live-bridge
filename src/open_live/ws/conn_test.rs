@@ -239,3 +239,130 @@ async fn close_frame_send_tolerates_an_already_closed_writer() {
     let mut writer = std::pin::pin!(writer);
     send_close(&mut writer).await.unwrap();
 }
+
+#[tokio::test]
+async fn auth_frame_delivers_events_in_order_across_the_early_event_limit() {
+    // 32 条鉴权前事件仍合法；鉴权后的事件不再计入该上限。
+    for (before, after) in [(0, 32), (0, 33), (32, 0), (32, 33)] {
+        for split_before in [false, true] {
+            let mut frames = Vec::new();
+            let mut frame = numbered_events(0, before);
+            if split_before && !frame.is_empty() {
+                frames.push(std::mem::take(&mut frame));
+            }
+            frame.extend(encode(Operation::AuthReply, br#"{"code":0}"#).unwrap());
+            frame.extend(numbered_events(before, after));
+            frames.push(frame);
+            let mut connection = connect_with_frames(frames).await.unwrap();
+            for index in 0..before + after {
+                let event = connection.recv().await.unwrap().unwrap();
+                assert_eq!(danmaku_msg(event), index.to_string());
+            }
+            assert!(connection.recv().await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejects_the_33rd_early_event_before_auth_in_one_or_multiple_frames() {
+    for split in [0, 16, 32] {
+        let mut frames = Vec::new();
+        if split != 0 {
+            frames.push(numbered_events(0, split));
+        }
+        let mut frame = numbered_events(split, 33 - split);
+        frame.extend(encode(Operation::AuthReply, br#"{"code":0}"#).unwrap());
+        frames.push(frame);
+        let error = connect_with_frames(frames).await.unwrap_err();
+        assert!(matches!(error, WsError::Connect { .. }));
+        assert!(error.to_string().contains("鉴权完成前收到过多推送"));
+    }
+}
+
+#[tokio::test]
+async fn auth_rejection_remains_fatal_before_and_after_bundled_events() {
+    for accepted_first in [false, true] {
+        let mut frame = if accepted_first {
+            encode(Operation::AuthReply, br#"{"code":0}"#).unwrap()
+        } else {
+            Vec::new()
+        };
+        // 成功回复后即使已经排入 33 条事件，仍必须检查后续鉴权错误。
+        frame.extend(numbered_events(0, if accepted_first { 33 } else { 32 }));
+        frame.extend(encode(Operation::AuthReply, br#"{"code":7007}"#).unwrap());
+        frame.extend(numbered_events(33, 33));
+        let error = connect_with_frames(vec![frame]).await.unwrap_err();
+        assert!(matches!(error, WsError::Protocol { .. }));
+        assert_eq!(error.to_string(), "官方长连接鉴权失败：7007");
+    }
+}
+
+#[tokio::test]
+async fn authenticated_events_still_obey_the_normal_frame_packet_budget() {
+    // 正常帧最多 4096 个包，包含一个鉴权回复。
+    for events in [4095, 4096] {
+        let mut frame = encode(Operation::AuthReply, br#"{"code":0}"#).unwrap();
+        frame.extend(numbered_events(0, events));
+        assert!(frame.len() < packet::MAX_PACKET_LEN);
+        let result = connect_with_frames(vec![frame]).await;
+        if events == 4095 {
+            let mut connection = result.unwrap();
+            for index in 0..events {
+                assert_eq!(
+                    danmaku_msg(connection.recv().await.unwrap().unwrap()),
+                    index.to_string()
+                );
+            }
+            assert!(connection.recv().await.unwrap().is_none());
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, WsError::Connect { .. }));
+            assert!(error.to_string().contains("单个帧里的长连接包过多"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_packet_after_auth_and_events_is_not_ignored() {
+    let mut frame = encode(Operation::AuthReply, br#"{"code":0}"#).unwrap();
+    frame.extend(numbered_events(0, 33));
+    frame.push(0);
+    let error = connect_with_frames(vec![frame]).await.unwrap_err();
+    assert!(matches!(error, WsError::Connect { .. }));
+    assert!(error.to_string().contains("长连接包不完整"));
+}
+
+fn numbered_events(start: usize, count: usize) -> Vec<u8> {
+    let mut frame = Vec::new();
+    for index in start..start + count {
+        frame.extend(encode(Operation::Notification, &dm(&index.to_string())).unwrap());
+    }
+    frame
+}
+
+async fn connect_with_frames(frames: Vec<Vec<u8>>) -> Result<Connection, WsError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let _auth = next_binary(&mut socket).await;
+        for frame in frames {
+            socket.send(Message::binary(frame)).await.unwrap();
+        }
+        // 拒绝鉴权或协议输入时，客户端可能已丢弃连接。
+        let _ = socket.send(Message::Close(None)).await;
+    });
+    let result = timeout(
+        Duration::from_secs(3),
+        Connection::connect(
+            [format!("ws://{address}")],
+            "auth-body",
+            Duration::from_secs(20),
+        ),
+    )
+    .await
+    .expect("bundled auth exchange timed out");
+    server.await.unwrap();
+    result
+}
