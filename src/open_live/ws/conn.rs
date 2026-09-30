@@ -8,7 +8,7 @@ use std::fmt;
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::{Interval, MissedTickBehavior, interval};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -24,6 +24,7 @@ use super::packet::{self, FrameItem, Operation, decode_frame};
 use crate::open_live::api::StartResult;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EARLY_EVENTS: usize = 32;
 
 type Upstream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -168,11 +169,12 @@ impl Connection {
 
     /// 发送关闭帧。已经标记关闭后再次调用没有额外效果，也不会重试失败的发送。
     ///
+    /// 发送最多等待 5 秒；失败或超时后不再读写，调用方应丢弃连接以释放传输层。
     /// 本方法只处理官方长连接，不调用 [`crate::open_live::api::Client::end`]。
     ///
     /// # Errors
     ///
-    /// 发送失败且连接尚未由底层确认关闭时返回 [`WsError::Transport`]。
+    /// 发送超时，或发送失败且连接尚未由底层确认关闭时返回 [`WsError::Transport`]。
     #[must_use = "关闭失败时需要处理 WsError"]
     pub async fn close(&mut self) -> Result<(), WsError> {
         if self.closed {
@@ -180,11 +182,7 @@ impl Connection {
         }
         self.pending_write = None;
         self.closed = true;
-        match self.write.send(Message::Close(None)).await {
-            Ok(()) => Ok(()),
-            Err(error) if socket_closed(&error) => Ok(()),
-            Err(error) => Err(WsError::transport("关闭官方长连接失败", error)),
-        }
+        send_close(&mut self.write).await
     }
 
     fn consume(&mut self, incoming: Option<Result<Message, SocketError>>) -> Result<(), WsError> {
@@ -336,6 +334,17 @@ async fn establish(
                 }
             }
         }
+    }
+}
+
+async fn send_close(
+    write: &mut (impl Sink<Message, Error = SocketError> + Unpin),
+) -> Result<(), WsError> {
+    match tokio::time::timeout(CLOSE_TIMEOUT, write.send(Message::Close(None))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) if socket_closed(&error) => Ok(()),
+        Ok(Err(error)) => Err(WsError::transport("关闭官方长连接失败", error)),
+        Err(error) => Err(WsError::transport("关闭官方长连接超时", error)),
     }
 }
 

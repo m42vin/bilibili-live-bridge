@@ -151,6 +151,86 @@ async fn same_code_shares_one_upstream_and_fans_events_out() {
     assert!(socket.is_closed());
 }
 
+#[tokio::test(start_paused = true)]
+async fn pending_socket_close_does_not_block_shutdown_or_local_cleanup() {
+    // 即使 end 也失败，关闭超时后仍须释放索引、广播和完成通知。
+    for fail_end in [false, true] {
+        let mock = Mock::new();
+        mock.push_ok("game-1", 7);
+        mock.push_connect_ok();
+        if fail_end {
+            mock.fail_end();
+        }
+        let manager = manager(&mock, QUIET);
+        let mut sub = manager.attach(CODE).await.unwrap();
+        let session = Arc::clone(&sub.session);
+        let socket = mock.connection(0);
+        socket.hold_close();
+        let started = tokio::time::Instant::now();
+
+        timeout(
+            super::SOCKET_CLOSE_TIMEOUT + Duration::from_secs(1),
+            async {
+                tokio::join!(manager.shutdown(), session.until_finished());
+            },
+        )
+        .await
+        .expect("pending close blocked shutdown or its completion notification");
+
+        assert_eq!(started.elapsed(), super::SOCKET_CLOSE_TIMEOUT);
+        assert!(
+            socket.is_closed(),
+            "close must be attempted before timing out"
+        );
+        assert!(
+            socket.tx.is_closed(),
+            "socket must be dropped after timeout"
+        );
+        assert_eq!(mock.end_attempts(), 1);
+        assert!(session.is_finished());
+        assert!(super::lock(&manager.state.tables).by_code.is_empty());
+        assert!(super::lock(&manager.state.tables).by_room.is_empty());
+        assert!(super::lock(&manager.state.beats).is_empty());
+        assert_eq!(sub.recv().await.unwrap_err(), RecvError::Closed);
+        let _ = manager.shutdown().await;
+        drop(sub);
+        assert_eq!(mock.end_attempts(), 1, "cleanup must not run twice");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_socket_close_allows_same_code_to_start_after_cleanup() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    mock.push_ok("game-2", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let first = manager.attach(CODE).await.unwrap();
+    let old_session = Arc::clone(&first.session);
+    let old_socket = mock.connection(0);
+    old_socket.hold_close();
+    drop(first);
+
+    let second = timeout(
+        super::SOCKET_CLOSE_TIMEOUT + Duration::from_secs(1),
+        manager.attach(CODE),
+    )
+    .await
+    .expect("same-code attach waited forever for socket close")
+    .unwrap();
+
+    assert!(old_session.is_finished());
+    assert!(old_socket.tx.is_closed());
+    assert_eq!(mock.ends(), ["game-1".to_owned()]);
+    assert_eq!(mock.start_codes(), [CODE.to_owned(), CODE.to_owned()]);
+    assert_eq!(second.game_id(), "game-2");
+    assert_eq!(super::lock(&manager.state.tables).by_code.len(), 1);
+    assert_eq!(super::lock(&manager.state.tables).by_room.len(), 1);
+    let _ = manager.shutdown().await;
+    assert_eq!(mock.ends(), ["game-1".to_owned(), "game-2".to_owned()]);
+}
+
 #[tokio::test]
 async fn concurrent_attaches_with_the_same_code_start_once() {
     let mock = Mock::new();
@@ -686,6 +766,7 @@ enum HeartbeatMode {
 struct TestConn {
     tx: mpsc::UnboundedSender<Option<LiveEvent>>,
     closed: Arc<AtomicBool>,
+    hold_close: Arc<AtomicBool>,
     received: watch::Receiver<usize>,
 }
 
@@ -698,6 +779,10 @@ impl TestConn {
 
     fn hangup(&self) {
         self.tx.send(None).expect("session dropped the socket");
+    }
+
+    fn hold_close(&self) {
+        self.hold_close.store(true, Ordering::SeqCst);
     }
 
     fn is_closed(&self) -> bool {
@@ -719,6 +804,7 @@ impl TestConn {
 struct MockSocket {
     incoming: mpsc::UnboundedReceiver<Option<LiveEvent>>,
     closed: Arc<AtomicBool>,
+    hold_close: Arc<AtomicBool>,
     received: watch::Sender<usize>,
 }
 
@@ -955,15 +1041,18 @@ impl Platform for Mock {
                 ConnectPlan::Ok => {
                     let (tx, incoming) = mpsc::unbounded_channel();
                     let closed = Arc::new(AtomicBool::new(false));
+                    let hold_close = Arc::new(AtomicBool::new(false));
                     let (received, received_rx) = watch::channel(0);
                     super::lock(&self.inner).connections.push(TestConn {
                         tx,
                         closed: Arc::clone(&closed),
+                        hold_close: Arc::clone(&hold_close),
                         received: received_rx,
                     });
                     let socket: Box<dyn LiveSocket> = Box::new(MockSocket {
                         incoming,
                         closed,
+                        hold_close,
                         received,
                     });
                     Ok(socket)
@@ -985,6 +1074,9 @@ impl LiveSocket for MockSocket {
     fn close(&mut self) -> BoxFuture<'_, Result<(), WsError>> {
         Box::pin(async move {
             self.closed.store(true, Ordering::SeqCst);
+            if self.hold_close.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         })
     }

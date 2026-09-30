@@ -19,6 +19,8 @@ use crate::open_live::ws::LiveEvent;
 
 /// 每个生产会话的广播缓冲容量；慢订阅者溢出后跳过旧事件，不拖住其他订阅者。
 const DEFAULT_EVENT_CAPACITY: usize = 256;
+/// 尽力发送关闭帧的上限，不能让写端背压阻塞场次结束和本地清理。
+const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 项目心跳连续非业务错误达到这个次数后关闭会话，包括传输、HTTP 状态和解码失败。
 const HEARTBEAT_TRANSPORT_LIMIT: u8 = 3;
 
@@ -146,6 +148,7 @@ impl Manager {
     ///
     /// 返回之后，新的 [`Manager::attach`] 得到 [`SessionError::ShuttingDown`]。
     /// 可以再次调用；已经结束的会话不会再关闭一次。
+    /// 官方连接关闭最多等待 5 秒，随后释放连接并继续调用 `end`。
     /// 官方连接或 `end` 清理失败会记录日志，不从本方法返回，也不自动重试；
     /// 返回不保证平台已确认场次结束成功。调用方应等待此 future 完成再退出 runtime。
     /// 被取消的接入任务派生的尽力清理不纳入此处等待，应先协调并发接入任务结束。
@@ -441,7 +444,7 @@ impl State {
             RoomDecision::Own => {}
         }
 
-        let mut socket = match self.platform.connect(&started).await {
+        let socket = match self.platform.connect(&started).await {
             Ok(socket) => socket,
             Err(error) => {
                 let end = self.platform.end(started.game_id()).await;
@@ -454,9 +457,7 @@ impl State {
         };
 
         if self.stopping(&session) {
-            if let Err(error) = socket.close().await {
-                tracing::warn!(game_id = started.game_id(), %error, "接入中止时关闭长连接失败");
-            }
+            close_socket(socket, started.game_id(), started.anchor().room_id).await;
             return abort(&mut leader, &session, SessionError::ShuttingDown).await;
         }
 
@@ -467,9 +468,7 @@ impl State {
             events.clone(),
         );
         let Some(subscription) = session.try_subscribe() else {
-            if let Err(error) = socket.close().await {
-                tracing::warn!(game_id = started.game_id(), %error, "接入中止时关闭长连接失败");
-            }
+            close_socket(socket, started.game_id(), started.anchor().room_id).await;
             return abort(&mut leader, &session, SessionError::ShuttingDown).await;
         };
 
@@ -719,6 +718,19 @@ enum Action {
     Fail(SessionError),
 }
 
+/// 取得所有权，确保超时取消关闭 future 后，在 end 请求前释放底层连接。
+async fn close_socket(mut socket: Box<dyn LiveSocket>, game_id: &str, room_id: i64) {
+    match tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, socket.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(room_id, %game_id, %error, "关闭官方长连接失败");
+        }
+        Err(_) => {
+            tracing::warn!(room_id, %game_id, "关闭官方长连接超时，释放连接并继续清理");
+        }
+    }
+}
+
 fn spawn_upstream(
     state: Arc<State>,
     session: Arc<Session>,
@@ -776,9 +788,7 @@ fn spawn_upstream(
 
             session.begin_close();
             session.stop.cancel();
-            if let Err(error) = socket.close().await {
-                tracing::warn!(room_id, %game_id, %error, "关闭官方长连接失败");
-            }
+            close_socket(socket, &game_id, room_id).await;
             if let Err(error) = state.platform.end(&game_id).await {
                 tracing::warn!(room_id, %game_id, %error, "关闭官方场次失败");
             }

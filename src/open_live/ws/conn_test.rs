@@ -209,3 +209,33 @@ fn danmaku_msg(event: LiveEvent) -> String {
         other => panic!("expected danmaku, got {other:?}"),
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn close_frame_send_times_out_when_the_writer_never_flushes() {
+    // 固定阻塞 flush，避免依赖操作系统 TCP 缓冲区大小制造背压。
+    let writer = futures_util::sink::unfold((), |(), message| async move {
+        assert_eq!(message, Message::Close(None));
+        std::future::pending::<Result<(), SocketError>>().await
+    });
+    let mut writer = std::pin::pin!(writer);
+    let started = tokio::time::Instant::now();
+    let error = timeout(
+        CLOSE_TIMEOUT + Duration::from_secs(1),
+        send_close(&mut writer),
+    )
+    .await
+    .expect("close-frame write did not respect its timeout")
+    .unwrap_err();
+    assert_eq!(started.elapsed(), CLOSE_TIMEOUT);
+    assert!(matches!(error, WsError::Transport { .. }));
+    assert!(error.to_string().contains("关闭官方长连接超时"));
+}
+
+#[tokio::test]
+async fn close_frame_send_tolerates_an_already_closed_writer() {
+    let writer = futures_util::sink::unfold((), |(), _message| async {
+        Err::<(), _>(SocketError::AlreadyClosed)
+    });
+    let mut writer = std::pin::pin!(writer);
+    send_close(&mut writer).await.unwrap();
+}
