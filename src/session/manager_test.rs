@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tracing::instrument::WithSubscriber;
 
 use super::super::platform::{BoxFuture, LiveSocket, Platform};
-use super::{Manager, RecvError};
+use super::{Manager, ManagerOptions, RecvError};
 use crate::open_live::api::{Anchor, BatchHeartbeatResult, StartResult};
 use crate::open_live::error::{ApiError, ErrorCode};
 use crate::open_live::ws::{Danmaku, InteractionEnd, LiveEvent, WsError};
@@ -485,6 +485,132 @@ async fn next_attach_waits_until_the_previous_game_ends() {
     assert_eq!(mock.ends(), ["game-1".to_owned()]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn idle_grace_keeps_heartbeats_and_reconnect_cancels_the_old_deadline() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = grace_manager(&mock);
+    let first = manager.attach(CODE).await.unwrap();
+    let socket = mock.connection(0);
+    drop(first);
+
+    socket.emit(danmaku("during-idle"));
+    socket.wait_received(1).await;
+    manager.beat_once().await;
+    assert_eq!(mock.heartbeats(), ["game-1"]);
+    assert!(!socket.is_closed());
+    tokio::time::advance(Duration::from_secs(29)).await;
+    let mut second = manager.attach(CODE).await.unwrap();
+    assert_eq!(second.game_id(), "game-1");
+    assert_eq!(mock.start_codes(), [CODE]);
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    socket.emit(danmaku("after-reconnect"));
+    assert_eq!(text(&second.recv().await.unwrap()), "after-reconnect");
+    assert!(mock.ends().is_empty());
+
+    drop(second);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(mock.ends().is_empty());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    mock.wait_ends(1).await;
+    assert_eq!(mock.ends(), ["game-1"]);
+    let _ = manager.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_expiration_closes_once_and_next_attach_starts_a_new_game() {
+    let mock = Mock::new();
+    for game in ["game-1", "game-2"] {
+        mock.push_ok(game, 7);
+        mock.push_connect_ok();
+    }
+    let manager = grace_manager(&mock);
+    drop(manager.attach(CODE).await.unwrap());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let second = manager.attach(CODE).await.unwrap();
+    assert_eq!(second.game_id(), "game-2");
+    assert_eq!(mock.ends(), ["game-1"]);
+    assert_eq!(mock.connections().len(), 2);
+    let _ = manager.shutdown().await;
+    assert_eq!(mock.ends(), ["game-1", "game-2"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_events_and_upstream_close_bypass_idle_grace() {
+    for interaction_end in [true, false] {
+        let mock = Mock::new();
+        mock.push_ok("game-1", 7);
+        mock.push_connect_ok();
+        let manager = grace_manager(&mock);
+        drop(manager.attach(CODE).await.unwrap());
+        if interaction_end {
+            mock.connection(0)
+                .emit(LiveEvent::InteractionEnd(InteractionEnd {
+                    game_id: "game-1".to_owned(),
+                    ..InteractionEnd::default()
+                }));
+        } else {
+            mock.connection(0).hangup();
+        }
+        mock.wait_ends(1).await;
+        assert!(mock.connection(0).is_closed());
+        let _ = manager.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_and_heartbeat_failure_bypass_idle_grace() {
+    for heartbeat_failure in [true, false] {
+        let mock = Mock::new();
+        mock.push_ok("game-1", 7);
+        mock.push_connect_ok();
+        let manager = grace_manager(&mock);
+        drop(manager.attach(CODE).await.unwrap());
+        if heartbeat_failure {
+            mock.fail_heartbeats_with_platform();
+            manager.beat_once().await;
+            mock.wait_ends(1).await;
+        }
+        let _ = manager.shutdown().await;
+        assert_eq!(mock.ends(), ["game-1"]);
+        assert!(mock.connection(0).is_closed());
+    }
+}
+
+#[tokio::test]
+async fn lagged_subscription_continues_from_retained_events() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let mut subscription = manager.attach(CODE).await.unwrap();
+    let socket = mock.connection(0);
+    for index in 0..20 {
+        socket.emit(danmaku(&index.to_string()));
+    }
+    socket.wait_received(20).await;
+    assert_eq!(
+        subscription.recv().await.unwrap_err(),
+        RecvError::Lagged { skipped: 4 }
+    );
+    assert_eq!(text(&subscription.recv().await.unwrap()), "4");
+    let _ = manager.shutdown().await;
+}
+
+fn grace_manager(mock: &Arc<Mock>) -> Manager {
+    let platform: Arc<dyn Platform> = mock.clone();
+    Manager::from_parts(
+        platform,
+        QUIET,
+        16,
+        ManagerOptions {
+            idle_grace: Duration::from_secs(30),
+        },
+    )
+}
+
 fn manager(mock: &Arc<Mock>, app_heartbeat: Duration) -> Manager {
     let mock = Arc::clone(mock);
     let platform: Arc<dyn Platform> = mock;
@@ -560,6 +686,7 @@ enum HeartbeatMode {
 struct TestConn {
     tx: mpsc::UnboundedSender<Option<LiveEvent>>,
     closed: Arc<AtomicBool>,
+    received: watch::Receiver<usize>,
 }
 
 impl TestConn {
@@ -576,11 +703,23 @@ impl TestConn {
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
+    async fn wait_received(&self, count: usize) {
+        let mut received = self.received.clone();
+        timeout(
+            Duration::from_secs(2),
+            received.wait_for(|value| *value >= count),
+        )
+        .await
+        .expect("upstream did not receive events")
+        .unwrap();
+    }
 }
 
 struct MockSocket {
     incoming: mpsc::UnboundedReceiver<Option<LiveEvent>>,
     closed: Arc<AtomicBool>,
+    received: watch::Sender<usize>,
 }
 
 impl Mock {
@@ -816,11 +955,17 @@ impl Platform for Mock {
                 ConnectPlan::Ok => {
                     let (tx, incoming) = mpsc::unbounded_channel();
                     let closed = Arc::new(AtomicBool::new(false));
+                    let (received, received_rx) = watch::channel(0);
                     super::lock(&self.inner).connections.push(TestConn {
                         tx,
                         closed: Arc::clone(&closed),
+                        received: received_rx,
                     });
-                    let socket: Box<dyn LiveSocket> = Box::new(MockSocket { incoming, closed });
+                    let socket: Box<dyn LiveSocket> = Box::new(MockSocket {
+                        incoming,
+                        closed,
+                        received,
+                    });
                     Ok(socket)
                 }
             }
@@ -830,7 +975,11 @@ impl Platform for Mock {
 
 impl LiveSocket for MockSocket {
     fn recv(&mut self) -> BoxFuture<'_, Result<Option<LiveEvent>, WsError>> {
-        Box::pin(async move { Ok(self.incoming.recv().await.unwrap_or_default()) })
+        Box::pin(async move {
+            let event = self.incoming.recv().await.unwrap_or_default();
+            self.received.send_modify(|count| *count += 1);
+            Ok(event)
+        })
     }
 
     fn close(&mut self) -> BoxFuture<'_, Result<(), WsError>> {

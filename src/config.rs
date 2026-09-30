@@ -14,7 +14,7 @@ pub const ENV_ACCESS_KEY_ID: &str = "BILIBILI_ACCESS_KEY_ID";
 pub const ENV_ACCESS_KEY_SECRET: &str = "BILIBILI_ACCESS_KEY_SECRET";
 /// 项目 ID，对应开放平台的 `app_id`，类型是 i64。
 pub const ENV_APP_ID: &str = "BILIBILI_APP_ID";
-/// 预留的直播桥监听地址。未设置时采用本机回环地址；当前没有实现监听服务。
+/// 下游 WebSocket 服务的监听地址。未设置时采用本机回环地址。
 pub const ENV_LISTEN: &str = "BRIDGE_LISTEN";
 /// 官方 WebSocket 心跳间隔，单位秒。
 pub const ENV_WEBSOCKET_HEARTBEAT_SECS: &str = "BRIDGE_WEBSOCKET_HEARTBEAT_SECS";
@@ -107,7 +107,7 @@ impl Config {
         self.app_id
     }
 
-    /// 预留的下游监听地址。读取此值不会启动服务。
+    /// 下游监听地址。`server` 在此地址提供 `/ws`；读取此值不会启动服务。
     #[must_use]
     pub const fn listen(&self) -> SocketAddr {
         self.listen

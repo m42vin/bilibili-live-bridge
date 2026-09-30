@@ -6,7 +6,7 @@
 //!
 //! 项目心跳需要另外调用 [`api::Client::heartbeat`](super::api::Client::heartbeat) 或批量 API；
 //! [`crate::session::Manager`] 会统一维护。事件数据结构描述官方推送，
-//! 当前未定义面向外部客户端的消息封装。
+//! 面向外部客户端的消息封装由 [`crate::downstream`] 定义。
 
 mod cmd;
 mod conn;

@@ -7,7 +7,7 @@
 //!
 //! 配置只读取进程环境变量，不自动加载 `.env`。库不自动初始化日志；
 //! 可执行入口可以调用 [`logging::init`]，也可以使用自己的 tracing subscriber。
-//! 当前尚未提供外部客户端 WebSocket 服务或消息协议。
+//! [`downstream::serve`] 提供下游 WebSocket 服务，`server` 程序组装配置和退出流程。
 //!
 //! # 接入示例
 //!
@@ -64,6 +64,7 @@
 //! 进程退出前应等待 [`session::Manager::shutdown`]，并保持 Tokio runtime 存活。
 
 pub mod config;
+pub mod downstream;
 pub mod logging;
 pub mod open_live;
 pub mod session;

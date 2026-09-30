@@ -21,7 +21,8 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 
 单元测试使用假凭据、模拟平台和本地 HTTP / WebSocket 桩，不需要配置真实 Access Key 或身份码。网络桩会监听 `127.0.0.1` 的动态端口，运行测试的环境需要允许回环监听。
 
-当前没有外部客户端服务可供联调。`cargo run --locked --bin server` 只初始化日志并提示入口未实现；手动验证上游使用 README 中的三个示例程序。
+`cargo run --locked --bin server` 启动下游 WebSocket 服务，联调方式见 [客户端协议](downstream-protocol.md)；
+手动验证上游也可以使用 README 中的三个示例程序。
 
 ## 从哪里开始修改
 
@@ -35,6 +36,7 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 | 二进制包与压缩 | [packet.rs](../src/open_live/ws/packet.rs) | [packet_test.rs](../src/open_live/ws/packet_test.rs) |
 | 直播事件字段与命令 | [cmd.rs](../src/open_live/ws/cmd.rs) | [cmd_test.rs](../src/open_live/ws/cmd_test.rs) |
 | 会话复用、订阅与清理 | [manager.rs](../src/session/manager.rs)、[platform.rs](../src/session/platform.rs) | [manager_test.rs](../src/session/manager_test.rs) |
+| 下游 WebSocket 与协议 | [downstream.rs](../src/downstream.rs)、[protocol.rs](../src/downstream/protocol.rs) | [downstream_test.rs](../src/downstream/downstream_test.rs) |
 | 示例程序 | [src/bin](../src/bin/) | 构建检查；需要真实平台时手动运行 |
 
 ## 测试组织与调试
@@ -57,6 +59,7 @@ cargo test --locked --doc
 - HTTP 桩接收真实请求，检查路径、请求体和签名，再返回预设响应。
 - WebSocket 桩完成本地握手，检查鉴权包、心跳、Ping/Pong、同帧事件和候选地址切换。
 - 会话测试的 `Mock` 实现私有 `Platform` / `LiveSocket`，控制开启、连接、推送、心跳失败和结束时序。
+- 下游测试同时启动本地 HTTP、官方 WebSocket 和下游监听器，验证真实握手、事件分发、协议错误和任务清理。
 
 会话并发测试优先通过桩的通知或控制入口构造时序，再使用超时限制测试等待；避免用固定 sleep 猜测任务是否完成。项目心跳策略可以用测试专用的 `beat_once` 推进，不必等待真实周期。
 
@@ -98,7 +101,7 @@ RUST_LOG=info,bilibili_live_bridge=trace,ws_listen=debug cargo run --locked --bi
 根据改动选择相应的行为验证：
 
 - 同码并发只开启一次；跨码同房复用时清理重复场次。
-- 最后一个订阅离开才开始关闭；慢订阅者不阻塞其他订阅者。
+- 最后一个订阅离开后按闲置宽限期关闭；重连取消旧截止时间，到期只清理一次；慢订阅者不阻塞其他订阅者。
 - 互动结束事件先转发，再结束会话；上游关闭和读取失败都清理场次。
 - 心跳部分失败只影响对应场次；非业务错误按连续失败次数处理。
 - 接入期间关闭管理器、建连失败、结束失败，以及同码再次接入与上一场清理的竞态。

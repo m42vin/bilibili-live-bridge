@@ -2,7 +2,8 @@
 
 本文面向维护者，说明当前实现的模块边界、会话生命周期与并发约束。配置和运行步骤见 [README](../README.md)，开发与验证方法见 [开发指南](development.md)，平台协议资料见 [开放平台文档](open-live/README.md)。
 
-当前项目提供开放平台客户端和进程内会话管理。`server` 仍是占位入口；下文中的“订阅者”指持有 `Subscription` 的进程内调用方，外部 WebSocket 服务及客户端协议尚未实现。
+当前项目提供开放平台客户端、进程内会话管理及下游 WebSocket 服务。下文中的“订阅者”指持有
+`Subscription` 的调用方，也包括每条下游连接；外部协议见 [客户端协议](downstream-protocol.md)。
 
 ## 模块边界
 
@@ -15,7 +16,8 @@
 | `open_live::api` | 对 JSON 请求签名，调用开启、关闭、单场和批量心跳 API | `Client`、`StartResult` |
 | `open_live::ws` | 官方连接鉴权、WebSocket 心跳、包解码和直播事件解析 | `Connection`、`LiveEvent` |
 | `session` | 按身份码和房间复用会话，维护订阅、批量项目心跳及清理流程 | `Manager`、`Subscription` |
-| `bin` | 组装库功能，处理示例程序的退出和日志 | `http_auth`、`ws_listen`、`multi_client` |
+| `downstream` | WebSocket 接入、JSON 封装、独立发送及连接任务收尾 | `serve` |
+| `bin` | 组装库功能，处理服务和示例程序的退出及日志 | `server`、`http_auth`、`ws_listen`、`multi_client` |
 
 会话层通过私有的 [Platform / LiveSocket](../src/session/platform.rs) 调用平台能力。生产实现包装 `Client` 和 `Connection`，测试实现使用模拟平台。签名、二进制包和命令解析细节保留在各自模块内部。
 
@@ -31,6 +33,7 @@ flowchart LR
     Command --> Broadcast["会话 broadcast 通道"]
     Broadcast --> Subscription["Subscription::recv"]
     Subscription --> Caller
+    Subscription --> Downstream["downstream：JSON / 下游 WebSocket"]
 ```
 
 ## 标识与共享范围
@@ -78,7 +81,7 @@ flowchart LR
 实现维护以下约束：
 
 - `tables` 锁保护身份码和房间索引的联动更新；网络请求和等待操作在释放锁后进行。
-- 订阅计数与 `closing` 使用同一把锁。最后一个订阅释放后立即禁止加入，并通知上游任务停止。
+- 订阅计数、闲置截止时间与 `closing` 使用同一把锁。默认最后一个订阅释放后立即停止；配置宽限期时登记截止时间，重连取消截止时间。到期再次在锁内确认无人订阅并禁止加入。
 - 删除索引和处理心跳结果时会比较会话指针，避免旧会话的清理影响已经替换的索引项。
 - `Notify` 的等待先注册通知，再检查完成标记，避免检查与等待之间丢失唤醒。
 - 会话到管理器、心跳登记到会话使用弱引用；活动上游任务持有管理器状态，直到清理结束。
@@ -117,11 +120,26 @@ flowchart LR
 - 新订阅只接收订阅之后广播的事件，不回放加入前的消息。
 - 慢订阅者被覆盖的未读事件不会补发。`recv` 返回 `Lagged { skipped }`，再次读取从仍保留的事件继续。
 - 订阅读取不会阻塞上游或其他订阅者。上游发送 `InteractionEnd` 后开始清理；订阅者可继续读完保留的事件，然后收到 `Closed`。
-- 事件没有持久化或重放。已知事件结构的 serde 支持不等于完整 `LiveEvent` 的外部消息协议，未来服务需要单独定义消息封装。
+- 事件没有持久化或重放。`downstream::protocol` 为 `LiveEvent` 提供独立序列化适配器，定义 `type / room_id / cmd / data` 消息；不改变官方事件枚举本身。
+
+## 下游服务与闲置宽限期
+
+`server` 绑定 `Config::listen()`，所有连接共享一个 `Manager`，并设置 `ManagerOptions::idle_grace`
+为 30 秒。旧的 `Manager::new` 和 `Manager::from_config` 默认宽限期为零，保持立即清理行为。
+每条 `/ws` 连接提交一次身份码，取得独立 `Subscription`；先发送 `ready`，再按序读取和发送事件。
+
+每条连接的读写 future 并发运行，写端是唯一业务消息发送者，直接消费现有广播缓冲，不增加事件队列。
+读端持续驱动控制帧，将首包和连接状态交给写端；缓冲覆盖映射成 `lagged`，发送失败或超时释放订阅。
+接入期间断开仍推进 `attach` 至完成并释放结果。服务退出时同时推进 `Manager::shutdown` 和连接任务收尾，
+不会直接 abort 接入任务。握手失败日志不记录客户端提交的头或 URL。
+
+闲置截止时间通过 watch 通知上游任务，由其 select 循环驱动到期检查。宽限期间继续读取官方连接，
+没有广播接收者时丢弃事件并保持两类心跳；新的订阅只接收加入后的事件。互动结束、上游故障、心跳失效
+及主动 shutdown 都立即开始清理，不等待宽限期。
 
 ## 关闭与失败处理
 
-最后一个订阅释放、上游正常关闭或读取失败、收到 `InteractionEnd`、项目心跳达到关闭条件，以及调用 `Manager::shutdown`，都会触发会话关闭。
+最后一个订阅释放且闲置宽限期到期、上游正常关闭或读取失败、收到 `InteractionEnd`、项目心跳达到关闭条件，以及调用 `Manager::shutdown`，都会触发会话关闭。
 
 已建立会话的上游任务负责统一清理：
 
@@ -136,7 +154,7 @@ flowchart LR
 
 ## 配置与日志边界
 
-`Config::from_env` 只读取进程环境变量，不自动读取 `.env`。`RUST_LOG` 由日志初始化单独读取，`AUTH_CODE` 由示例程序读取；预留的监听地址当前没有对应监听服务。
+`Config::from_env` 只读取进程环境变量，不自动读取 `.env`。`RUST_LOG` 由日志初始化单独读取，`AUTH_CODE` 由示例程序读取；`server` 使用监听地址提供 `/ws`。
 
 库只产生 tracing 事件，不自动安装全局 subscriber。可执行入口调用 `logging::init`；嵌入其他程序时也可以使用调用方已有的日志配置。后台会话任务和心跳任务显式携带 span 和当前 subscriber，以保留异步上下文。
 
@@ -152,4 +170,5 @@ flowchart LR
 | 用私有平台 trait 隔离网络 | 会话测试可以控制启动、连接、心跳和清理时序，无需真实凭据 |
 | 将关闭集中在上游任务 | 订阅析构无需执行异步请求，完整退出需要显式等待管理器关闭 |
 
-外部客户端接入、断线恢复、持久化、多实例协调及服务部署均未实现。修改这些边界时，应同步更新本文、公共接口注释和行为测试；外部服务落地时另行维护客户端协议与部署指南。
+下游提供实时分发及 30 秒内重连复用，不补发历史事件。上游自动重连、持久化、多实例协调和公网部署尚未实现。
+修改这些边界时，应同步更新本文、客户端协议、公共接口注释和行为测试。

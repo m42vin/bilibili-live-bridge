@@ -2,7 +2,7 @@
 
 一个用 Rust 实现的轻量级 Bilibili 直播事件桥。通过官方直播开放平台，用主播身份码开启互动场次、接收官方 WebSocket 推送，并将解析后的直播间事件分发给多个订阅者。
 
-> 当前已实现开放平台客户端和进程内会话管理，可通过示例程序接收事件。`server` 仍是占位入口，尚未提供面向外部客户端的 WebSocket 服务与接入协议。
+提供开放平台客户端、进程内会话管理和面向本机客户端的 WebSocket 服务；下游协议见 [客户端协议](docs/downstream-protocol.md)。
 
 ## 已实现功能
 
@@ -12,6 +12,7 @@
 - **会话复用**：同一身份码的并发接入只开启一次场次；不同身份码关联同一房间时复用已有会话，共享一条官方长连接。
 - **共享心跳**：一个会话管理器统一维护项目心跳，每批最多包含 200 个 `game_id`；WebSocket 心跳由各自的官方连接维护。
 - **会话清理**：最后一个订阅者离开、互动结束、上游断开或心跳失败达到关闭条件时，尝试关闭官方场次；支持等待全部会话关闭。
+- **下游 WebSocket**：每条 `/ws` 连接订阅一个房间，按序推送 JSON 事件；报告缓冲溢出，支持 Ping/Pong、读写限制和优雅退出。服务在最后一个客户端离开后保留上游 30 秒供重连。
 - **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
 
 ## 快速开始
@@ -59,11 +60,29 @@ cargo run --locked --bin multi_client
 | `BILIBILI_ACCESS_KEY_ID` | 是 | 无 | 开放平台 Access Key Id |
 | `BILIBILI_ACCESS_KEY_SECRET` | 是 | 无 | 开放平台 Access Key Secret |
 | `BILIBILI_APP_ID` | 是 | 无 | 项目 ID，必须是大于 0 的 `i64` 整数 |
-| `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 预留的下游监听地址，格式为 IP 和端口；当前没有启动监听服务 |
+| `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
 | `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` | 否 | `20` | 官方 WebSocket 心跳间隔，整数秒，范围 `1..=29` |
 | `BRIDGE_APP_HEARTBEAT_SECS` | 否 | `20` | 项目心跳间隔，整数秒，范围 `1..=59` |
 | `RUST_LOG` | 否 | `info` | 日志级别和模块过滤，由日志初始化读取 |
 | `AUTH_CODE` | 示例程序需要 | 无 | 主播身份码，由示例程序单独读取，不属于 `Config` |
+
+### 启动 WebSocket 服务
+
+导出三个平台配置变量后运行：
+
+```sh
+cargo run --locked --bin server
+```
+
+本机客户端连接 `ws://127.0.0.1:8080/ws`，在握手后发送：
+
+```json
+{"type":"subscribe","code":"主播身份码"}
+```
+
+接入成功后先收到 `ready`，再收到带 `cmd` 和 `data` 的 `event`。多条同码连接共享一场上游互动；
+最后一个客户端离开后保留上游 30 秒，期间重连复用原场次，事件不补发。
+Ctrl-C 或 Unix SIGTERM 会停止接入并等待清理。完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
 ### 日志
 
@@ -103,7 +122,7 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 1. 用 `config::Config::from_env()` 加载配置，再用 `session::Manager::from_config(&config)` 创建管理器。
 2. 调用 `manager.attach(&auth_code).await` 获取 `Subscription`。克隆 `Manager` 会共享同一组会话。
 3. 调用 `subscription.recv().await` 接收 `Arc<LiveEvent>`，通过事件变体处理数据，或用 `event.cmd()` 获取平台命令名。
-4. 丢弃订阅表示离开；最后一个订阅者离开后触发场次关闭。进程退出前调用 `manager.shutdown().await`，等待全部场次完成关闭调用。
+4. 丢弃订阅表示离开；默认最后一个订阅者离开后立即关闭场次。通过 `Manager::with_options` 和 `ManagerOptions::idle_grace` 可以设置闲置宽限期。进程退出前调用 `manager.shutdown().await`，等待全部场次完成关闭调用。
 
 订阅落后时，`recv()` 返回 `RecvError::Lagged { skipped }`；再次读取会从保留的事件继续，不会阻塞其他订阅者。会话结束且缓冲读完后返回 `RecvError::Closed`。
 
@@ -125,11 +144,13 @@ cargo doc --no-deps --open
 | --- | --- |
 | [架构说明](docs/architecture.md) | 模块边界、会话复用、心跳、事件分发与关闭流程 |
 | [开发指南](docs/development.md) | 开发环境、测试与调试、常见扩展方式和注释维护 |
+| [下游客户端协议](docs/downstream-protocol.md) | WebSocket 接入、消息封装、心跳、重连和关闭语义 |
 | [`src/config.rs`](src/config.rs) | 环境变量配置与校验 |
 | [`src/logging.rs`](src/logging.rs) | tracing 初始化与 `RUST_LOG` 过滤 |
 | [`src/open_live/`](src/open_live/) | 开放平台 API、鉴权、错误码与官方 WebSocket 客户端 |
 | [`src/session/`](src/session/) | 会话复用、订阅分发、批量心跳与生命周期管理 |
-| [`src/bin/`](src/bin/) | 示例程序与待实现的服务入口 |
+| [`src/downstream.rs`](src/downstream.rs) | 下游 WebSocket 服务和连接生命周期 |
+| [`src/bin/`](src/bin/) | 示例程序与 WebSocket 服务入口 |
 | [`docs/open-live/`](docs/open-live/README.md) | 收录的开放平台鉴权、应用 API、长链协议与事件命令文档 |
 
 ## 许可证

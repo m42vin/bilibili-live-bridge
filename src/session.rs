@@ -5,7 +5,7 @@
 //! 调用方用身份码接入；同一个码或开启后返回同一个房间的后来者共享已解析的事件。
 //! 独立构造的管理器及不同进程不共享会话。
 //!
-//! 最后一个订阅者离开、收到互动结束、上游断开或项目心跳达到关闭条件时，
+//! 最后一个订阅者离开并超过配置的闲置宽限期、收到互动结束、上游断开或项目心跳达到关闭条件时，
 //! 会尝试调用 `/v2/app/end`。退出前等待 [`Manager::shutdown`]；
 //! 清理失败写入日志，运行中的会话断开后不会自动重连。
 //!
@@ -16,4 +16,4 @@ mod manager;
 mod platform;
 
 pub use error::SessionError;
-pub use manager::{Manager, RecvError, Subscription};
+pub use manager::{Manager, ManagerOptions, RecvError, Subscription};

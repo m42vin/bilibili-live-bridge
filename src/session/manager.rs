@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Notify, broadcast, watch};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
@@ -21,6 +21,16 @@ use crate::open_live::ws::LiveEvent;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 /// 项目心跳连续非业务错误达到这个次数后关闭会话，包括传输、HTTP 状态和解码失败。
 const HEARTBEAT_TRANSPORT_LIMIT: u8 = 3;
+
+/// 会话生命周期选项。默认在最后一个订阅者离开后立即关闭。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ManagerOptions {
+    /// 最后一个订阅者离开后保留上游的时间。
+    ///
+    /// 宽限期内继续接收事件和发送两类心跳；新订阅复用原场次，但不回放期间的事件。
+    /// 上游结束、心跳失效和主动 shutdown 不等待这个时间。
+    pub idle_grace: Duration,
+}
 
 /// 直播桥上的全部会话。
 ///
@@ -50,14 +60,40 @@ impl Manager {
         websocket_heartbeat: Duration,
         app_heartbeat: Duration,
     ) -> Result<Self, SessionError> {
+        Self::with_options(
+            api,
+            websocket_heartbeat,
+            app_heartbeat,
+            ManagerOptions::default(),
+        )
+    }
+
+    /// 用应用 API 客户端、心跳间隔和生命周期选项创建会话管理器。
+    ///
+    /// 心跳间隔的约束与 [`Self::new`] 相同。闲置宽限期为零时立即清理。
+    ///
+    /// # Errors
+    ///
+    /// 心跳间隔为零或闲置宽限期超过时钟可表示的范围时返回 [`SessionError::Invalid`]。
+    #[must_use = "创建失败时需要处理 SessionError"]
+    pub fn with_options(
+        api: api::Client,
+        websocket_heartbeat: Duration,
+        app_heartbeat: Duration,
+        options: ManagerOptions,
+    ) -> Result<Self, SessionError> {
         if websocket_heartbeat.is_zero() || app_heartbeat.is_zero() {
             return Err(SessionError::invalid("心跳间隔必须大于 0"));
+        }
+        if Instant::now().checked_add(options.idle_grace).is_none() {
+            return Err(SessionError::invalid("闲置宽限期超出时钟范围"));
         }
         let platform: Arc<dyn Platform> = Arc::new(LivePlatform::new(api, websocket_heartbeat));
         Ok(Self::from_parts(
             platform,
             app_heartbeat,
             DEFAULT_EVENT_CAPACITY,
+            options,
         ))
     }
 
@@ -79,7 +115,8 @@ impl Manager {
     /// 另一个码如果成功开启并返回同一个房间，会尝试关闭后一次场次，调用方改挂到已有的那场。
     /// 平台拒绝另一个码的开启时直接返回错误，不会根据房间索引绕过该错误。
     ///
-    /// 返回的 [`Subscription`] 被丢弃时记一次离开。最后一个离开的下游会触发 `/v2/app/end`。
+    /// 返回的 [`Subscription`] 被丢弃时记一次离开。最后一个下游离开后，
+    /// 等待 [`ManagerOptions::idle_grace`] 到期再触发 `/v2/app/end`；默认立即关闭。
     /// 同码上一场正在清理时等待其完成；接入返回 `Closed` 且未关闭管理器时额外尝试一次。
     /// 已运行会话断开后不自动重连，需要调用方重新接入。
     ///
@@ -127,12 +164,14 @@ impl Manager {
         platform: Arc<dyn Platform>,
         app_heartbeat: Duration,
         event_capacity: usize,
+        options: ManagerOptions,
     ) -> Self {
         Self {
             state: Arc::new(State {
                 platform,
                 app_heartbeat,
                 event_capacity,
+                options,
                 tables: Mutex::new(Tables {
                     by_code: HashMap::new(),
                     by_room: HashMap::new(),
@@ -154,7 +193,12 @@ impl Manager {
         event_capacity: usize,
     ) -> Self {
         assert!(event_capacity > 0, "事件缓冲至少为 1");
-        Self::from_parts(platform, app_heartbeat, event_capacity)
+        Self::from_parts(
+            platform,
+            app_heartbeat,
+            event_capacity,
+            ManagerOptions::default(),
+        )
     }
 
     #[cfg(test)]
@@ -278,6 +322,7 @@ struct State {
     platform: Arc<dyn Platform>,
     app_heartbeat: Duration,
     event_capacity: usize,
+    options: ManagerOptions,
     tables: Mutex<Tables>,
     shutdown: AtomicBool,
     beats: Mutex<HashMap<String, BeatSlot>>,
@@ -326,7 +371,7 @@ impl State {
                     }
                     Some(existing)
                 } else {
-                    let session = Session::starting(Arc::downgrade(self));
+                    let session = Session::starting(Arc::downgrade(self), self.options.idle_grace);
                     session.add_code(code.to_owned());
                     tables.by_code.insert(code.to_owned(), Arc::clone(&session));
                     return Ok((session, true));
@@ -687,23 +732,30 @@ fn spawn_upstream(
     tokio::spawn(
         async move {
             tracing::info!("直播间会话已建立");
-            // 项目心跳在管理器的批量任务里发送，这里只在会话停止时打断 `recv`。
+            let mut idle = session.idle.subscribe();
+            // 宽限期由同一个上游任务驱动，避免派生的旧计时器关闭已经恢复的订阅。
             loop {
+                let deadline = *idle.borrow_and_update();
                 tokio::select! {
                     biased;
                     _ = session.stop.cancelled() => {
                         tracing::debug!("会话收到关闭信号");
                         break;
                     }
+                    _ = idle.changed() => {}
+                    _ = until_idle(deadline) => {
+                        if session.expire_idle() {
+                            tracing::info!("闲置宽限期已到，关闭会话");
+                            break;
+                        }
+                    }
                     incoming = socket.recv() => {
                         match incoming {
                             Ok(Some(event)) => {
                                 let ends = event.ends_push();
                                 tracing::debug!(cmd = event.cmd(), "转发直播间事件");
-                                if events.send(Arc::new(event)).is_err() {
-                                    tracing::info!("订阅者已全部离开，关闭会话");
-                                    break;
-                                }
+                                // 无接收者是宽限期的正常状态；立即清理由 release 的停止信号驱动。
+                                let _ = events.send(Arc::new(event));
                                 if ends {
                                     tracing::info!("平台已停止互动推送，关闭会话");
                                     break;
@@ -748,6 +800,8 @@ struct Session {
     phase: watch::Sender<Phase>,
     stop: Stop,
     subscribers: Mutex<Subscribers>,
+    idle_grace: Duration,
+    idle: watch::Sender<Option<Instant>>,
     codes: Mutex<Vec<String>>,
     room_id: Mutex<Option<i64>>,
     finished: AtomicBool,
@@ -757,6 +811,7 @@ struct Session {
 struct Subscribers {
     count: usize,
     closing: bool,
+    idle_deadline: Option<Instant>,
 }
 
 /// 接入状态通过 watch 发布；正在关闭另由订阅计数中的 closing 标记表达。
@@ -775,8 +830,9 @@ enum Phase {
 }
 
 impl Session {
-    fn starting(state: Weak<State>) -> Arc<Self> {
+    fn starting(state: Weak<State>, idle_grace: Duration) -> Arc<Self> {
         let (phase, _) = watch::channel(Phase::Starting);
+        let (idle, _) = watch::channel(None);
         Arc::new(Self {
             state,
             phase,
@@ -784,7 +840,10 @@ impl Session {
             subscribers: Mutex::new(Subscribers {
                 count: 0,
                 closing: false,
+                idle_deadline: None,
             }),
+            idle_grace,
+            idle,
             codes: Mutex::new(Vec::new()),
             room_id: Mutex::new(None),
             finished: AtomicBool::new(false),
@@ -812,7 +871,9 @@ impl Session {
     }
 
     fn is_closing(&self) -> bool {
-        lock(&self.subscribers).closing
+        let mut subscribers = lock(&self.subscribers);
+        self.expire_idle_locked(&mut subscribers);
+        subscribers.closing
     }
 
     fn is_finished(&self) -> bool {
@@ -857,10 +918,13 @@ impl Session {
         {
             // Ready 与正在关闭可以同时存在，必须在计数锁内再次确认能否加入。
             let mut subscribers = lock(&self.subscribers);
+            self.expire_idle_locked(&mut subscribers);
             if subscribers.closing {
                 return None;
             }
             subscribers.count += 1;
+            subscribers.idle_deadline = None;
+            self.idle.send_replace(None);
         }
         Some(Subscription {
             room_id,
@@ -876,10 +940,35 @@ impl Session {
         let mut subscribers = lock(&self.subscribers);
         subscribers.count = subscribers.count.saturating_sub(1);
         if subscribers.count == 0 && !subscribers.closing {
-            subscribers.closing = true;
-            drop(subscribers);
-            self.stop.cancel();
+            if self.idle_grace.is_zero() {
+                subscribers.closing = true;
+                self.stop.cancel();
+            } else {
+                let deadline = Instant::now() + self.idle_grace;
+                subscribers.idle_deadline = Some(deadline);
+                self.idle.send_replace(Some(deadline));
+            }
         }
+    }
+
+    fn expire_idle(&self) -> bool {
+        self.expire_idle_locked(&mut lock(&self.subscribers))
+    }
+
+    fn expire_idle_locked(&self, subscribers: &mut Subscribers) -> bool {
+        if !subscribers.closing
+            && subscribers.count == 0
+            && subscribers
+                .idle_deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            subscribers.closing = true;
+            subscribers.idle_deadline = None;
+            self.idle.send_replace(None);
+            self.stop.cancel();
+            return true;
+        }
+        false
     }
 
     fn begin_close(&self) {
@@ -933,6 +1022,13 @@ impl Session {
             return;
         }
         notified.await;
+    }
+}
+
+async fn until_idle(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

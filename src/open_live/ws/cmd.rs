@@ -23,7 +23,7 @@ const CMD_INTERACTION_END: &str = "LIVE_OPEN_PLATFORM_INTERACTION_END";
 /// 官方长连接推送的一条直播间事件。
 ///
 /// 已知变体保存解析后的字段，[`LiveEvent::Unknown`] 保存未知命令。
-/// 此枚举尚未定义统一的 serde 消息封装，不能视为外部客户端的协议格式。
+/// 此枚举本身不是外部消息格式；[`crate::downstream`] 使用独立适配器定义客户端封装。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveEvent {
     /// 本房间弹幕。
