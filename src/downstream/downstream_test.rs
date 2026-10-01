@@ -430,7 +430,9 @@ async fn sends_timeout_without_retrying_a_cancelled_sink() {
 
 #[tokio::test]
 async fn matching_pong_survives_unsolicited_pong_and_missing_next_pong_ends_it() {
-    let fixture = Fixture::new().await;
+    // 本测试只推进下游 Ping/Pong 的虚拟时钟；本地 HTTP I/O 不跟随虚拟时间，
+    // 因此让项目心跳在观察窗口之外，避免其请求超时/恢复期限抢先结束订阅。
+    let fixture = Fixture::with_app_heartbeat(Duration::from_secs(3600)).await;
     let mut subscription = fixture.manager.attach(CODE).await.unwrap();
     let (mut sink, mut messages) = recording_sink();
     let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
@@ -542,6 +544,10 @@ struct PlatformState {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_app_heartbeat(Duration::from_secs(20)).await
+    }
+
+    async fn with_app_heartbeat(app_heartbeat: Duration) -> Self {
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let official = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -564,7 +570,7 @@ impl Fixture {
             )
             .unwrap(),
             Duration::from_secs(20),
-            Duration::from_secs(20),
+            app_heartbeat,
             ManagerOptions {
                 idle_grace: Duration::from_secs(30),
             },

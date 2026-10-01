@@ -11,6 +11,7 @@
 - **直播间事件**：弹幕、跨房弹幕、礼物、付费留言及下线、上舰、点赞、进房、开播、下播和互动结束。未识别的命令保留 `cmd` 与原始 `data`。
 - **会话复用**：同一身份码的并发接入只开启一次场次；不同身份码关联同一房间时复用已有会话，共享一条官方长连接。
 - **共享心跳**：一个会话管理器统一维护项目心跳，每批最多包含 200 个 `game_id`，建连与鉴权期间也持续维护；WebSocket 心跳由各自的官方连接维护。
+- **心跳有限恢复**：暂时性业务、传输和解码错误按成功时间限定恢复预算并退避重试；访问受限时降低频率，明确的鉴权、权限和参数错误立即关闭对应批次。
 - **会话清理**：最后一个订阅者离开、互动结束、上游断开或心跳失败达到关闭条件时，尝试关闭官方场次；支持等待全部会话关闭。
 - **下游 WebSocket**：每条 `/ws` 连接订阅一个房间，按序推送 JSON 事件；报告缓冲溢出，支持 Ping/Pong、读写限制和优雅退出。服务在最后一个客户端离开后保留上游 30 秒供重连。
 - **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
@@ -63,8 +64,22 @@ cargo run --locked --bin multi_client
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
 | `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` | 否 | `20` | 官方 WebSocket 心跳间隔，整数秒，范围 `1..=29` |
 | `BRIDGE_APP_HEARTBEAT_SECS` | 否 | `20` | 项目心跳间隔，整数秒，范围 `1..=59` |
+| `BRIDGE_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS` | 否 | `45` | 从最后确认成功起算的恢复期限，正整数秒；首次失败后启用 |
+| `BRIDGE_APP_HEARTBEAT_RETRY_INITIAL_MS` | 否 | `2000` | 普通重试初始退避，正整数毫秒 |
+| `BRIDGE_APP_HEARTBEAT_RETRY_MAX_MS` | 否 | `10000` | 普通退避上限，正整数毫秒，含抖动 |
 | `RUST_LOG` | 否 | `info` | 日志级别和模块过滤，由日志初始化读取 |
 | `AUTH_CODE` | 示例程序需要 | 无 | 主播身份码，由示例程序单独读取，不属于 `Config` |
+
+恢复期限默认 45 秒，依据收录的平台文档中最短 60 秒失效窗口，为响应延迟和安全余量预留 15 秒。
+重试从 2 秒起指数增长，加入 ±20% 抖动，普通重试最长等待 10 秒；
+`4009` 或 HTTP 429 的延迟至少为正常项目心跳间隔，`4009` 也可能涉及权限。
+成功后回到原共享心跳周期；连续失败次数用于退避，关闭条件由时间预算替代原来的三次失败阈值。
+
+管理器构造时，恢复期限超过 45 秒、心跳间隔加 10 秒请求超时不小于恢复期限、
+或初始退避大于上限，会记录警告，保留原值并继续启动；退避仍按上限封顶。
+自定义不安全组合无法保证在平台失效前恢复，首次失败时预算可能已经耗尽。
+零值、格式错误或超出时钟范围仍返回配置错误。
+这些恢复设置用于 `Manager`，低层 `Client` 的单次请求不自动重试。
 
 ### 启动 WebSocket 服务
 
@@ -124,6 +139,10 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 2. 调用 `manager.attach(&auth_code).await` 获取 `Subscription`。克隆 `Manager` 会共享同一组会话。
 3. 调用 `subscription.recv().await` 接收 `Arc<LiveEvent>`，通过事件变体处理数据，或用 `event.cmd()` 获取平台命令名。
 4. 丢弃订阅表示离开；默认最后一个订阅者离开后立即关闭场次。通过 `Manager::with_options` 和 `ManagerOptions::idle_grace` 可以设置闲置宽限期。进程退出前调用 `manager.shutdown().await`，等待全部场次完成关闭调用。
+
+`Manager::new` 和 `with_options` 使用默认 `session::HeartbeatPolicy`；
+`from_config` 和 `server` 使用环境配置。需要同时自定义生命周期与恢复策略时，
+使用 `Manager::with_heartbeat_policy(api, websocket_heartbeat, app_heartbeat, options, policy)`。
 
 订阅落后时，`recv()` 返回 `RecvError::Lagged { skipped }`；再次读取会从保留的事件继续，不会阻塞其他订阅者。会话结束且缓冲读完后返回 `RecvError::Closed`。
 

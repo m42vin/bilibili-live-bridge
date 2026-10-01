@@ -14,6 +14,9 @@ use crate::open_live::error::{ApiError, ErrorCode};
 use crate::open_live::ws::{Danmaku, InteractionEnd, LiveEvent, WsError};
 use crate::session::SessionError;
 
+#[path = "heartbeat_recovery_test.rs"]
+mod heartbeat_recovery_test;
+
 const QUIET: Duration = Duration::from_secs(3600);
 const CODE: &str = "super-secret-code";
 
@@ -59,9 +62,12 @@ async fn heartbeat_and_background_cleanup_failures_are_logged() {
         mock.fail_end();
         let manager = manager(&mock, QUIET);
         let _subscription = manager.attach(CODE).await.unwrap();
-        for _ in 0..super::HEARTBEAT_TRANSPORT_LIMIT {
-            manager.beat_once().await;
-        }
+        // 上次确认已经超出预算，首次失败就完成清理；不用等待真实的 45 秒。
+        super::lock(&manager.state.beats)
+            .get_mut("game-1")
+            .unwrap()
+            .last_confirmed = tokio::time::Instant::now() - Duration::from_secs(46);
+        manager.beat_once().await;
         let _ = manager.shutdown().await;
     }
     .with_subscriber(dispatch)
@@ -69,8 +75,8 @@ async fn heartbeat_and_background_cleanup_failures_are_logged() {
 
     let output = logs.output();
     assert!(output.contains("会话批量心跳失败"));
-    assert!(output.contains("HTTP 503"));
-    assert!(output.contains("transport_failure_limit"), "{output}");
+    assert!(output.contains("http_status=Some(503)"));
+    assert!(output.contains("recovery_budget_exhausted"), "{output}");
     let cleanup = output
         .lines()
         .find(|line| line.contains("关闭官方场次失败"))
@@ -372,11 +378,11 @@ async fn upstream_close_ends_the_session() {
 }
 
 #[tokio::test]
-async fn platform_heartbeat_error_ends_the_session() {
+async fn failed_game_ids_end_the_session() {
     let mock = Mock::new();
     mock.push_ok("game-1", 7);
     mock.push_connect_ok();
-    mock.fail_heartbeats_with_platform();
+    mock.fail_all_game_ids();
     let manager = manager(&mock, Duration::from_millis(20));
     let mut sub = manager.attach(CODE).await.unwrap();
 
@@ -385,23 +391,23 @@ async fn platform_heartbeat_error_ends_the_session() {
     assert_eq!(mock.ends(), ["game-1".to_owned()]);
 }
 
-#[tokio::test]
-async fn repeated_transport_heartbeat_errors_end_the_session() {
+#[tokio::test(start_paused = true)]
+async fn repeated_transport_heartbeat_errors_exhaust_the_recovery_budget() {
     let mock = Mock::new();
     mock.push_ok("game-1", 7);
     mock.push_connect_ok();
     mock.fail_heartbeats_with_transport();
-    let manager = manager(&mock, Duration::from_millis(20));
+    let manager = manager(&mock, Duration::from_secs(20));
     let mut sub = manager.attach(CODE).await.unwrap();
 
     assert_eq!(
-        timeout(Duration::from_secs(2), sub.recv())
+        timeout(Duration::from_secs(60), sub.recv())
             .await
             .expect("heartbeat did not close the session")
             .unwrap_err(),
         RecvError::Closed
     );
-    assert_eq!(mock.heartbeats().len(), 3);
+    assert!(mock.heartbeats().len() >= 3);
     assert_eq!(mock.ends(), ["game-1".to_owned()]);
 }
 
@@ -649,7 +655,7 @@ async fn shutdown_and_heartbeat_failure_bypass_idle_grace() {
         let manager = grace_manager(&mock);
         drop(manager.attach(CODE).await.unwrap());
         if heartbeat_failure {
-            mock.fail_heartbeats_with_platform();
+            mock.fail_all_game_ids();
             manager.beat_once().await;
             mock.wait_ends(1).await;
         }
@@ -688,6 +694,7 @@ fn grace_manager(mock: &Arc<Mock>) -> Manager {
         ManagerOptions {
             idle_grace: Duration::from_secs(30),
         },
+        super::HeartbeatPolicy::default(),
     )
 }
 
@@ -737,6 +744,9 @@ struct Mock {
     hold_end: AtomicBool,
     end_entered: AtomicUsize,
     fail_end: AtomicBool,
+    heartbeat_active: AtomicUsize,
+    heartbeat_peak: AtomicUsize,
+    heartbeat_entered: watch::Sender<usize>,
 }
 
 struct MockInner {
@@ -745,8 +755,10 @@ struct MockInner {
     connections: Vec<TestConn>,
     start_codes: Vec<String>,
     batches: Vec<Vec<String>>,
+    batch_times: Vec<tokio::time::Instant>,
     failed_ids: Vec<String>,
     heartbeat_mode: HeartbeatMode,
+    heartbeat_steps: VecDeque<HeartbeatStep>,
     ends: Vec<String>,
 }
 
@@ -759,8 +771,25 @@ enum ConnectPlan {
 #[derive(Clone, Copy)]
 enum HeartbeatMode {
     Ok,
-    Platform,
+    FailedIds,
     Unavailable,
+}
+
+enum HeartbeatStep {
+    Reply(Result<BatchHeartbeatResult, ApiError>),
+    Wait {
+        gate: watch::Receiver<bool>,
+        entered: watch::Sender<bool>,
+        reply: Result<BatchHeartbeatResult, ApiError>,
+    },
+}
+
+struct ActiveHeartbeat<'a>(&'a Mock);
+
+impl Drop for ActiveHeartbeat<'_> {
+    fn drop(&mut self) {
+        self.0.heartbeat_active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -814,6 +843,7 @@ impl Mock {
         let (entered, _) = watch::channel(0);
         let (start_gate, _) = watch::channel(false);
         let (end_gate, _) = watch::channel(false);
+        let (heartbeat_entered, _) = watch::channel(0);
         Arc::new(Self {
             inner: Mutex::new(MockInner {
                 starts: VecDeque::new(),
@@ -821,8 +851,10 @@ impl Mock {
                 connections: Vec::new(),
                 start_codes: Vec::new(),
                 batches: Vec::new(),
+                batch_times: Vec::new(),
                 failed_ids: Vec::new(),
                 heartbeat_mode: HeartbeatMode::Ok,
+                heartbeat_steps: VecDeque::new(),
                 ends: Vec::new(),
             }),
             entered,
@@ -832,6 +864,9 @@ impl Mock {
             hold_end: AtomicBool::new(false),
             end_entered: AtomicUsize::new(0),
             fail_end: AtomicBool::new(false),
+            heartbeat_active: AtomicUsize::new(0),
+            heartbeat_peak: AtomicUsize::new(0),
+            heartbeat_entered,
         })
     }
 
@@ -855,15 +890,15 @@ impl Mock {
         self.fail_end.store(true, Ordering::SeqCst);
     }
 
-    fn fail_heartbeats_with_platform(&self) {
+    fn fail_all_game_ids(&self) {
         let mut inner = super::lock(&self.inner);
-        inner.heartbeat_mode = HeartbeatMode::Platform;
+        inner.heartbeat_mode = HeartbeatMode::FailedIds;
         inner.failed_ids.clear();
     }
 
     fn fail_game_ids(&self, game_ids: &[&str]) {
         let mut inner = super::lock(&self.inner);
-        inner.heartbeat_mode = HeartbeatMode::Platform;
+        inner.heartbeat_mode = HeartbeatMode::FailedIds;
         inner.failed_ids = game_ids
             .iter()
             .map(|game_id| (*game_id).to_owned())
@@ -872,6 +907,36 @@ impl Mock {
 
     fn fail_heartbeats_with_transport(&self) {
         super::lock(&self.inner).heartbeat_mode = HeartbeatMode::Unavailable;
+    }
+
+    fn push_heartbeat(&self, reply: Result<BatchHeartbeatResult, ApiError>) {
+        super::lock(&self.inner)
+            .heartbeat_steps
+            .push_back(HeartbeatStep::Reply(reply));
+    }
+
+    fn hold_heartbeat(
+        &self,
+        reply: Result<BatchHeartbeatResult, ApiError>,
+    ) -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        let (gate, waiting) = watch::channel(false);
+        let (entered, entered_rx) = watch::channel(false);
+        super::lock(&self.inner)
+            .heartbeat_steps
+            .push_back(HeartbeatStep::Wait {
+                gate: waiting,
+                entered,
+                reply,
+            });
+        (gate, entered_rx)
+    }
+
+    async fn wait_batches(&self, count: usize) {
+        self.heartbeat_entered
+            .subscribe()
+            .wait_for(|actual| *actual >= count)
+            .await
+            .unwrap();
     }
 
     fn push_ok(&self, game_id: &str, room_id: i64) {
@@ -996,14 +1061,37 @@ impl Platform for Mock {
         game_ids: &'a [String],
     ) -> BoxFuture<'a, Result<BatchHeartbeatResult, ApiError>> {
         Box::pin(async move {
-            let (mode, failed_ids) = {
+            let active = self.heartbeat_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.heartbeat_peak.fetch_max(active, Ordering::SeqCst);
+            let _active = ActiveHeartbeat(self);
+            let (mode, failed_ids, step) = {
                 let mut inner = super::lock(&self.inner);
                 inner.batches.push(game_ids.to_vec());
-                (inner.heartbeat_mode, inner.failed_ids.clone())
+                inner.batch_times.push(tokio::time::Instant::now());
+                (
+                    inner.heartbeat_mode,
+                    inner.failed_ids.clone(),
+                    inner.heartbeat_steps.pop_front(),
+                )
             };
+            self.heartbeat_entered.send_modify(|count| *count += 1);
+            if let Some(step) = step {
+                return match step {
+                    HeartbeatStep::Reply(reply) => reply,
+                    HeartbeatStep::Wait {
+                        mut gate,
+                        entered,
+                        reply,
+                    } => {
+                        entered.send_replace(true);
+                        gate.wait_for(|open| *open).await.unwrap();
+                        reply
+                    }
+                };
+            }
             match mode {
                 HeartbeatMode::Ok => Ok(BatchHeartbeatResult::from_failed(Vec::new())),
-                HeartbeatMode::Platform => {
+                HeartbeatMode::FailedIds => {
                     let failed = if failed_ids.is_empty() {
                         game_ids.to_vec()
                     } else {

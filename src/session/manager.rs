@@ -1,13 +1,13 @@
 //! 按房间复用一场官方互动，并把直播间事件分发给下游。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Notify, broadcast, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
+use tokio::time::{Instant, sleep_until};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
@@ -17,12 +17,15 @@ use crate::config::Config;
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
 
+#[path = "heartbeat.rs"]
+mod heartbeat;
+pub use heartbeat::HeartbeatPolicy;
+use heartbeat::run_heartbeats;
+
 /// 每个生产会话的广播缓冲容量；慢订阅者溢出后跳过旧事件，不拖住其他订阅者。
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 /// 尽力发送关闭帧的上限，不能让写端背压阻塞场次结束和本地清理。
 const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-/// 项目心跳连续非业务错误达到这个次数后关闭会话，包括传输、HTTP 状态和解码失败。
-const HEARTBEAT_TRANSPORT_LIMIT: u8 = 3;
 
 /// 会话生命周期选项。默认在最后一个订阅者离开后立即关闭。
 #[derive(Debug, Clone, Copy, Default)]
@@ -51,11 +54,12 @@ impl Manager {
     /// 用已经构造好的应用 API 客户端创建会话管理器。
     ///
     /// `websocket_heartbeat` 传给官方长连接，`app_heartbeat` 是 `/v2/app/batchHeartbeat` 的间隔。
-    /// 两个间隔都必须大于 0；本构造方法不检查平台心跳上限。
+    /// 两个间隔都必须大于 0 且在时钟范围内；本构造方法不检查平台心跳上限。
+    /// 项目心跳使用默认的 45 秒有限恢复策略；不安全的时间组合只警告。
     ///
     /// # Errors
     ///
-    /// 任一间隔为零时返回 [`SessionError::Invalid`]。
+    /// 任一间隔为零或超出时钟范围时返回 [`SessionError::Invalid`]。
     #[must_use = "创建失败时需要处理 SessionError"]
     pub fn new(
         api: api::Client,
@@ -76,7 +80,7 @@ impl Manager {
     ///
     /// # Errors
     ///
-    /// 心跳间隔为零或闲置宽限期超过时钟可表示的范围时返回 [`SessionError::Invalid`]。
+    /// 心跳间隔为零，或间隔、闲置宽限期超出时钟范围时返回 [`SessionError::Invalid`]。
     #[must_use = "创建失败时需要处理 SessionError"]
     pub fn with_options(
         api: api::Client,
@@ -84,18 +88,72 @@ impl Manager {
         app_heartbeat: Duration,
         options: ManagerOptions,
     ) -> Result<Self, SessionError> {
+        Self::with_heartbeat_policy(
+            api,
+            websocket_heartbeat,
+            app_heartbeat,
+            options,
+            HeartbeatPolicy::default(),
+        )
+    }
+
+    /// 用生命周期选项和项目心跳恢复策略创建管理器。
+    ///
+    /// 暂时性错误按最后成功时间限定恢复期限；明确的参数、鉴权和权限错误立即关闭本批。
+    /// 时间组合不安全时仅警告，不修改配置或阻止启动；见 [`HeartbeatPolicy`]。
+    ///
+    /// ```no_run
+    /// use bilibili_live_bridge::{
+    ///     config::Config,
+    ///     open_live::api::Client,
+    ///     session::{HeartbeatPolicy, Manager, ManagerOptions},
+    /// };
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = Config::from_env()?;
+    /// let manager = Manager::with_heartbeat_policy(
+    ///     Client::from_config(&config)?,
+    ///     config.websocket_heartbeat(),
+    ///     config.app_heartbeat(),
+    ///     ManagerOptions::default(),
+    ///     HeartbeatPolicy::default(),
+    /// )?;
+    /// # let _ = manager;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// 心跳间隔或策略时长为零，或间隔、策略时长、闲置宽限期超出时钟范围时，
+    /// 返回 [`SessionError::Invalid`]。
+    #[must_use = "创建失败时需要处理 SessionError"]
+    pub fn with_heartbeat_policy(
+        api: api::Client,
+        websocket_heartbeat: Duration,
+        app_heartbeat: Duration,
+        options: ManagerOptions,
+        heartbeat_policy: HeartbeatPolicy,
+    ) -> Result<Self, SessionError> {
         if websocket_heartbeat.is_zero() || app_heartbeat.is_zero() {
             return Err(SessionError::invalid("心跳间隔必须大于 0"));
         }
         if Instant::now().checked_add(options.idle_grace).is_none() {
             return Err(SessionError::invalid("闲置宽限期超出时钟范围"));
         }
+        for every in [websocket_heartbeat, app_heartbeat] {
+            if Instant::now().checked_add(every).is_none() {
+                return Err(SessionError::invalid("心跳间隔超出时钟范围"));
+            }
+        }
+        heartbeat_policy.validate().map_err(SessionError::invalid)?;
+        heartbeat_policy.warn_if_unsafe(app_heartbeat);
         let platform: Arc<dyn Platform> = Arc::new(LivePlatform::new(api, websocket_heartbeat));
         Ok(Self::from_parts(
             platform,
             app_heartbeat,
             DEFAULT_EVENT_CAPACITY,
             options,
+            heartbeat_policy,
         ))
     }
 
@@ -103,12 +161,18 @@ impl Manager {
     ///
     /// # Errors
     ///
-    /// HTTP 客户端初始化失败或心跳间隔无效时返回 [`SessionError::Invalid`]。
+    /// HTTP 客户端初始化失败或心跳间隔、恢复策略无效时返回 [`SessionError::Invalid`]。
     #[must_use = "创建失败时需要处理 SessionError"]
     pub fn from_config(config: &Config) -> Result<Self, SessionError> {
         let api = api::Client::from_config(config)
             .map_err(|error| SessionError::invalid(error.to_string()))?;
-        Self::new(api, config.websocket_heartbeat(), config.app_heartbeat())
+        Self::with_heartbeat_policy(
+            api,
+            config.websocket_heartbeat(),
+            config.app_heartbeat(),
+            ManagerOptions::default(),
+            config.heartbeat_policy(),
+        )
     }
 
     /// 用身份码接入一场会话。
@@ -170,6 +234,7 @@ impl Manager {
         app_heartbeat: Duration,
         event_capacity: usize,
         options: ManagerOptions,
+        heartbeat_policy: HeartbeatPolicy,
     ) -> Self {
         Self {
             state: Arc::new(State {
@@ -177,6 +242,7 @@ impl Manager {
                 app_heartbeat,
                 event_capacity,
                 options,
+                heartbeat_policy,
                 tables: Mutex::new(Tables {
                     by_code: HashMap::new(),
                     by_room: HashMap::new(),
@@ -184,6 +250,7 @@ impl Manager {
                 }),
                 shutdown: AtomicBool::new(false),
                 beats: Mutex::new(HashMap::new()),
+                heartbeat_wake: Arc::new(Notify::new()),
                 heartbeat_started: Mutex::new(false),
                 heartbeat_stop: Stop::new(),
                 heartbeat_finished: AtomicBool::new(false),
@@ -204,12 +271,13 @@ impl Manager {
             app_heartbeat,
             event_capacity,
             ManagerOptions::default(),
+            HeartbeatPolicy::default(),
         )
     }
 
     #[cfg(test)]
     pub(super) async fn beat_once(&self) {
-        pump(&self.state).await;
+        heartbeat::pump(&self.state).await;
     }
 }
 
@@ -329,9 +397,11 @@ struct State {
     app_heartbeat: Duration,
     event_capacity: usize,
     options: ManagerOptions,
+    heartbeat_policy: HeartbeatPolicy,
     tables: Mutex<Tables>,
     shutdown: AtomicBool,
     beats: Mutex<HashMap<String, BeatSlot>>,
+    heartbeat_wake: Arc<Notify>,
     heartbeat_started: Mutex<bool>,
     heartbeat_stop: Stop,
     heartbeat_finished: AtomicBool,
@@ -340,7 +410,11 @@ struct State {
 
 struct BeatSlot {
     session: Weak<Session>,
-    transport_failures: u8,
+    last_confirmed: Instant,
+    failures: u32,
+    retry_at: Option<Instant>,
+    normal_due: Option<Instant>,
+    in_flight: bool,
 }
 
 /// 两个索引可能指向同一会话；迁移与移除时需保持关联，并确认会话身份。
@@ -593,17 +667,30 @@ impl State {
             game_id.to_owned(),
             BeatSlot {
                 session: Arc::downgrade(session),
-                transport_failures: 0,
+                last_confirmed: Instant::now(),
+                failures: 0,
+                retry_at: None,
+                normal_due: None,
+                in_flight: false,
             },
         );
         // 与 begin_close 的关闭标记串行，避免它移除心跳后又重新登记。
         drop(subscribers);
         self.ensure_heartbeat();
+        self.heartbeat_wake.notify_one();
         true
     }
 
-    fn unregister_beat(&self, game_id: &str) {
-        lock(&self.beats).remove(game_id);
+    fn unregister_beat(&self, game_id: &str, session: &Session) {
+        let mut beats = lock(&self.beats);
+        if beats
+            .get(game_id)
+            .is_some_and(|slot| std::ptr::eq(slot.session.as_ptr(), session))
+        {
+            beats.remove(game_id);
+        }
+        drop(beats);
+        self.heartbeat_wake.notify_one();
     }
 
     fn ensure_heartbeat(self: &Arc<Self>) {
@@ -1041,7 +1128,7 @@ impl Session {
         let Some(game_id) = self.game_id() else {
             return;
         };
-        state.unregister_beat(&game_id);
+        state.unregister_beat(&game_id, self);
     }
 
     fn game_id(&self) -> Option<String> {
@@ -1123,158 +1210,6 @@ impl Stop {
             return;
         }
         notified.await;
-    }
-}
-
-#[derive(Clone)]
-struct PendingBeat {
-    game_id: String,
-    session: Weak<Session>,
-}
-
-async fn run_heartbeats(state: Weak<State>, stop: Stop, every: Duration) {
-    let mut ticker = interval(every);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut armed = false;
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.cancelled() => {
-                finish_heartbeats(&state);
-                return;
-            }
-            _ = ticker.tick() => {}
-        }
-        let Some(current) = state.upgrade() else {
-            return;
-        };
-        if current.heartbeat_stop.is_cancelled() {
-            current.mark_heartbeat_finished();
-            return;
-        }
-        // 丢弃调度器第一次立即就绪的 tick；后来注册的场次参与下一轮统一心跳。
-        if !armed {
-            armed = true;
-            continue;
-        }
-        pump(&current).await;
-        if current.heartbeat_stop.is_cancelled() {
-            current.mark_heartbeat_finished();
-            return;
-        }
-    }
-}
-
-fn finish_heartbeats(state: &Weak<State>) {
-    if let Some(state) = state.upgrade() {
-        state.mark_heartbeat_finished();
-    }
-}
-
-async fn pump(state: &State) {
-    let pending: Vec<PendingBeat> = {
-        let beats = lock(&state.beats);
-        beats
-            .iter()
-            .map(|(game_id, slot)| PendingBeat {
-                game_id: game_id.clone(),
-                session: slot.session.clone(),
-            })
-            .collect()
-    };
-    if pending.is_empty() {
-        return;
-    }
-    for chunk in pending.chunks(api::MAX_BATCH_HEARTBEAT) {
-        let current: Vec<PendingBeat> = {
-            let beats = lock(&state.beats);
-            // 快照之后可能关闭或替换会话，旧批次不能作用于新的登记项。
-            chunk
-                .iter()
-                .filter(|beat| {
-                    beats
-                        .get(&beat.game_id)
-                        .is_some_and(|slot| Weak::ptr_eq(&slot.session, &beat.session))
-                })
-                .cloned()
-                .collect()
-        };
-        if current.is_empty() {
-            continue;
-        }
-        dispatch_chunk(state, &current).await;
-    }
-}
-
-async fn dispatch_chunk(state: &State, chunk: &[PendingBeat]) {
-    let game_ids: Vec<String> = chunk.iter().map(|beat| beat.game_id.clone()).collect();
-    // Some 表示有确定的业务结果；None 表示非业务错误，按场次累积失败次数。
-    let failed = match state.platform.batch_heartbeat(&game_ids).await {
-        Ok(result) => {
-            tracing::debug!(
-                batch_size = game_ids.len(),
-                failed_count = result.failed_game_ids().len(),
-                "会话批量心跳完成"
-            );
-            Some(
-                result
-                    .failed_game_ids()
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>(),
-            )
-        }
-        Err(error) => {
-            tracing::warn!(batch_size = game_ids.len(), %error, "会话批量心跳失败");
-            if error.platform_code().is_some() {
-                Some(game_ids.iter().cloned().collect())
-            } else {
-                None
-            }
-        }
-    };
-    let mut closing = Vec::new();
-    {
-        let mut beats = lock(&state.beats);
-        for beat in chunk {
-            let Some(slot) = beats.get_mut(&beat.game_id) else {
-                continue;
-            };
-            if !Weak::ptr_eq(&slot.session, &beat.session) {
-                continue;
-            }
-            let close = match &failed {
-                Some(failed) => failed.contains(&beat.game_id),
-                None => {
-                    slot.transport_failures = slot.transport_failures.saturating_add(1);
-                    slot.transport_failures >= HEARTBEAT_TRANSPORT_LIMIT
-                }
-            };
-            if close {
-                closing.push((beat.game_id.clone(), beat.session.clone()));
-            } else if failed.is_some() {
-                slot.transport_failures = 0;
-            }
-        }
-        for (game_id, _) in &closing {
-            beats.remove(game_id);
-        }
-    }
-    for (game_id, session) in closing {
-        if let Some(session) = session.upgrade() {
-            let reason = if failed.is_some() {
-                "platform_rejected"
-            } else {
-                "transport_failure_limit"
-            };
-            tracing::warn!(
-                %game_id,
-                room_id = ?session.room_id(),
-                reason,
-                "项目心跳失效，关闭会话"
-            );
-            session.begin_close();
-        }
     }
 }
 

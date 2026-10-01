@@ -36,6 +36,7 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 | 二进制包与压缩 | [packet.rs](../src/open_live/ws/packet.rs) | [packet_test.rs](../src/open_live/ws/packet_test.rs) |
 | 直播事件字段与命令 | [cmd.rs](../src/open_live/ws/cmd.rs) | [cmd_test.rs](../src/open_live/ws/cmd_test.rs) |
 | 会话复用、订阅与清理 | [manager.rs](../src/session/manager.rs)、[platform.rs](../src/session/platform.rs) | [manager_test.rs](../src/session/manager_test.rs) |
+| 项目心跳分类、预算与退避 | [heartbeat.rs](../src/session/heartbeat.rs) | [heartbeat_test.rs](../src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../src/session/heartbeat_recovery_test.rs) |
 | 下游 WebSocket 与协议 | [downstream.rs](../src/downstream.rs)、[protocol.rs](../src/downstream/protocol.rs) | [downstream_test.rs](../src/downstream/downstream_test.rs) |
 | 示例程序 | [src/bin](../src/bin/) | 构建检查；需要真实平台时手动运行 |
 

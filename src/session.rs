@@ -16,4 +16,4 @@ mod manager;
 mod platform;
 
 pub use error::SessionError;
-pub use manager::{Manager, ManagerOptions, RecvError, Subscription};
+pub use manager::{HeartbeatPolicy, Manager, ManagerOptions, RecvError, Subscription};

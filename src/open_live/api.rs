@@ -22,6 +22,8 @@ use crate::config::Config;
 pub const API_ORIGIN: &str = "https://live-open.biliapi.com";
 /// 单次批量心跳允许的 `game_id` 数量。超过后开放平台返回 7004。
 pub const MAX_BATCH_HEARTBEAT: usize = 200;
+/// 请求总超时；会话恢复预算与这个上限保持一致。
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 const START_PATH: &str = "/v2/app/start";
 const END_PATH: &str = "/v2/app/end";
@@ -91,7 +93,7 @@ impl Client {
                 "/",
                 env!("CARGO_PKG_VERSION")
             ))
-            .timeout(Duration::from_secs(10))
+            .timeout(REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()

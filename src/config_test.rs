@@ -30,6 +30,69 @@ fn loads_required_values_and_defaults() {
     assert_eq!(config.listen(), DEFAULT_LISTEN);
     assert_eq!(config.websocket_heartbeat(), DEFAULT_HEARTBEAT);
     assert_eq!(config.app_heartbeat(), DEFAULT_HEARTBEAT);
+    assert_eq!(config.heartbeat_policy(), HeartbeatPolicy::default());
+}
+
+#[test]
+fn loads_heartbeat_policy_and_preserves_unsafe_values() {
+    let mut vars = required_vars();
+    vars.extend([
+        (ENV_APP_HEARTBEAT_SECS, "59"),
+        (ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS, " 120 "),
+        (ENV_APP_HEARTBEAT_RETRY_INITIAL_MS, "20000"),
+        (ENV_APP_HEARTBEAT_RETRY_MAX_MS, "10000"),
+    ]);
+    let config = load(&vars).unwrap();
+    assert_eq!(config.app_heartbeat(), Duration::from_secs(59));
+    assert_eq!(
+        config.heartbeat_policy(),
+        HeartbeatPolicy {
+            failure_timeout: Duration::from_secs(120),
+            retry_initial_delay: Duration::from_secs(20),
+            retry_max_delay: Duration::from_secs(10),
+        }
+    );
+}
+
+#[test]
+fn blank_heartbeat_policy_values_use_defaults() {
+    let mut vars = required_vars();
+    vars.extend([
+        (ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS, " "),
+        (ENV_APP_HEARTBEAT_RETRY_INITIAL_MS, ""),
+        (ENV_APP_HEARTBEAT_RETRY_MAX_MS, "\n"),
+    ]);
+    assert_eq!(
+        load(&vars).unwrap().heartbeat_policy(),
+        HeartbeatPolicy::default()
+    );
+}
+
+#[test]
+fn rejects_invalid_heartbeat_policy_values() {
+    for key in [
+        ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS,
+        ENV_APP_HEARTBEAT_RETRY_INITIAL_MS,
+        ENV_APP_HEARTBEAT_RETRY_MAX_MS,
+    ] {
+        for value in ["0", "-1", "1.5", "nope", "18446744073709551616"] {
+            let mut vars = required_vars();
+            vars.push((key, value));
+            assert!(matches!(load(&vars), Err(ConfigError::Invalid { var, .. }) if var == key));
+        }
+    }
+    let mut vars = required_vars();
+    vars.push((
+        ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS,
+        "18446744073709551615",
+    ));
+    assert!(matches!(
+        load(&vars),
+        Err(ConfigError::Invalid {
+            var: ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS,
+            ..
+        })
+    ));
 }
 
 #[test]

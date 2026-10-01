@@ -8,6 +8,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use crate::session::HeartbeatPolicy;
+
 /// 开放平台 Access Key Id。
 pub const ENV_ACCESS_KEY_ID: &str = "BILIBILI_ACCESS_KEY_ID";
 /// 开放平台 Access Key Secret。签名只用这份密钥，不能写进日志或下游协议。
@@ -20,6 +22,13 @@ pub const ENV_LISTEN: &str = "BRIDGE_LISTEN";
 pub const ENV_WEBSOCKET_HEARTBEAT_SECS: &str = "BRIDGE_WEBSOCKET_HEARTBEAT_SECS";
 /// 项目心跳间隔，单位秒。
 pub const ENV_APP_HEARTBEAT_SECS: &str = "BRIDGE_APP_HEARTBEAT_SECS";
+/// 项目心跳恢复期限，从最后确认成功起算，单位秒。
+pub const ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS: &str =
+    "BRIDGE_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS";
+/// 项目心跳初始退避，单位毫秒。
+pub const ENV_APP_HEARTBEAT_RETRY_INITIAL_MS: &str = "BRIDGE_APP_HEARTBEAT_RETRY_INITIAL_MS";
+/// 项目心跳普通退避上限，单位毫秒。
+pub const ENV_APP_HEARTBEAT_RETRY_MAX_MS: &str = "BRIDGE_APP_HEARTBEAT_RETRY_MAX_MS";
 
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 /// 官方文档推荐的心跳间隔。长连接约 30 秒收不到心跳会断开，互动玩法约 60 秒没有项目心跳会关闭场次。
@@ -38,6 +47,7 @@ pub struct Config {
     listen: SocketAddr,
     websocket_heartbeat: Duration,
     app_heartbeat: Duration,
+    heartbeat_policy: HeartbeatPolicy,
 }
 
 impl Config {
@@ -47,6 +57,10 @@ impl Config {
     /// 可选：`BRIDGE_LISTEN`（默认 `127.0.0.1:8080`）、
     /// `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` 与 `BRIDGE_APP_HEARTBEAT_SECS`（默认都是 20）。
     /// WebSocket 心跳必须小于 30 秒，项目心跳必须小于 60 秒。
+    /// 项目心跳恢复期限默认 45 秒，初始退避默认 2000 毫秒、上限 10000 毫秒；
+    /// 分别通过 BRIDGE_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS、
+    /// BRIDGE_APP_HEARTBEAT_RETRY_INITIAL_MS、BRIDGE_APP_HEARTBEAT_RETRY_MAX_MS 配置。
+    /// 时间组合不安全时由管理器警告，配置值保持原样。
     /// 读取的文本去掉首尾空白；空白的可选变量使用默认值。
     ///
     /// # Errors
@@ -78,6 +92,27 @@ impl Config {
             Some(value) => parse_interval(&value, ENV_APP_HEARTBEAT_SECS, APP_HEARTBEAT_MAX_SECS)?,
             None => DEFAULT_HEARTBEAT,
         };
+        let defaults = HeartbeatPolicy::default();
+        let heartbeat_policy = HeartbeatPolicy {
+            failure_timeout: policy_duration(
+                &read,
+                ENV_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS,
+                defaults.failure_timeout,
+                Duration::from_secs,
+            )?,
+            retry_initial_delay: policy_duration(
+                &read,
+                ENV_APP_HEARTBEAT_RETRY_INITIAL_MS,
+                defaults.retry_initial_delay,
+                Duration::from_millis,
+            )?,
+            retry_max_delay: policy_duration(
+                &read,
+                ENV_APP_HEARTBEAT_RETRY_MAX_MS,
+                defaults.retry_max_delay,
+                Duration::from_millis,
+            )?,
+        };
 
         Ok(Self {
             access_key_id,
@@ -86,6 +121,7 @@ impl Config {
             listen,
             websocket_heartbeat,
             app_heartbeat,
+            heartbeat_policy,
         })
     }
 
@@ -124,6 +160,12 @@ impl Config {
     pub const fn app_heartbeat(&self) -> Duration {
         self.app_heartbeat
     }
+
+    /// 项目心跳恢复策略。管理器构造时只警告不安全的时间组合，不修改原值。
+    #[must_use]
+    pub const fn heartbeat_policy(&self) -> HeartbeatPolicy {
+        self.heartbeat_policy
+    }
 }
 
 impl fmt::Debug for Config {
@@ -136,6 +178,7 @@ impl fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("websocket_heartbeat", &self.websocket_heartbeat)
             .field("app_heartbeat", &self.app_heartbeat)
+            .field("heartbeat_policy", &self.heartbeat_policy)
             .finish()
     }
 }
@@ -196,6 +239,33 @@ fn optional(
             message: "不是合法的 Unicode".to_owned(),
         }),
     }
+}
+
+fn policy_duration(
+    read: &impl Fn(&str) -> Result<String, VarError>,
+    key: &'static str,
+    default: Duration,
+    convert: impl Fn(u64) -> Duration,
+) -> Result<Duration, ConfigError> {
+    let Some(value) = optional(read, key)? else {
+        return Ok(default);
+    };
+    let amount = value
+        .parse::<u64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| ConfigError::Invalid {
+            var: key,
+            message: "必须是大于 0 的整数".to_owned(),
+        })?;
+    let duration = convert(amount);
+    if std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(ConfigError::Invalid {
+            var: key,
+            message: "时长超出时钟范围".to_owned(),
+        });
+    }
+    Ok(duration)
 }
 
 fn parse_app_id(value: &str) -> Result<i64, ConfigError> {
