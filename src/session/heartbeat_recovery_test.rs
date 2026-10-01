@@ -50,7 +50,17 @@ async fn attach_rooms(manager: &Manager, count: usize) -> Vec<Subscription> {
 }
 
 fn policy_manager(mock: &Arc<Mock>, every: Duration, policy: HeartbeatPolicy) -> Manager {
-    Manager::from_parts(mock.clone(), every, 16, ManagerOptions::default(), policy)
+    Manager::from_parts(
+        mock.clone(),
+        every,
+        16,
+        ManagerOptions::default(),
+        policy,
+        super::super::UpstreamPolicy {
+            reconnect: None,
+            ..super::super::UpstreamPolicy::default()
+        },
+    )
 }
 
 #[tokio::test(start_paused = true)]

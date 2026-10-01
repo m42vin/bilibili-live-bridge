@@ -5,19 +5,25 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::poll_fn;
+use std::io;
+use std::pin::Pin;
+use std::task::{Poll, ready};
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::time::{Interval, MissedTickBehavior, interval};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::Error as SocketError;
 use tokio_tungstenite::tungstenite::http::header::{HeaderValue, USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
+use super::HealthPolicy;
 use super::cmd::LiveEvent;
 use super::error::WsError;
 use super::packet::{self, FrameItem, Operation, decode_frame};
@@ -39,10 +45,12 @@ type Reader = SplitStream<Upstream>;
 pub struct Connection {
     endpoint: String,
     heartbeat_every: Duration,
-    write: Writer,
-    read: Reader,
-    heartbeat: Interval,
-    pending_write: Option<Message>,
+    write: Option<Writer>,
+    read: Option<Reader>,
+    heartbeat_at: Instant,
+    health: HealthPolicy,
+    activity_deadline: Instant,
+    pending_write: PendingWrite,
     pending_events: VecDeque<LiveEvent>,
     closed: bool,
 }
@@ -68,6 +76,23 @@ impl Connection {
         auth_body: &str,
         heartbeat: Duration,
     ) -> Result<Self, WsError> {
+        Self::connect_with_policy(links, auth_body, heartbeat, HealthPolicy::default()).await
+    }
+
+    /// 用自定义发送和存活期限建立官方连接。
+    ///
+    /// 持续轮询 [`Self::recv`] 驱动检测。有效事件及官方心跳回复刷新存活期限。
+    ///
+    /// # Errors
+    ///
+    /// 除 [`Self::connect`] 的错误外，无效健康策略返回 [`WsError::Invalid`]。
+    #[tracing::instrument(name = "websocket_connect", skip_all)]
+    pub async fn connect_with_policy(
+        links: impl IntoIterator<Item = impl AsRef<str>>,
+        auth_body: &str,
+        heartbeat: Duration,
+        health: HealthPolicy,
+    ) -> Result<Self, WsError> {
         let auth_body = auth_body.trim();
         if auth_body.is_empty() {
             return Err(WsError::invalid("auth_body 不能为空"));
@@ -75,6 +100,7 @@ impl Connection {
         if heartbeat.is_zero() {
             return Err(WsError::invalid("心跳间隔必须大于 0"));
         }
+        health.validate(heartbeat).map_err(WsError::invalid)?;
         let links: Vec<String> = links
             .into_iter()
             .map(|link| link.as_ref().trim().to_owned())
@@ -87,9 +113,11 @@ impl Connection {
         let mut failures = Vec::new();
         for (index, link) in links.iter().enumerate() {
             tracing::debug!(endpoint = %link, attempt = index + 1, "尝试连接官方 WebSocket");
-            let attempt =
-                tokio::time::timeout(HANDSHAKE_TIMEOUT, establish(link, auth_body, heartbeat))
-                    .await;
+            let attempt = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                establish(link, auth_body, heartbeat, health),
+            )
+            .await;
             match attempt {
                 Ok(Ok(connection)) => {
                     tracing::info!(endpoint = %link, "官方 WebSocket 已连接并完成鉴权");
@@ -126,6 +154,20 @@ impl Connection {
         Self::connect(started.wss_link(), started.auth_body(), heartbeat).await
     }
 
+    /// 使用场次信息及自定义健康期限建立连接。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::connect_with_policy`] 相同；失败后调用方仍需结束场次。
+    #[tracing::instrument(skip_all, fields(game_id = started.game_id(), room_id = started.anchor().room_id))]
+    pub async fn from_start_with_policy(
+        started: &StartResult,
+        heartbeat: Duration,
+        health: HealthPolicy,
+    ) -> Result<Self, WsError> {
+        Self::connect_with_policy(started.wss_link(), started.auth_body(), heartbeat, health).await
+    }
+
     /// 当前连上的官方地址。
     #[must_use]
     pub fn endpoint(&self) -> &str {
@@ -139,30 +181,51 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// 读写失败、二进制协议不符或事件 JSON 无法解析时返回 [`WsError`]。
+    /// 读写失败、发送或存活期限到期、二进制协议不符或事件 JSON 无法解析时返回 [`WsError`]。
+    /// 超时后立即释放连接；取消读取不会重置期限，调用方仍须持续轮询驱动心跳和检查。
     #[must_use = "读取失败时需要处理 WsError"]
     pub async fn recv(&mut self) -> Result<Option<LiveEvent>, WsError> {
+        let result = self.recv_inner().await;
+        if result.is_err() || self.closed {
+            self.closed = true;
+            self.write.take();
+            self.read.take();
+            self.pending_write = PendingWrite::default();
+            self.pending_events.clear();
+        }
+        result
+    }
+
+    async fn recv_inner(&mut self) -> Result<Option<LiveEvent>, WsError> {
         loop {
             if self.closed {
                 return Ok(None);
             }
-            if let Some(message) = self.pending_write.take() {
-                self.write
-                    .send(message)
-                    .await
-                    .map_err(|error| self.fail("发送官方长连接数据失败", error))?;
+            if Instant::now() >= self.activity_deadline {
+                return Err(deadline_error("activity_timeout"));
+            }
+            if self.pending_write.deadline.is_some() {
+                self.pending_write
+                    .drive(self.write.as_mut().unwrap(), self.activity_deadline)
+                    .await?;
+                continue;
+            }
+            if Instant::now() >= self.heartbeat_at {
+                let packet = packet::encode(Operation::Heartbeat, &[])?;
+                self.pending_write
+                    .queue(Message::binary(packet), self.health.write_timeout);
+                self.heartbeat_at = Instant::now() + self.heartbeat_every;
+                tracing::trace!(endpoint = %self.endpoint, "排入 WebSocket 心跳");
                 continue;
             }
             if let Some(event) = self.pending_events.pop_front() {
                 return Ok(Some(event));
             }
             tokio::select! {
-                _ = self.heartbeat.tick() => {
-                    let packet = packet::encode(Operation::Heartbeat, &[])?;
-                    self.pending_write = Some(Message::binary(packet));
-                    tracing::trace!(endpoint = %self.endpoint, "排入 WebSocket 心跳");
-                }
-                incoming = self.read.next() => {
+                biased;
+                _ = sleep_until(self.activity_deadline) => return Err(deadline_error("activity_timeout")),
+                _ = sleep_until(self.heartbeat_at) => {},
+                incoming = self.read.as_mut().unwrap().next() => {
                     self.consume(incoming)?;
                 }
             }
@@ -182,9 +245,12 @@ impl Connection {
         if self.closed {
             return Ok(());
         }
-        self.pending_write = None;
+        self.pending_write = PendingWrite::default();
         self.closed = true;
-        send_close(&mut self.write).await
+        let result = send_close(self.write.as_mut().unwrap()).await;
+        self.write.take();
+        self.read.take();
+        result
     }
 
     fn consume(&mut self, incoming: Option<Result<Message, SocketError>>) -> Result<(), WsError> {
@@ -205,20 +271,33 @@ impl Connection {
                 if bytes.is_empty() {
                     return Err(WsError::protocol("官方长连接收到空二进制帧"));
                 }
+                let mut active = false;
                 for item in decode_frame(&bytes)? {
-                    if let FrameItem::Event(event) = item {
-                        self.pending_events.push_back(*event);
+                    match item {
+                        FrameItem::Event(event) => {
+                            active = true;
+                            self.pending_events.push_back(*event);
+                        }
+                        FrameItem::HeartbeatReply => active = true,
+                        FrameItem::AuthReply(_) => {}
                     }
+                }
+                if active {
+                    self.activity_deadline = Instant::now() + self.health.activity_timeout;
                 }
                 Ok(())
             }
             Message::Ping(payload) => {
-                self.pending_write = Some(Message::Pong(payload));
+                self.pending_write
+                    .queue(Message::Pong(payload), self.health.write_timeout);
                 Ok(())
             }
             Message::Pong(_) | Message::Frame(_) => Ok(()),
-            Message::Close(_) => {
+            Message::Close(frame) => {
                 self.closed = true;
+                if frame.is_some_and(|frame| fatal_close(frame.code)) {
+                    return Err(WsError::protocol("官方长连接拒绝继续通信"));
+                }
                 Ok(())
             }
             Message::Text(_) => Err(WsError::protocol("官方长连接应使用二进制帧")),
@@ -227,7 +306,7 @@ impl Connection {
 
     fn fail(&mut self, message: &'static str, error: SocketError) -> WsError {
         self.closed = true;
-        WsError::transport(message, error)
+        socket_error(message, error)
     }
 }
 
@@ -251,6 +330,7 @@ async fn establish(
     link: &str,
     auth_body: &str,
     heartbeat_every: Duration,
+    health: HealthPolicy,
 ) -> Result<Connection, Attempt> {
     if !is_websocket_url(link) {
         return Err(Attempt::Retry("地址必须是 ws 或 wss".to_owned()));
@@ -295,7 +375,10 @@ async fn establish(
                     .map_err(|error| Attempt::Retry(error.to_string()))?;
             }
             Message::Pong(_) | Message::Frame(_) => {}
-            Message::Close(_) => {
+            Message::Close(frame) => {
+                if frame.is_some_and(|frame| fatal_close(frame.code)) {
+                    return Err(Attempt::Fatal(WsError::protocol("官方长连接拒绝继续通信")));
+                }
                 return Err(Attempt::Retry("连接在鉴权回复前关闭".to_owned()));
             }
             Message::Text(_) => {
@@ -307,6 +390,7 @@ async fn establish(
                 let mut authenticated = false;
                 for item in items {
                     match item {
+                        FrameItem::HeartbeatReply => {}
                         FrameItem::AuthReply(body) => {
                             packet::auth_accepted(&body).map_err(Attempt::Fatal)?;
                             authenticated = true;
@@ -321,16 +405,15 @@ async fn establish(
                     }
                 }
                 if authenticated {
-                    let mut heartbeat = interval(heartbeat_every);
-                    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                    heartbeat.tick().await;
                     return Ok(Connection {
                         endpoint: link.to_owned(),
                         heartbeat_every,
-                        write,
-                        read,
-                        heartbeat,
-                        pending_write: None,
+                        write: Some(write),
+                        read: Some(read),
+                        heartbeat_at: Instant::now() + heartbeat_every,
+                        health,
+                        activity_deadline: Instant::now() + health.activity_timeout,
+                        pending_write: PendingWrite::default(),
                         pending_events: early_events,
                         closed: false,
                     });
@@ -338,6 +421,92 @@ async fn establish(
             }
         }
     }
+}
+
+/// 发送状态保存在连接中，取消 drive future 不会丢失消息或刷新绝对期限。
+#[derive(Default)]
+struct PendingWrite {
+    message: Option<Message>,
+    flushing: bool,
+    deadline: Option<Instant>,
+}
+
+impl PendingWrite {
+    fn queue(&mut self, message: Message, timeout: Duration) {
+        debug_assert!(self.deadline.is_none());
+        self.message = Some(message);
+        self.deadline = Some(Instant::now() + timeout);
+    }
+
+    async fn drive(
+        &mut self,
+        writer: &mut (impl Sink<Message, Error = SocketError> + Unpin),
+        activity_deadline: Instant,
+    ) -> Result<(), WsError> {
+        let write_deadline = self.deadline.unwrap();
+        let deadline = write_deadline.min(activity_deadline);
+        if Instant::now() >= deadline {
+            return Err(deadline_error(if activity_deadline <= write_deadline {
+                "activity_timeout"
+            } else {
+                "write_timeout"
+            }));
+        }
+        let result = timeout_at(
+            deadline,
+            poll_fn(|cx| {
+                // timeout_at 会先轮询内部 future；到期时不能再推进写入。
+                if Instant::now() >= deadline {
+                    return Poll::Pending;
+                }
+                if !self.flushing {
+                    ready!(Pin::new(&mut *writer).poll_ready(cx))?;
+                    Pin::new(&mut *writer).start_send(self.message.take().unwrap())?;
+                    self.flushing = true;
+                }
+                ready!(Pin::new(&mut *writer).poll_flush(cx))?;
+                self.flushing = false;
+                self.deadline = None;
+                Poll::Ready(Ok(()))
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(socket_error("发送官方长连接数据失败", error)),
+            Err(_) => Err(deadline_error(if activity_deadline <= write_deadline {
+                "activity_timeout"
+            } else {
+                "write_timeout"
+            })),
+        }
+    }
+}
+
+fn deadline_error(reason: &'static str) -> WsError {
+    tracing::warn!(reason, "官方长连接健康期限已到");
+    let message = if reason == "activity_timeout" {
+        "官方长连接存活超时"
+    } else {
+        "官方长连接发送超时"
+    };
+    WsError::transport(message, io::Error::new(io::ErrorKind::TimedOut, reason))
+}
+
+fn socket_error(message: &'static str, error: SocketError) -> WsError {
+    match error {
+        SocketError::Protocol(_) | SocketError::Utf8(_) | SocketError::Capacity(_) => {
+            WsError::protocol("官方长连接传输协议错误")
+        }
+        error => WsError::transport(message, error),
+    }
+}
+
+fn fatal_close(code: CloseCode) -> bool {
+    matches!(
+        code,
+        CloseCode::Protocol | CloseCode::Unsupported | CloseCode::Invalid | CloseCode::Policy
+    )
 }
 
 async fn send_close(
@@ -368,3 +537,7 @@ fn socket_closed(error: &SocketError) -> bool {
 #[cfg(test)]
 #[path = "conn_test.rs"]
 mod conn_test;
+
+#[cfg(test)]
+#[path = "health_test.rs"]
+mod health_test;

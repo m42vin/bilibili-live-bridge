@@ -306,7 +306,7 @@ impl StartResult {
     /// 官方 WebSocket 地址，按平台返回的可用顺序排列。
     ///
     /// [`crate::open_live::ws::Connection`] 在建连时按此顺序尝试地址。
-    /// 鉴权被明确拒绝时停止尝试；已建立连接断开后不会自动切换。
+    /// 鉴权被明确拒绝时停止尝试；低层 Connection 不自行重连；会话管理器在恢复时优先切换集群。
     #[must_use]
     pub fn wss_link(&self) -> &[String] {
         &self.wss_link

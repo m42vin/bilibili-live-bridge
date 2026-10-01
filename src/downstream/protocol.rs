@@ -23,6 +23,9 @@ pub(super) fn subscription_code(text: &str) -> Result<String, &'static str> {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum ServerMessage<'a> {
+    Status {
+        state: &'static str,
+    },
     Ready {
         room_id: i64,
         game_id: &'a str,

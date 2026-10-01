@@ -31,6 +31,50 @@ fn loads_required_values_and_defaults() {
     assert_eq!(config.websocket_heartbeat(), DEFAULT_HEARTBEAT);
     assert_eq!(config.app_heartbeat(), DEFAULT_HEARTBEAT);
     assert_eq!(config.heartbeat_policy(), HeartbeatPolicy::default());
+    assert_eq!(config.upstream_policy(), UpstreamPolicy::default());
+}
+
+#[test]
+fn loads_upstream_policy_and_can_disable_reconnect() {
+    let mut vars = required_vars();
+    vars.extend([
+        (ENV_WEBSOCKET_WRITE_TIMEOUT_SECS, "3"),
+        (ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS, "50"),
+        (ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS, "90"),
+        (ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS, "500"),
+        (ENV_UPSTREAM_RECONNECT_RETRY_MAX_MS, "3000"),
+    ]);
+    let policy = load(&vars).unwrap().upstream_policy();
+    assert_eq!(policy.health.write_timeout, Duration::from_secs(3));
+    assert_eq!(policy.health.activity_timeout, Duration::from_secs(50));
+    let reconnect = policy.reconnect.unwrap();
+    assert_eq!(reconnect.failure_timeout, Duration::from_secs(90));
+    assert_eq!(reconnect.retry_initial_delay, Duration::from_millis(500));
+    assert_eq!(reconnect.retry_max_delay, Duration::from_secs(3));
+    let mut vars = required_vars();
+    vars.push((ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS, "0"));
+    assert!(load(&vars).unwrap().upstream_policy().reconnect.is_none());
+}
+
+#[test]
+fn rejects_invalid_upstream_durations_and_combinations() {
+    for (key, value) in [
+        (ENV_WEBSOCKET_WRITE_TIMEOUT_SECS, "0"),
+        (ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS, "0"),
+        (ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS, "25"),
+        (ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS, "-1"),
+        (ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS, "0"),
+        (ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS, "10001"),
+        (ENV_UPSTREAM_RECONNECT_RETRY_MAX_MS, "0"),
+        (ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS, "18446744073709551615"),
+    ] {
+        let mut vars = required_vars();
+        vars.push((key, value));
+        assert!(
+            matches!(load(&vars), Err(ConfigError::Invalid { .. })),
+            "{key}={value}"
+        );
+    }
 }
 
 #[test]

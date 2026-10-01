@@ -40,7 +40,7 @@ fn reads_two_packets_from_one_buffer() {
 }
 
 #[test]
-fn inflates_a_version_two_bundle_and_skips_heartbeat_replies() {
+fn inflates_a_version_two_bundle_and_preserves_heartbeat_replies() {
     let mut plain = encode(Operation::HeartbeatReply, b"").unwrap();
     plain.extend(encode(Operation::Notification, &dm("inside")).unwrap());
     plain.extend(encode(Operation::AuthReply, br#"{"code":0}"#).unwrap());
@@ -48,9 +48,10 @@ fn inflates_a_version_two_bundle_and_skips_heartbeat_replies() {
 
     let items = decode_frame(&packet).unwrap();
 
-    assert_eq!(items.len(), 2);
-    assert_eq!(event_msg(&items[0]), "inside");
-    assert_eq!(items[1], FrameItem::AuthReply(br#"{"code":0}"#.to_vec()));
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0], FrameItem::HeartbeatReply);
+    assert_eq!(event_msg(&items[1]), "inside");
+    assert_eq!(items[2], FrameItem::AuthReply(br#"{"code":0}"#.to_vec()));
 }
 
 #[test]

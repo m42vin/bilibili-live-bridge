@@ -20,7 +20,10 @@ use crate::open_live::ws::LiveEvent;
 #[path = "heartbeat.rs"]
 mod heartbeat;
 pub use heartbeat::HeartbeatPolicy;
+#[path = "upstream.rs"]
+mod upstream;
 use heartbeat::run_heartbeats;
+pub use upstream::{ReconnectPolicy, UpstreamPolicy, UpstreamStatus};
 
 /// 每个生产会话的广播缓冲容量；慢订阅者溢出后跳过旧事件，不拖住其他订阅者。
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -134,6 +137,31 @@ impl Manager {
         options: ManagerOptions,
         heartbeat_policy: HeartbeatPolicy,
     ) -> Result<Self, SessionError> {
+        Self::with_policies(
+            api,
+            websocket_heartbeat,
+            app_heartbeat,
+            options,
+            heartbeat_policy,
+            UpstreamPolicy::default(),
+        )
+    }
+
+    /// 用项目心跳和上游健康、恢复策略创建管理器。
+    ///
+    /// 默认启用原场次的有限重连；将 upstream_policy.reconnect 设为 None 可以禁用。
+    ///
+    /// # Errors
+    ///
+    /// 任一策略时长、期限组合或闲置宽限期无效时返回 SessionError::Invalid。
+    pub fn with_policies(
+        api: api::Client,
+        websocket_heartbeat: Duration,
+        app_heartbeat: Duration,
+        options: ManagerOptions,
+        heartbeat_policy: HeartbeatPolicy,
+        upstream_policy: UpstreamPolicy,
+    ) -> Result<Self, SessionError> {
         if websocket_heartbeat.is_zero() || app_heartbeat.is_zero() {
             return Err(SessionError::invalid("心跳间隔必须大于 0"));
         }
@@ -147,13 +175,21 @@ impl Manager {
         }
         heartbeat_policy.validate().map_err(SessionError::invalid)?;
         heartbeat_policy.warn_if_unsafe(app_heartbeat);
-        let platform: Arc<dyn Platform> = Arc::new(LivePlatform::new(api, websocket_heartbeat));
+        upstream_policy
+            .validate(websocket_heartbeat)
+            .map_err(SessionError::invalid)?;
+        let platform: Arc<dyn Platform> = Arc::new(LivePlatform::new(
+            api,
+            websocket_heartbeat,
+            upstream_policy.health,
+        ));
         Ok(Self::from_parts(
             platform,
             app_heartbeat,
             DEFAULT_EVENT_CAPACITY,
             options,
             heartbeat_policy,
+            upstream_policy,
         ))
     }
 
@@ -166,12 +202,13 @@ impl Manager {
     pub fn from_config(config: &Config) -> Result<Self, SessionError> {
         let api = api::Client::from_config(config)
             .map_err(|error| SessionError::invalid(error.to_string()))?;
-        Self::with_heartbeat_policy(
+        Self::with_policies(
             api,
             config.websocket_heartbeat(),
             config.app_heartbeat(),
             ManagerOptions::default(),
             config.heartbeat_policy(),
+            config.upstream_policy(),
         )
     }
 
@@ -185,7 +222,7 @@ impl Manager {
     /// 返回的 [`Subscription`] 被丢弃时记一次离开。最后一个下游离开后，
     /// 等待 [`ManagerOptions::idle_grace`] 到期再触发 `/v2/app/end`；默认立即关闭。
     /// 同码上一场正在清理时等待其完成；接入返回 `Closed` 且未关闭管理器时额外尝试一次。
-    /// 已运行会话断开后不自动重连，需要调用方重新接入。
+    /// 已运行会话断开后按上游策略恢复原场次；终止后需要调用方重新接入。
     ///
     /// # Errors
     ///
@@ -235,6 +272,7 @@ impl Manager {
         event_capacity: usize,
         options: ManagerOptions,
         heartbeat_policy: HeartbeatPolicy,
+        upstream_policy: UpstreamPolicy,
     ) -> Self {
         Self {
             state: Arc::new(State {
@@ -243,6 +281,7 @@ impl Manager {
                 event_capacity,
                 options,
                 heartbeat_policy,
+                upstream_policy,
                 tables: Mutex::new(Tables {
                     by_code: HashMap::new(),
                     by_room: HashMap::new(),
@@ -272,6 +311,10 @@ impl Manager {
             event_capacity,
             ManagerOptions::default(),
             HeartbeatPolicy::default(),
+            UpstreamPolicy {
+                reconnect: None,
+                ..UpstreamPolicy::default()
+            },
         )
     }
 
@@ -325,6 +368,12 @@ impl Subscription {
     #[must_use]
     pub const fn anchor(&self) -> &Anchor {
         &self.anchor
+    }
+
+    /// 订阅上游状态的最新快照；慢接收者可合并中间变化。
+    #[must_use]
+    pub fn watch_status(&self) -> watch::Receiver<UpstreamStatus> {
+        self.session.upstream.subscribe()
     }
 
     /// 读取下一条直播间事件。
@@ -398,6 +447,7 @@ struct State {
     event_capacity: usize,
     options: ManagerOptions,
     heartbeat_policy: HeartbeatPolicy,
+    upstream_policy: UpstreamPolicy,
     tables: Mutex<Tables>,
     shutdown: AtomicBool,
     beats: Mutex<HashMap<String, BeatSlot>>,
@@ -491,7 +541,7 @@ impl State {
         session.set_game_id(started.game_id().to_owned());
         tracing::debug!(
             room_id = started.anchor().room_id,
-            game_id = started.game_id(),
+            game_id = %started.game_id(),
             "官方场次已开启，准备建立会话"
         );
 
@@ -576,8 +626,7 @@ impl State {
             Arc::clone(&session),
             socket,
             events,
-            started.game_id().to_owned(),
-            started.anchor().room_id,
+            started,
         );
         Ok(subscription)
     }
@@ -863,72 +912,19 @@ async fn close_socket(mut socket: Box<dyn LiveSocket>, game_id: &str, room_id: i
 fn spawn_upstream(
     state: Arc<State>,
     session: Arc<Session>,
-    mut socket: Box<dyn LiveSocket>,
+    socket: Box<dyn LiveSocket>,
     events: broadcast::Sender<Arc<LiveEvent>>,
-    game_id: String,
-    room_id: i64,
+    started: api::StartResult,
 ) {
-    let span = tracing::info_span!("session", room_id, %game_id);
+    let span = tracing::info_span!(
+        "session",
+        room_id = started.anchor().room_id,
+        game_id = %started.game_id()
+    );
     tokio::spawn(
-        async move {
-            tracing::info!("直播间会话已建立");
-            let mut idle = session.idle.subscribe();
-            // 宽限期由同一个上游任务驱动，避免派生的旧计时器关闭已经恢复的订阅。
-            loop {
-                let deadline = *idle.borrow_and_update();
-                tokio::select! {
-                    biased;
-                    _ = session.stop.cancelled() => {
-                        tracing::debug!("会话收到关闭信号");
-                        break;
-                    }
-                    _ = idle.changed() => {}
-                    _ = until_idle(deadline) => {
-                        if session.expire_idle() {
-                            tracing::info!("闲置宽限期已到，关闭会话");
-                            break;
-                        }
-                    }
-                    incoming = socket.recv() => {
-                        match incoming {
-                            Ok(Some(event)) => {
-                                let ends = event.ends_push();
-                                tracing::debug!(cmd = event.cmd(), "转发直播间事件");
-                                // 无接收者是宽限期的正常状态；立即清理由 release 的停止信号驱动。
-                                let _ = events.send(Arc::new(event));
-                                if ends {
-                                    tracing::info!("平台已停止互动推送，关闭会话");
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                tracing::info!("官方长连接已关闭，结束会话");
-                                break;
-                            }
-                            Err(error) => {
-                                tracing::warn!(room_id, %game_id, %error, "官方长连接读取失败，结束会话");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            session.begin_close();
-            session.stop.cancel();
-            close_socket(socket, &game_id, room_id).await;
-            if let Err(error) = state.platform.end(&game_id).await {
-                tracing::warn!(room_id, %game_id, %error, "关闭官方场次失败");
-            }
-            state.unlink(&session);
-            // `send` 在没有接收者时会丢掉新值。会话创建时没有人订阅 phase，必须用 replace。
-            session.phase.send_replace(Phase::Closed);
-            drop(events);
-            tracing::info!("直播间会话已结束");
-            session.mark_finished();
-        }
-        .instrument(span)
-        .with_current_subscriber(),
+        upstream::run(state, session, socket, events, started)
+            .instrument(span)
+            .with_current_subscriber(),
     );
 }
 
@@ -936,6 +932,7 @@ fn spawn_upstream(
 struct Session {
     state: Weak<State>,
     phase: watch::Sender<Phase>,
+    upstream: watch::Sender<UpstreamStatus>,
     stop: Stop,
     subscribers: Mutex<Subscribers>,
     idle_grace: Duration,
@@ -975,6 +972,7 @@ impl Session {
         Arc::new(Self {
             state,
             phase,
+            upstream: watch::channel(UpstreamStatus::Connected).0,
             stop: Stop::new(),
             subscribers: Mutex::new(Subscribers {
                 count: 0,
@@ -1154,6 +1152,9 @@ impl Session {
     }
 
     fn mark_finished(&self) {
+        if *self.upstream.borrow() != UpstreamStatus::Closed {
+            self.upstream.send_replace(UpstreamStatus::Closed);
+        }
         self.finished.store(true, Ordering::SeqCst);
         self.done.notify_waiters();
     }

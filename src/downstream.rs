@@ -24,7 +24,7 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async_with_config};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
-use crate::session::{Manager, RecvError, Subscription};
+use crate::session::{Manager, RecvError, Subscription, UpstreamStatus};
 
 mod protocol;
 use protocol::{ServerMessage, subscription_code};
@@ -340,6 +340,22 @@ async fn forward<S: Sink<Message> + Unpin>(
     shutdown: &mut watch::Receiver<bool>,
 ) -> Exit {
     let mut ticker = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    let mut status = subscription.watch_status();
+    let initial = *status.borrow_and_update();
+    if initial == UpstreamStatus::Reconnecting
+        && let Err(exit) = send_json(
+            writer,
+            &ServerMessage::Status {
+                state: "reconnecting",
+            },
+            peer,
+            shutdown,
+        )
+        .await
+    {
+        return exit;
+    }
+    let mut status_open = initial != UpstreamStatus::Closed;
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut deadline = None;
     let mut pong = pongs.acknowledged.subscribe();
@@ -368,7 +384,17 @@ async fn forward<S: Sink<Message> + Unpin>(
                 }
                 deadline = Some(Instant::now() + IO_TIMEOUT);
             }
+            changed = status.changed(), if status_open => {
+                if changed.is_err() {
+                    status_open = false;
+                } else if let Err(exit) = send_upstream_status(writer, &mut status, &mut status_open, peer, shutdown).await {
+                    return exit;
+                }
+            }
             incoming = subscription.recv() => {
+                // 状态分支可能刚轮询为 Pending，上游随后发布状态和事件；发送前再核对一次。
+                if status_open && status.has_changed().unwrap_or(false)
+                    && let Err(exit) = send_upstream_status(writer, &mut status, &mut status_open, peer, shutdown).await { return exit; }
                 let message = match &incoming {
                     Ok(event) => ServerMessage::event(subscription.room_id(), event),
                     Err(RecvError::Lagged { skipped }) => ServerMessage::Lagged { skipped: *skipped },
@@ -379,6 +405,26 @@ async fn forward<S: Sink<Message> + Unpin>(
             }
         }
     }
+}
+
+async fn send_upstream_status<S: Sink<Message> + Unpin>(
+    writer: &mut S,
+    status: &mut watch::Receiver<UpstreamStatus>,
+    status_open: &mut bool,
+    peer: &mut watch::Receiver<PeerState>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), Exit> {
+    let current = *status.borrow_and_update();
+    let state = match current {
+        UpstreamStatus::Connected => "connected",
+        UpstreamStatus::Reconnecting => "reconnecting",
+        UpstreamStatus::Closed => {
+            // 结束状态不抢先关闭，仍需先交付 InteractionEnd 或缓冲中的事件。
+            *status_open = false;
+            return Ok(());
+        }
+    };
+    send_json(writer, &ServerMessage::Status { state }, peer, shutdown).await
 }
 
 async fn until_deadline(deadline: Option<Instant>) {

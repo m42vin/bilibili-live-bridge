@@ -114,6 +114,72 @@ async fn two_clients_share_one_upstream_and_receive_events_in_order() {
 }
 
 #[tokio::test]
+async fn reconnect_reports_status_before_events_and_keeps_the_same_game() {
+    let fixture = Fixture::new().await;
+    let (mut first, ready) = fixture.subscribe("code-1").await;
+    let room = ready["room_id"].as_i64().unwrap();
+    fixture.state.socket_gate.send_replace(false);
+    fixture.state.emit(room, Value::Null).await;
+    assert_eq!(
+        next_json(&mut first).await,
+        json!({"type":"status","state":"reconnecting"})
+    );
+    let (mut second, second_ready) = fixture.subscribe("code-1").await;
+    assert_eq!(ready["game_id"], second_ready["game_id"]);
+    assert_eq!(
+        next_json(&mut second).await,
+        json!({"type":"status","state":"reconnecting"})
+    );
+    *fixture.state.early_event.lock().unwrap() =
+        Some(json!({"cmd":"LIVE_OPEN_PLATFORM_DM","data":{"msg":"bundled-after-reconnect"}}));
+    fixture.state.socket_gate.send_replace(true);
+    assert_eq!(
+        next_json(&mut first).await,
+        json!({"type":"status","state":"connected"})
+    );
+    assert_eq!(
+        next_json(&mut second).await,
+        json!({"type":"status","state":"connected"})
+    );
+    assert_eq!(
+        next_json(&mut first).await["data"]["msg"],
+        "bundled-after-reconnect"
+    );
+    assert_eq!(
+        next_json(&mut second).await["data"]["msg"],
+        "bundled-after-reconnect"
+    );
+    fixture
+        .state
+        .emit(
+            room,
+            json!({"cmd":"LIVE_OPEN_PLATFORM_DM","data":{"msg":"restored"}}),
+        )
+        .await;
+    assert_eq!(next_json(&mut first).await["data"]["msg"], "restored");
+    assert_eq!(next_json(&mut second).await["data"]["msg"], "restored");
+    assert_eq!(fixture.state.starts.borrow().len(), 1);
+    assert_eq!(*fixture.state.ws_connects.borrow(), 2);
+    assert!(fixture.state.ends.borrow().is_empty());
+    fixture
+        .state
+        .emit(
+            room,
+            json!({"cmd":"LIVE_OPEN_PLATFORM_INTERACTION_END","data":{}}),
+        )
+        .await;
+    assert_eq!(next_json(&mut first).await["type"], "event");
+    assert_eq!(next_json(&mut first).await["type"], "closed");
+    assert_eq!(next_json(&mut second).await["type"], "event");
+    assert_eq!(next_json(&mut second).await["type"], "closed");
+    assert!(matches!(next_frame(&mut first).await, Message::Close(_)));
+    assert!(matches!(next_frame(&mut second).await, Message::Close(_)));
+    drop(first);
+    drop(second);
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn ready_precedes_events_bundled_with_upstream_authentication() {
     let fixture = Fixture::new().await;
     *fixture.state.early_event.lock().unwrap() =
@@ -533,6 +599,8 @@ struct Fixture {
 
 struct PlatformState {
     ws_url: String,
+    socket_gate: watch::Sender<bool>,
+    ws_connects: watch::Sender<usize>,
     starts: watch::Sender<Vec<String>>,
     ends: watch::Sender<Vec<String>>,
     start_gate: watch::Sender<bool>,
@@ -553,6 +621,8 @@ impl Fixture {
         let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let state = Arc::new(PlatformState {
             ws_url: format!("ws://{}", official.local_addr().unwrap()),
+            socket_gate: watch::channel(true).0,
+            ws_connects: watch::channel(0).0,
             starts: watch::channel(Vec::new()).0,
             ends: watch::channel(Vec::new()).0,
             start_gate: watch::channel(true).0,
@@ -777,6 +847,13 @@ async fn official_socket(stream: TcpStream, state: Arc<PlatformState>) {
     assert_eq!(u32::from_be_bytes(auth[8..12].try_into().unwrap()), 7);
     let auth: Value = serde_json::from_slice(&auth[16..]).unwrap();
     let room_id = auth["room_id"].as_i64().unwrap();
+    state.ws_connects.send_modify(|count| *count += 1);
+    state
+        .socket_gate
+        .subscribe()
+        .wait_for(|open| *open)
+        .await
+        .unwrap();
     let (sender, mut events) = mpsc::unbounded_channel::<UpstreamMessage>();
     state.sockets.lock().unwrap().insert(room_id, sender);
     let mut reply = packet(8, br#"{"code":0}"#);
@@ -790,6 +867,11 @@ async fn official_socket(stream: TcpStream, state: Arc<PlatformState>) {
         tokio::select! {
             event = events.recv() => {
                 let Some((value, done)) = event else { break; };
+                if value.is_null() {
+                    let _ = socket.send(Message::Close(None)).await;
+                    let _ = done.send(());
+                    break;
+                }
                 if socket.send(Message::binary(packet(5, value.to_string().as_bytes()))).await.is_err() { break; }
                 let _ = done.send(());
             }
@@ -797,6 +879,7 @@ async fn official_socket(stream: TcpStream, state: Arc<PlatformState>) {
                 Some(Ok(Message::Binary(body))) => {
                     if u32::from_be_bytes(body[8..12].try_into().unwrap()) == 2 {
                         state.heartbeats.fetch_add(1, Ordering::SeqCst);
+                        if socket.send(Message::binary(packet(3, b""))).await.is_err() { break; }
                     }
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,

@@ -27,8 +27,7 @@ const MAX_DEPTH: u8 = 4;
 pub(super) enum Operation {
     /// 客户端心跳。正文为空。
     Heartbeat = 2,
-    /// 服务端心跳回复。读循环忽略这个操作码，变体留给协议对照。
-    #[allow(dead_code)]
+    /// 服务端心跳回复，用于刷新运行期间的健康期限。
     HeartbeatReply = 3,
     /// 服务端推送的业务消息。
     Notification = 5,
@@ -46,9 +45,10 @@ pub(super) struct RawPacket {
     pub(super) body: Vec<u8>,
 }
 
-/// 一帧里解析出的内容。心跳回复会被丢掉。
+/// 一帧里解析出的内容，心跳回复只交给连接健康检查。
 #[derive(Debug, PartialEq)]
 pub(super) enum FrameItem {
+    HeartbeatReply,
     Event(Box<LiveEvent>),
     AuthReply(Vec<u8>),
 }
@@ -89,7 +89,7 @@ pub(super) fn decode_packets(input: &[u8]) -> Result<Vec<RawPacket>, WsError> {
     Ok(packets)
 }
 
-/// 展开一帧中的包和嵌套压缩，解析事件或鉴权回复，忽略心跳回复和未知操作码。
+/// 展开一帧中的包和嵌套压缩，解析事件、心跳及鉴权回复，忽略未知操作码。
 pub(super) fn decode_frame(input: &[u8]) -> Result<Vec<FrameItem>, WsError> {
     let mut count = 0;
     let mut items = Vec::new();
@@ -137,6 +137,9 @@ fn expand(packet: RawPacket, depth: u8, count: &mut usize) -> Result<Vec<FrameIt
         )));
     }
     match packet.operation {
+        operation if operation == Operation::HeartbeatReply as u32 => {
+            Ok(vec![FrameItem::HeartbeatReply])
+        }
         operation if operation == Operation::Notification as u32 => Ok(vec![FrameItem::Event(
             Box::new(parse_command(&packet.body)?),
         )]),

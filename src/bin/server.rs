@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     logging::init()?;
     let config = Config::from_env()?;
-    let manager = Manager::with_heartbeat_policy(
+    let manager = Manager::with_policies(
         Client::from_config(&config)?,
         config.websocket_heartbeat(),
         config.app_heartbeat(),
@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             idle_grace: Duration::from_secs(30),
         },
         config.heartbeat_policy(),
+        config.upstream_policy(),
     )?;
     let listener = TcpListener::bind(config.listen()).await?;
     tracing::info!(listen = %listener.local_addr()?, path = "/ws", "直播桥已开始监听");

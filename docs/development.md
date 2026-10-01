@@ -71,7 +71,13 @@ cargo test --locked --doc
 ```sh
 RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked --bin multi_client
 RUST_LOG=info,bilibili_live_bridge=trace,ws_listen=debug cargo run --locked --bin ws_listen
+RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 ```
+
+`auth_reauth` 单独验证原场次的 `auth_body` 能否重新鉴权，即上游恢复的前提；它开启一场真实互动，
+按 `wss_link` 顺序握手、释放、再用原鉴权重复握手，并在恢复后调用项目心跳确认场次存续。
+`.env` 不会被自动加载，需要先 `set -a && . ./.env && set +a`。测试套件只覆盖它的参数与凭据校验
+（[auth_reauth_cli.rs](../tests/auth_reauth_cli.rs)），真实鉴权结果需要人工运行并记录。
 
 使用房间号、场次 ID、请求路径和命令名关联日志。debug 可以看到示例程序的事件详情，trace 可以看到 WebSocket 心跳；真实运行会开启和关闭平台场次。
 
@@ -103,8 +109,8 @@ RUST_LOG=info,bilibili_live_bridge=trace,ws_listen=debug cargo run --locked --bi
 
 - 同码并发只开启一次；跨码同房复用时清理重复场次。
 - 最后一个订阅离开后按闲置宽限期关闭；重连取消旧截止时间，到期只清理一次；慢订阅者不阻塞其他订阅者。
-- 互动结束事件先转发，再结束会话；上游关闭和读取失败都清理场次。
-- 心跳部分失败只影响对应场次；非业务错误按连续失败次数处理。
+- 互动结束先转发再终止；可恢复断线保留同一场次，终止错误和恢复预算耗尽清理一次。
+- 项目心跳部分失败只影响对应场次；暂时错误按时间预算恢复，保持与上游恢复策略独立。
 - 接入期间关闭管理器、建连失败、结束失败，以及同码再次接入与上一场清理的竞态。
 
 使用现有模拟平台扩展必要的时序控制。不要让会话单元测试依赖真实平台；新增平台操作时同时更新生产适配器与测试实现。
@@ -134,3 +140,40 @@ cargo doc --locked --no-deps --open
 查看内部实现的 rustdoc 时追加 `--document-private-items`。README 和本文中的文件链接均相对仓库定位，新增或移动文件时需检查链接。
 
 提交前运行与改动相关的测试，并完成格式、默认测试和严格文档构建。对纯文档改动，重点确认链接与描述匹配当前实现；对新增 Rust 示例，还要确认 doctest 编译通过。
+
+## 上游健康与恢复验证
+
+健康期限测试使用暂停时钟及可控 Sink，覆盖发送准备/flush 阻塞、取消恢复和缓存事件不保活。
+`upstream_recovery_test.rs` 使用平台桩验证原场次恢复、稳定窗口、预算、闲置、项目心跳及 shutdown。
+本地 WebSocket 测试验证心跳回复、候选集群切换及下游 ready/status/event/closed 顺序；断线立即结束的旧测试显式禁用恢复。
+真实平台验证用 `auth_reauth`，拒绝时结束订阅，不重新 start。
+
+2026-10-01 对真实平台的运行结论（`--wait-secs 60`，单次运行）：
+
+- 释放首条连接后，用原 `auth_body` 重新鉴权成功；平台没有把重新鉴权视为冲突。
+- 重新鉴权后的连接在 60 秒观察期内保持打开且未收到事件，说明平台接受后不静默关闭；
+  该观察长度等于默认 `activity_timeout`，更长的静默存活需要更大的观察窗口。
+- 两次项目心跳（释放旧连接后、重新鉴权后）都成功，原场次在整个过程中保持存续。
+
+`wss_link` 的实际结构（另一次请求记录，5 项、4 个不同地址）：
+
+```text
+0 wss://zj-cn-live-comet.chat.bilibili.com:443/sub   浙江
+1 wss://zj-cn-live-comet.chat.bilibili.com:443/sub   重复
+2 wss://bd-bj-live-comet-11.chat.bilibili.com:443/sub 北京
+3 wss://bd-sz-live-comet-06.chat.bilibili.com:443/sub 深圳
+4 wss://broadcastlv.chat.bilibili.com:443/sub        主入口
+```
+
+平台会重复同一个集群，且候选确实包含不同地域。恢复时的候选顺序因此在去重后计算偏移；
+否则上次停在浙江（下标 0）时，偏移会落到下标 1 的重复项，让同一地址被连续尝试两次，
+在 10 秒握手期限下白耗一份恢复预算。真实地址集下的完整跨集群故障转移仍需断网联调。
+
+剩余的未验证部分：真实断线触发的完整恢复路径、平台真实不可用时跨集群故障转移的全过程、
+以及静默存活超过一个 `activity_timeout` 的行为。
+
+```sh
+cargo test --locked health_test
+cargo test --locked upstream_recovery
+cargo clippy --locked --all-targets -- -D warnings
+```

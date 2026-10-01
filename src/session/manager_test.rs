@@ -16,6 +16,8 @@ use crate::session::SessionError;
 
 #[path = "heartbeat_recovery_test.rs"]
 mod heartbeat_recovery_test;
+#[path = "upstream_recovery_test.rs"]
+mod upstream_recovery_test;
 
 const QUIET: Duration = Duration::from_secs(3600);
 const CODE: &str = "super-secret-code";
@@ -695,6 +697,10 @@ fn grace_manager(mock: &Arc<Mock>) -> Manager {
             idle_grace: Duration::from_secs(30),
         },
         super::HeartbeatPolicy::default(),
+        super::UpstreamPolicy {
+            reconnect: None,
+            ..super::UpstreamPolicy::default()
+        },
     )
 }
 
@@ -765,6 +771,7 @@ struct MockInner {
 enum ConnectPlan {
     Ok,
     Err(String),
+    Reject,
     Wait(watch::Receiver<bool>, watch::Sender<bool>),
 }
 
@@ -794,7 +801,7 @@ impl Drop for ActiveHeartbeat<'_> {
 
 #[derive(Clone)]
 struct TestConn {
-    tx: mpsc::UnboundedSender<Option<LiveEvent>>,
+    tx: mpsc::UnboundedSender<Result<Option<LiveEvent>, WsError>>,
     closed: Arc<AtomicBool>,
     hold_close: Arc<AtomicBool>,
     received: watch::Receiver<usize>,
@@ -803,12 +810,12 @@ struct TestConn {
 impl TestConn {
     fn emit(&self, event: LiveEvent) {
         self.tx
-            .send(Some(event))
+            .send(Ok(Some(event)))
             .expect("session dropped the socket");
     }
 
     fn hangup(&self) {
-        self.tx.send(None).expect("session dropped the socket");
+        self.tx.send(Ok(None)).expect("session dropped the socket");
     }
 
     fn hold_close(&self) {
@@ -832,7 +839,7 @@ impl TestConn {
 }
 
 struct MockSocket {
-    incoming: mpsc::UnboundedReceiver<Option<LiveEvent>>,
+    incoming: mpsc::UnboundedReceiver<Result<Option<LiveEvent>, WsError>>,
     closed: Arc<AtomicBool>,
     hold_close: Arc<AtomicBool>,
     received: watch::Sender<usize>,
@@ -1136,6 +1143,11 @@ impl Platform for Mock {
                 .expect("unexpected connect");
             match plan {
                 ConnectPlan::Err(message) => return Err(WsError::Connect { message }),
+                ConnectPlan::Reject => {
+                    return Err(WsError::Protocol {
+                        message: "auth rejected".to_owned(),
+                    });
+                }
                 ConnectPlan::Ok => {}
                 ConnectPlan::Wait(mut gate, entered) => {
                     entered.send_replace(true);
@@ -1168,9 +1180,9 @@ impl Platform for Mock {
 impl LiveSocket for MockSocket {
     fn recv(&mut self) -> BoxFuture<'_, Result<Option<LiveEvent>, WsError>> {
         Box::pin(async move {
-            let event = self.incoming.recv().await.unwrap_or_default();
+            let event = self.incoming.recv().await.unwrap_or(Ok(None));
             self.received.send_modify(|count| *count += 1);
-            Ok(event)
+            event
         })
     }
 

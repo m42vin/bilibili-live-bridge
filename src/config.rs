@@ -8,7 +8,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::session::HeartbeatPolicy;
+use crate::open_live::ws::HealthPolicy;
+use crate::session::{HeartbeatPolicy, ReconnectPolicy, UpstreamPolicy};
 
 /// 开放平台 Access Key Id。
 pub const ENV_ACCESS_KEY_ID: &str = "BILIBILI_ACCESS_KEY_ID";
@@ -30,6 +31,18 @@ pub const ENV_APP_HEARTBEAT_RETRY_INITIAL_MS: &str = "BRIDGE_APP_HEARTBEAT_RETRY
 /// 项目心跳普通退避上限，单位毫秒。
 pub const ENV_APP_HEARTBEAT_RETRY_MAX_MS: &str = "BRIDGE_APP_HEARTBEAT_RETRY_MAX_MS";
 
+/// 官方长连接单次发送期限，单位秒。
+pub const ENV_WEBSOCKET_WRITE_TIMEOUT_SECS: &str = "BRIDGE_WEBSOCKET_WRITE_TIMEOUT_SECS";
+/// 官方长连接有效入站活动期限，单位秒。
+pub const ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS: &str = "BRIDGE_WEBSOCKET_ACTIVITY_TIMEOUT_SECS";
+/// 原场次上游恢复预算，单位秒；0 禁用恢复。
+pub const ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS: &str = "BRIDGE_UPSTREAM_RECONNECT_TIMEOUT_SECS";
+/// 上游恢复初始退避，单位毫秒。
+pub const ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS: &str =
+    "BRIDGE_UPSTREAM_RECONNECT_RETRY_INITIAL_MS";
+/// 上游恢复退避上限，单位毫秒。
+pub const ENV_UPSTREAM_RECONNECT_RETRY_MAX_MS: &str = "BRIDGE_UPSTREAM_RECONNECT_RETRY_MAX_MS";
+
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 /// 官方文档推荐的心跳间隔。长连接约 30 秒收不到心跳会断开，互动玩法约 60 秒没有项目心跳会关闭场次。
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(20);
@@ -48,6 +61,7 @@ pub struct Config {
     websocket_heartbeat: Duration,
     app_heartbeat: Duration,
     heartbeat_policy: HeartbeatPolicy,
+    upstream_policy: UpstreamPolicy,
 }
 
 impl Config {
@@ -60,7 +74,9 @@ impl Config {
     /// 项目心跳恢复期限默认 45 秒，初始退避默认 2000 毫秒、上限 10000 毫秒；
     /// 分别通过 BRIDGE_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS、
     /// BRIDGE_APP_HEARTBEAT_RETRY_INITIAL_MS、BRIDGE_APP_HEARTBEAT_RETRY_MAX_MS 配置。
-    /// 时间组合不安全时由管理器警告，配置值保持原样。
+    /// 项目心跳时间组合不安全时由管理器警告，配置值保持原样。
+    /// 上游发送/活动期限默认 5/60 秒，恢复预算默认 120 秒（0 禁用），退避 2000/10000 毫秒。
+    /// 活动期限必须大于长连接心跳间隔加发送期限，初始退避不得超过上限。
     /// 读取的文本去掉首尾空白；空白的可选变量使用默认值。
     ///
     /// # Errors
@@ -114,6 +130,61 @@ impl Config {
             )?,
         };
 
+        let defaults = UpstreamPolicy::default();
+        let health = HealthPolicy {
+            write_timeout: policy_duration(
+                &read,
+                ENV_WEBSOCKET_WRITE_TIMEOUT_SECS,
+                defaults.health.write_timeout,
+                Duration::from_secs,
+            )?,
+            activity_timeout: policy_duration(
+                &read,
+                ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS,
+                defaults.health.activity_timeout,
+                Duration::from_secs,
+            )?,
+        };
+        health
+            .validate(websocket_heartbeat)
+            .map_err(|message| ConfigError::Invalid {
+                var: ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS,
+                message: message.to_owned(),
+            })?;
+        let reconnect = match optional(&read, ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS)? {
+            Some(value) if value.parse::<u64>().ok() == Some(0) => None,
+            _ => {
+                let defaults = ReconnectPolicy::default();
+                Some(ReconnectPolicy {
+                    failure_timeout: policy_duration(
+                        &read,
+                        ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS,
+                        defaults.failure_timeout,
+                        Duration::from_secs,
+                    )?,
+                    retry_initial_delay: policy_duration(
+                        &read,
+                        ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS,
+                        defaults.retry_initial_delay,
+                        Duration::from_millis,
+                    )?,
+                    retry_max_delay: policy_duration(
+                        &read,
+                        ENV_UPSTREAM_RECONNECT_RETRY_MAX_MS,
+                        defaults.retry_max_delay,
+                        Duration::from_millis,
+                    )?,
+                })
+            }
+        };
+        let upstream_policy = UpstreamPolicy { health, reconnect };
+        upstream_policy
+            .validate(websocket_heartbeat)
+            .map_err(|message| ConfigError::Invalid {
+                var: ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS,
+                message: message.to_owned(),
+            })?;
+
         Ok(Self {
             access_key_id,
             access_key_secret,
@@ -122,6 +193,7 @@ impl Config {
             websocket_heartbeat,
             app_heartbeat,
             heartbeat_policy,
+            upstream_policy,
         })
     }
 
@@ -166,6 +238,11 @@ impl Config {
     pub const fn heartbeat_policy(&self) -> HeartbeatPolicy {
         self.heartbeat_policy
     }
+    /// 官方连接健康检查及原场次恢复策略。
+    #[must_use]
+    pub const fn upstream_policy(&self) -> UpstreamPolicy {
+        self.upstream_policy
+    }
 }
 
 impl fmt::Debug for Config {
@@ -179,6 +256,7 @@ impl fmt::Debug for Config {
             .field("websocket_heartbeat", &self.websocket_heartbeat)
             .field("app_heartbeat", &self.app_heartbeat)
             .field("heartbeat_policy", &self.heartbeat_policy)
+            .field("upstream_policy", &self.upstream_policy)
             .finish()
     }
 }

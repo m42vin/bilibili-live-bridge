@@ -52,7 +52,12 @@ async fn listen(
     config: &Config,
     started: &StartResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut connection = Connection::from_start(started, config.websocket_heartbeat()).await?;
+    let mut connection = Connection::from_start_with_policy(
+        started,
+        config.websocket_heartbeat(),
+        config.upstream_policy().health,
+    )
+    .await?;
 
     let mut ticks = interval(config.app_heartbeat());
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);

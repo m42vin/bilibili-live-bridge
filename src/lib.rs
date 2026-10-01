@@ -18,7 +18,7 @@
 //! use bilibili_live_bridge::{
 //!     config::Config,
 //!     logging,
-//!     session::{Manager, RecvError},
+//!     session::{Manager, RecvError, UpstreamStatus},
 //! };
 //!
 //! type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -37,11 +37,21 @@
 //!
 //! async fn receive(manager: &Manager, code: &str) -> Result<(), Error> {
 //!     let mut subscription = manager.attach(code).await?;
+//!     let mut status = subscription.watch_status();
+//!     let mut status_open = true;
 //!     loop {
 //!         tokio::select! {
 //!             signal = tokio::signal::ctrl_c() => {
 //!                 signal?;
 //!                 return Ok(());
+//!             }
+//!             changed = status.changed(), if status_open => {
+//!                 let current = *status.borrow_and_update();
+//!                 if changed.is_err() || current == UpstreamStatus::Closed {
+//!                     status_open = false; // 继续读完事件缓冲，包括 InteractionEnd。
+//!                 } else {
+//!                     tracing::info!(?current, "上游状态变化");
+//!                 }
 //!             }
 //!             incoming = subscription.recv() => match incoming {
 //!                 Ok(event) => {
@@ -62,6 +72,7 @@
 //!
 //! `Lagged` 表示缓冲中的未读事件被覆盖，当前没有持久化补发。订阅析构只触发异步清理；
 //! 进程退出前应等待 [`session::Manager::shutdown`]，并保持 Tokio runtime 存活。
+//! 默认在原场次内有限恢复上游，状态与直播事件独立。恢复空窗不补发历史事件。
 
 pub mod config;
 pub mod downstream;

@@ -11,6 +11,7 @@
 mod cmd;
 mod conn;
 mod error;
+mod health;
 mod packet;
 
 pub use cmd::{
@@ -19,3 +20,4 @@ pub use cmd::{
 };
 pub use conn::Connection;
 pub use error::WsError;
+pub use health::HealthPolicy;
