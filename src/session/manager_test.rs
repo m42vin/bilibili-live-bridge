@@ -753,6 +753,7 @@ struct MockInner {
 enum ConnectPlan {
     Ok,
     Err(String),
+    Wait(watch::Receiver<bool>, watch::Sender<bool>),
 }
 
 #[derive(Clone, Copy)]
@@ -883,6 +884,15 @@ impl Mock {
 
     fn push_connect_ok(&self) {
         super::lock(&self.inner).connects.push_back(ConnectPlan::Ok);
+    }
+
+    fn push_connect_wait(&self) -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        let (gate, waiting) = watch::channel(false);
+        let (entered, entered_rx) = watch::channel(false);
+        super::lock(&self.inner)
+            .connects
+            .push_back(ConnectPlan::Wait(waiting, entered));
+        (gate, entered_rx)
     }
 
     fn push_connect_err(&self, message: impl Into<String>) {
@@ -1037,27 +1047,32 @@ impl Platform for Mock {
                 .pop_front()
                 .expect("unexpected connect");
             match plan {
-                ConnectPlan::Err(message) => Err(WsError::Connect { message }),
-                ConnectPlan::Ok => {
-                    let (tx, incoming) = mpsc::unbounded_channel();
-                    let closed = Arc::new(AtomicBool::new(false));
-                    let hold_close = Arc::new(AtomicBool::new(false));
-                    let (received, received_rx) = watch::channel(0);
-                    super::lock(&self.inner).connections.push(TestConn {
-                        tx,
-                        closed: Arc::clone(&closed),
-                        hold_close: Arc::clone(&hold_close),
-                        received: received_rx,
-                    });
-                    let socket: Box<dyn LiveSocket> = Box::new(MockSocket {
-                        incoming,
-                        closed,
-                        hold_close,
-                        received,
-                    });
-                    Ok(socket)
+                ConnectPlan::Err(message) => return Err(WsError::Connect { message }),
+                ConnectPlan::Ok => {}
+                ConnectPlan::Wait(mut gate, entered) => {
+                    entered.send_replace(true);
+                    gate.wait_for(|open| *open)
+                        .await
+                        .expect("connect gate closed");
                 }
             }
+            let (tx, incoming) = mpsc::unbounded_channel();
+            let closed = Arc::new(AtomicBool::new(false));
+            let hold_close = Arc::new(AtomicBool::new(false));
+            let (received, received_rx) = watch::channel(0);
+            super::lock(&self.inner).connections.push(TestConn {
+                tx,
+                closed: Arc::clone(&closed),
+                hold_close: Arc::clone(&hold_close),
+                received: received_rx,
+            });
+            let socket: Box<dyn LiveSocket> = Box::new(MockSocket {
+                incoming,
+                closed,
+                hold_close,
+                received,
+            });
+            Ok(socket)
         })
     }
 }
@@ -1080,4 +1095,181 @@ impl LiveSocket for MockSocket {
             Ok(())
         })
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeats_run_during_connect_and_keep_their_schedule_after_ready() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    let (gate, mut entered) = mock.push_connect_wait();
+    let manager = manager(&mock, Duration::from_secs(20));
+    let attach = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    entered.wait_for(|entered| *entered).await.unwrap();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    for expected_batches in 1..=2 {
+        tokio::time::advance(Duration::from_secs(20)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(mock.batches().len(), expected_batches);
+        assert_eq!(mock.batches().last().unwrap(), &["game-1".to_owned()]);
+        assert!(!attach.is_finished());
+    }
+    tokio::time::advance(Duration::from_secs(5)).await;
+    gate.send_replace(true);
+    let sub = attach.await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        mock.batches().len(),
+        3,
+        "ready must not restart the heartbeat interval"
+    );
+    let _ = manager.shutdown().await;
+    drop(sub);
+    assert!(super::lock(&manager.state.beats).is_empty());
+    assert!(super::lock(&manager.state.tables).sessions.is_empty());
+    assert_eq!(mock.ends(), ["game-1"]);
+}
+
+#[tokio::test]
+async fn heartbeat_failure_cancels_pending_connect_and_cleans_the_game() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    let (_gate, mut entered) = mock.push_connect_wait();
+    let manager = manager(&mock, QUIET);
+    let attach = {
+        let state = Arc::clone(&manager.state);
+        tokio::spawn(async move { state.attach_once(CODE).await })
+    };
+    entered.wait_for(|entered| *entered).await.unwrap();
+    mock.fail_game_ids(&["game-1"]);
+    manager.beat_once().await;
+    let error = timeout(Duration::from_secs(1), attach)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error, SessionError::Closed);
+    assert_eq!(mock.ends(), ["game-1"]);
+    assert!(mock.connections().is_empty());
+    assert!(super::lock(&manager.state.beats).is_empty());
+    assert!(super::lock(&manager.state.tables).sessions.is_empty());
+    let _ = manager.shutdown().await;
+    assert_eq!(mock.end_attempts(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_cancels_pending_connect_and_waits_for_end() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    let (_gate, mut entered) = mock.push_connect_wait();
+    let manager = manager(&mock, QUIET);
+    let attach = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    entered.wait_for(|entered| *entered).await.unwrap();
+    timeout(Duration::from_secs(1), manager.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(
+        attach.await.unwrap().unwrap_err(),
+        SessionError::ShuttingDown
+    );
+    assert_eq!(mock.ends(), ["game-1"]);
+    assert!(mock.connections().is_empty());
+    assert!(super::lock(&manager.state.beats).is_empty());
+    assert!(super::lock(&manager.state.tables).sessions.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_duplicate_game_cleanup_after_code_redirect() {
+    let mock = Mock::new();
+    mock.push_ok("game-a", 42);
+    mock.push_ok("game-b", 42);
+    mock.push_connect_ok();
+    let manager = manager(&mock, QUIET);
+    let first = manager.attach("code-a").await.unwrap();
+    mock.hold_end();
+    let other = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach("code-b").await })
+    };
+    mock.wait_end_entered(1).await;
+    // 重复场次已经进入等待；让活动场次的 end 独立完成。
+    mock.hold_end.store(false, Ordering::SeqCst);
+    assert!(
+        timeout(Duration::from_millis(50), manager.shutdown())
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.ends(), ["game-a"]);
+    assert_eq!(super::lock(&manager.state.tables).sessions.len(), 1);
+    mock.release_end();
+    assert_eq!(
+        other.await.unwrap().unwrap_err(),
+        SessionError::ShuttingDown
+    );
+    let _ = manager.shutdown().await;
+    drop(first);
+    assert_eq!(mock.ends(), ["game-a", "game-b"]);
+    assert_eq!(mock.end_attempts(), 2);
+    assert!(super::lock(&manager.state.tables).sessions.is_empty());
+}
+
+#[tokio::test]
+async fn failed_connect_removes_heartbeats_before_waiting_for_end() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_err("connect failed");
+    mock.hold_end();
+    let manager = manager(&mock, QUIET);
+    let attach = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    mock.wait_end_entered(1).await;
+    assert!(super::lock(&manager.state.beats).is_empty());
+    assert_eq!(super::lock(&manager.state.tables).sessions.len(), 1);
+    manager.beat_once().await;
+    assert!(mock.batches().is_empty());
+    mock.release_end();
+    assert!(matches!(
+        attach.await.unwrap(),
+        Err(SessionError::Connect { .. })
+    ));
+    let _ = manager.shutdown().await;
+    assert_eq!(mock.ends(), ["game-1"]);
+    assert!(super::lock(&manager.state.tables).sessions.is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_connect_removes_heartbeats_and_cleans_the_known_game() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    let (_gate, mut entered) = mock.push_connect_wait();
+    let manager = manager(&mock, QUIET);
+    let attach = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.attach(CODE).await })
+    };
+    entered.wait_for(|entered| *entered).await.unwrap();
+    assert_eq!(super::lock(&manager.state.beats).len(), 1);
+    attach.abort();
+    assert!(attach.await.unwrap_err().is_cancelled());
+    assert!(super::lock(&manager.state.beats).is_empty());
+    assert!(super::lock(&manager.state.tables).sessions.is_empty());
+    // 被取消的接入派生尽力清理，按契约先等待它结束再关闭 runtime。
+    mock.wait_ends(1).await;
+    let _ = manager.shutdown().await;
+    assert_eq!(mock.ends(), ["game-1"]);
+    assert_eq!(mock.end_attempts(), 1);
 }

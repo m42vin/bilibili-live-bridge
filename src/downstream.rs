@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -50,6 +51,41 @@ enum Exit {
     AttachFailed,
     Disconnected,
     Failed,
+}
+
+/// 只发布当前 Ping 的确认，主动或旧 Pong 不会覆盖有效确认。
+struct Pongs {
+    expected: Mutex<Option<[u8; 8]>>,
+    acknowledged: watch::Sender<Option<[u8; 8]>>,
+}
+
+impl Pongs {
+    fn new() -> Self {
+        Self {
+            expected: Mutex::new(None),
+            acknowledged: watch::channel(None).0,
+        }
+    }
+
+    fn expect(&self, payload: [u8; 8]) {
+        *self
+            .expected
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(payload);
+    }
+
+    fn acknowledge(&self, payload: &[u8]) {
+        let mut expected = self
+            .expected
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if expected
+            .as_ref()
+            .is_some_and(|expected| payload == expected)
+        {
+            self.acknowledged.send_replace(expected.take());
+        }
+    }
 }
 
 /// 在已绑定的监听器上服务下游 WebSocket，直到退出信号就绪或监听失败。
@@ -135,17 +171,17 @@ async fn connection(stream: TcpStream, manager: Manager, mut shutdown: watch::Re
     let (mut writer, reader) = socket.split();
     let (first_tx, first_rx) = oneshot::channel();
     let (peer_tx, mut peer) = watch::channel(PeerState::Connected);
-    let (pong_tx, pong_rx) = watch::channel(Vec::new());
+    let pongs = Arc::new(Pongs::new());
     let (done, done_rx) = watch::channel(false);
     tokio::join!(
-        read_peer(reader, first_tx, peer_tx, pong_tx, done_rx),
+        read_peer(reader, first_tx, peer_tx, Arc::clone(&pongs), done_rx),
         async {
             let exit = write_peer(
                 &mut writer,
                 &manager,
                 first_rx,
                 &mut peer,
-                pong_rx,
+                &pongs,
                 &mut shutdown,
             )
             .await;
@@ -172,7 +208,7 @@ async fn read_peer(
     mut reader: Reader,
     first: oneshot::Sender<String>,
     state: watch::Sender<PeerState>,
-    pong: watch::Sender<Vec<u8>>,
+    pongs: Arc<Pongs>,
     mut done: watch::Receiver<bool>,
 ) {
     let mut first = Some(first);
@@ -207,7 +243,7 @@ async fn read_peer(
                 first.take();
             }
             Some(Ok(Message::Pong(payload))) => {
-                pong.send_replace(payload.to_vec());
+                pongs.acknowledge(&payload);
             }
             Some(Ok(Message::Close(_))) => {
                 state.send_replace(PeerState::Closed);
@@ -246,7 +282,7 @@ async fn write_peer(
     manager: &Manager,
     first: oneshot::Receiver<String>,
     peer: &mut watch::Receiver<PeerState>,
-    pong: watch::Receiver<Vec<u8>>,
+    pongs: &Pongs,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Exit {
     let code = match receive_code(first, peer, shutdown).await {
@@ -276,7 +312,7 @@ async fn write_peer(
     if let Err(exit) = send_json(writer, &ready, peer, shutdown).await {
         return exit;
     }
-    forward(writer, &mut subscription, peer, pong, shutdown).await
+    forward(writer, &mut subscription, peer, pongs, shutdown).await
 }
 
 async fn receive_code(
@@ -300,13 +336,14 @@ async fn forward<S: Sink<Message> + Unpin>(
     writer: &mut S,
     subscription: &mut Subscription,
     peer: &mut watch::Receiver<PeerState>,
-    mut pong: watch::Receiver<Vec<u8>>,
+    pongs: &Pongs,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Exit {
     let mut ticker = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut deadline = None;
-    let mut expected_pong = Vec::new();
+    let mut pong = pongs.acknowledged.subscribe();
+    let mut expected_pong = None;
     let mut ping_id = 0_u64;
     loop {
         tokio::select! {
@@ -322,8 +359,11 @@ async fn forward<S: Sink<Message> + Unpin>(
             }
             _ = ticker.tick() => {
                 ping_id = ping_id.wrapping_add(1);
-                expected_pong = ping_id.to_be_bytes().to_vec();
-                if let Err(exit) = send_frame(writer, Message::Ping(expected_pong.clone().into()), peer, shutdown).await {
+                let payload = ping_id.to_be_bytes();
+                expected_pong = Some(payload);
+                // 发送开始前登记，读端可能在 send 的 flush 完成之前收到应答。
+                pongs.expect(payload);
+                if let Err(exit) = send_frame(writer, Message::Ping(payload.to_vec().into()), peer, shutdown).await {
                     return exit;
                 }
                 deadline = Some(Instant::now() + IO_TIMEOUT);

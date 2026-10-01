@@ -116,6 +116,7 @@ impl Manager {
     /// 身份码前后的空白会去掉。同一个码的并发接入只会调用一次 `/v2/app/start`。
     /// 另一个码如果成功开启并返回同一个房间，会尝试关闭后一次场次，调用方改挂到已有的那场。
     /// 平台拒绝另一个码的开启时直接返回错误，不会根据房间索引绕过该错误。
+    /// 取得场次后即维护项目心跳，包括建连与多地址鉴权期间；心跳失效会中止建连并清理场次。
     ///
     /// 返回的 [`Subscription`] 被丢弃时记一次离开。最后一个下游离开后，
     /// 等待 [`ManagerOptions::idle_grace`] 到期再触发 `/v2/app/end`；默认立即关闭。
@@ -148,6 +149,7 @@ impl Manager {
     ///
     /// 返回之后，新的 [`Manager::attach`] 得到 [`SessionError::ShuttingDown`]。
     /// 可以再次调用；已经结束的会话不会再关闭一次。
+    /// 正在接入的会话和跨身份码合并时的重复场次清理也纳入等待。
     /// 官方连接关闭最多等待 5 秒，随后释放连接并继续调用 `end`。
     /// 官方连接或 `end` 清理失败会记录日志，不从本方法返回，也不自动重试；
     /// 返回不保证平台已确认场次结束成功。调用方应等待此 future 完成再退出 runtime。
@@ -178,6 +180,7 @@ impl Manager {
                 tables: Mutex::new(Tables {
                     by_code: HashMap::new(),
                     by_room: HashMap::new(),
+                    sessions: Vec::new(),
                 }),
                 shutdown: AtomicBool::new(false),
                 beats: Mutex::new(HashMap::new()),
@@ -344,6 +347,8 @@ struct BeatSlot {
 struct Tables {
     by_code: HashMap<String, Arc<Session>>,
     by_room: HashMap<i64, Arc<Session>>,
+    /// 独立于复用索引的生命周期登记，保留正在清理的重复场次。
+    sessions: Vec<Arc<Session>>,
 }
 
 impl State {
@@ -377,6 +382,7 @@ impl State {
                     let session = Session::starting(Arc::downgrade(self), self.options.idle_grace);
                     session.add_code(code.to_owned());
                     tables.by_code.insert(code.to_owned(), Arc::clone(&session));
+                    tables.sessions.push(Arc::clone(&session));
                     return Ok((session, true));
                 }
             };
@@ -408,6 +414,7 @@ impl State {
             }
         };
         leader.game_id = Some(started.game_id().to_owned());
+        session.set_game_id(started.game_id().to_owned());
         tracing::debug!(
             room_id = started.anchor().room_id,
             game_id = started.game_id(),
@@ -415,13 +422,13 @@ impl State {
         );
 
         if self.stopping(&session) {
-            return abort(&mut leader, &session, SessionError::ShuttingDown).await;
+            return abort(&mut leader, &session, self.stop_error()).await;
         }
 
         let decision = self.decide_room(&session, code, started.anchor().room_id);
         match decision {
             RoomDecision::Abort => {
-                return abort(&mut leader, &session, SessionError::ShuttingDown).await;
+                return abort(&mut leader, &session, self.stop_error()).await;
             }
             RoomDecision::Join(existing) => {
                 let game_id = leader
@@ -438,15 +445,30 @@ impl State {
                 }
                 leader.game_id = None;
                 leader.committed = true;
+                if self.stopping(&session) {
+                    let error = self.stop_error();
+                    session.fail(error.clone());
+                    return Err(error);
+                }
                 session.redirect(&existing);
                 return follow(existing).await;
             }
             RoomDecision::Own => {}
         }
 
-        let socket = match self.platform.connect(&started).await {
-            Ok(socket) => socket,
-            Err(error) => {
+        if !self.register_beat(started.game_id(), &session) {
+            return abort(&mut leader, &session, self.stop_error()).await;
+        }
+        // 建连和多地址鉴权期间也维持项目心跳；失效或 shutdown 时取消建连并清理已知场次。
+        let connected = tokio::select! {
+            biased;
+            _ = session.stop.cancelled() => None,
+            result = self.platform.connect(&started) => Some(result),
+        };
+        let socket = match connected {
+            Some(Ok(socket)) => socket,
+            Some(Err(error)) => {
+                session.begin_close();
                 let end = self.platform.end(started.game_id()).await;
                 leader.game_id = None;
                 leader.committed = true;
@@ -454,11 +476,12 @@ impl State {
                 session.fail(error.clone());
                 return Err(error);
             }
+            None => return abort(&mut leader, &session, self.stop_error()).await,
         };
 
         if self.stopping(&session) {
             close_socket(socket, started.game_id(), started.anchor().room_id).await;
-            return abort(&mut leader, &session, SessionError::ShuttingDown).await;
+            return abort(&mut leader, &session, self.stop_error()).await;
         }
 
         let (events, _) = broadcast::channel(self.event_capacity);
@@ -469,7 +492,7 @@ impl State {
         );
         let Some(subscription) = session.try_subscribe() else {
             close_socket(socket, started.game_id(), started.anchor().room_id).await;
-            return abort(&mut leader, &session, SessionError::ShuttingDown).await;
+            return abort(&mut leader, &session, self.stop_error()).await;
         };
 
         leader.committed = true;
@@ -510,6 +533,14 @@ impl State {
         self.shutdown.load(Ordering::SeqCst) || session.is_closing()
     }
 
+    fn stop_error(&self) -> SessionError {
+        if self.shutdown.load(Ordering::SeqCst) {
+            SessionError::ShuttingDown
+        } else {
+            SessionError::Closed
+        }
+    }
+
     async fn shutdown(&self) {
         let sessions = {
             let tables = lock(&self.tables);
@@ -530,6 +561,9 @@ impl State {
 
     fn unlink(&self, session: &Arc<Session>) {
         let mut tables = lock(&self.tables);
+        tables
+            .sessions
+            .retain(|current| !Arc::ptr_eq(current, session));
         if let Some(room_id) = session.room_id()
             && tables
                 .by_room
@@ -550,7 +584,11 @@ impl State {
         }
     }
 
-    fn register_beat(self: &Arc<Self>, game_id: &str, session: &Arc<Session>) {
+    fn register_beat(self: &Arc<Self>, game_id: &str, session: &Arc<Session>) -> bool {
+        let subscribers = lock(&session.subscribers);
+        if subscribers.closing || self.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
         lock(&self.beats).insert(
             game_id.to_owned(),
             BeatSlot {
@@ -558,7 +596,10 @@ impl State {
                 transport_failures: 0,
             },
         );
+        // 与 begin_close 的关闭标记串行，避免它移除心跳后又重新登记。
+        drop(subscribers);
         self.ensure_heartbeat();
+        true
     }
 
     fn unregister_beat(&self, game_id: &str) {
@@ -663,6 +704,7 @@ async fn abort(
     session: &Arc<Session>,
     error: SessionError,
 ) -> Result<Subscription, SessionError> {
+    session.begin_close();
     if let Some(game_id) = leader.game_id.clone() {
         if let Err(error) = leader.platform.end(&game_id).await {
             tracing::warn!(%game_id, %error, "接入中止后关闭场次失败");
@@ -739,7 +781,6 @@ fn spawn_upstream(
     game_id: String,
     room_id: i64,
 ) {
-    state.register_beat(&game_id, &session);
     let span = tracing::info_span!("session", room_id, %game_id);
     tokio::spawn(
         async move {
@@ -814,6 +855,7 @@ struct Session {
     idle: watch::Sender<Option<Instant>>,
     codes: Mutex<Vec<String>>,
     room_id: Mutex<Option<i64>>,
+    game_id: Mutex<Option<String>>,
     finished: AtomicBool,
     done: Notify,
 }
@@ -856,6 +898,7 @@ impl Session {
             idle,
             codes: Mutex::new(Vec::new()),
             room_id: Mutex::new(None),
+            game_id: Mutex::new(None),
             finished: AtomicBool::new(false),
             done: Notify::new(),
         })
@@ -878,6 +921,10 @@ impl Session {
 
     fn room_id(&self) -> Option<i64> {
         *lock(&self.room_id)
+    }
+
+    fn set_game_id(&self, game_id: String) {
+        *lock(&self.game_id) = Some(game_id);
     }
 
     fn is_closing(&self) -> bool {
@@ -998,10 +1045,7 @@ impl Session {
     }
 
     fn game_id(&self) -> Option<String> {
-        match &*self.phase.borrow() {
-            Phase::Ready { game_id, .. } => Some(game_id.clone()),
-            _ => None,
-        }
+        lock(&self.game_id).clone()
     }
 
     fn fail(self: &Arc<Self>, error: SessionError) {
@@ -1013,7 +1057,10 @@ impl Session {
         self.mark_finished();
     }
 
-    fn redirect(&self, target: &Arc<Session>) {
+    fn redirect(self: &Arc<Self>, target: &Arc<Session>) {
+        if let Some(state) = self.state.upgrade() {
+            state.unlink(self);
+        }
         self.phase
             .send_replace(Phase::Attach(Arc::downgrade(target)));
         self.mark_finished();
@@ -1232,14 +1279,7 @@ async fn dispatch_chunk(state: &State, chunk: &[PendingBeat]) {
 }
 
 fn snapshot(tables: &Tables) -> Vec<Arc<Session>> {
-    let mut seen = HashSet::<*const Session>::new();
-    let mut sessions = Vec::new();
-    for session in tables.by_code.values().chain(tables.by_room.values()) {
-        if seen.insert(Arc::as_ptr(session)) {
-            sessions.push(Arc::clone(session));
-        }
-    }
-    sessions
+    tables.sessions.clone()
 }
 
 fn remove_session(tables: &mut Tables, code: &str, session: &Arc<Session>) {

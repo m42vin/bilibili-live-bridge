@@ -360,10 +360,10 @@ async fn forward_reports_lagged_then_continues_with_retained_events() {
     }
     let (mut sink, mut messages) = recording_sink();
     let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
-    let (_pong_tx, pong) = watch::channel(Vec::new());
+    let pongs = Pongs::new();
     let (shutdown, mut signal) = watch::channel(false);
     let task = tokio::spawn(async move {
-        forward(&mut sink, &mut subscription, &mut peer, pong, &mut signal).await
+        forward(&mut sink, &mut subscription, &mut peer, &pongs, &mut signal).await
     });
     let lagged = recorded_json(&mut messages).await;
     assert_eq!(lagged, json!({"type":"lagged", "skipped":44}));
@@ -429,24 +429,37 @@ async fn sends_timeout_without_retrying_a_cancelled_sink() {
 }
 
 #[tokio::test]
-async fn matching_pong_keeps_connection_and_missing_pong_ends_it() {
+async fn matching_pong_survives_unsolicited_pong_and_missing_next_pong_ends_it() {
     let fixture = Fixture::new().await;
     let mut subscription = fixture.manager.attach(CODE).await.unwrap();
     let (mut sink, mut messages) = recording_sink();
     let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
-    let (pong_tx, pong) = watch::channel(Vec::new());
+    let pongs = Arc::new(Pongs::new());
+    let task_pongs = Arc::clone(&pongs);
     let (_stop_tx, mut stop) = watch::channel(false);
     tokio::time::pause();
     let task = tokio::spawn(async move {
-        forward(&mut sink, &mut subscription, &mut peer, pong, &mut stop).await
+        forward(
+            &mut sink,
+            &mut subscription,
+            &mut peer,
+            &task_pongs,
+            &mut stop,
+        )
+        .await
     });
     let first_ping = messages.recv().await.unwrap();
     let Message::Ping(payload) = first_ping else {
         panic!("expected ping");
     };
-    pong_tx.send_replace(payload.to_vec());
+    // 读端可能连续读完这些帧，写端只得到一次调度机会。
+    pongs.acknowledge(b"unsolicited");
+    pongs.acknowledge(&payload);
+    pongs.acknowledge(b"unsolicited");
     let next_ping = messages.recv().await.unwrap();
     assert!(matches!(next_ping, Message::Ping(_)));
+    // 上一轮的 Pong 也不能解除新一轮的超时。
+    pongs.acknowledge(&payload);
     assert_eq!(task.await.unwrap(), Exit::Failed);
     tokio::time::resume();
     fixture.stop().await;
