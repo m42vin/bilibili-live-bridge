@@ -105,6 +105,34 @@ cargo run --locked --bin server
 最后一个客户端离开后保留上游 30 秒，期间重连复用原场次，事件不补发。
 Ctrl-C 或 Unix SIGTERM 会停止接入并等待清理。完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
+### 下游客户端示例
+
+先在一个终端配置平台凭据并启动 `server`，再在另一个终端运行：
+
+```sh
+export AUTH_CODE='主播身份码'
+cargo run --locked --bin downstream_client
+```
+
+客户端只需要身份码，无需平台 Access Key 或 `BILIBILI_APP_ID`，也不会自动读取 `.env`。
+可通过 `BRIDGE_URL` 修改地址，默认是 `ws://127.0.0.1:8080/ws`；例如：
+
+```sh
+BRIDGE_URL='ws://127.0.0.1:8080/ws' RUST_LOG=info,downstream_client=debug cargo run --locked --bin downstream_client
+```
+
+[`downstream_client`](src/bin/downstream_client.rs) 演示订阅、`ready`、事件接收、
+上游 `reconnecting` / `connected` 状态和 `lagged` 处理，事件正文在 debug 日志中输出。
+上游恢复时保持下游连接等待；下游网络失败、关闭帧或 90 秒无入站活动时，
+按 2、4、8、10 秒退避重新连接并订阅，后续等待封顶 10 秒。
+订阅保持 60 秒后，下次故障从 2 秒重新退避。重连空窗和缓冲丢失的事件不会补发。
+
+收到业务消息 `closed` 时正常退出，收到 `error`、无效协议消息或 HTTP 4xx 握手拒绝
+（429 除外）时报错退出；服务正常退出会发送 `closed`，因此示例不会自动等待它重启。
+遇到身份码或接入错误，请检查配置和服务端日志后重新运行，避免自动重试反复开启场次。
+Ctrl-C 可中断建连、等待事件或重连退避，并尝试关闭当前连接。
+握手和单次发送最多等待 10 秒，关闭清理最多等待 2 秒。
+
 ### 日志
 
 所有二进制入口先调用 `logging::init()`，日志输出到 stderr，包含时间、级别、模块以及 span 上下文。默认使用 `info`，记录场次开启和关闭、会话接入与结束；连接候选地址失败、心跳异常和清理失败使用 `warn`，导致示例程序退出的错误使用 `error`。重定向到文件时自动关闭 ANSI 颜色：
@@ -126,7 +154,8 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 
 ### 示例程序
 
-以下程序需要先设置上述环境变量，并会实际调用开放平台开启、维持和关闭场次：
+以下上游示例需要先设置上述环境变量，并会实际调用开放平台开启、维持和关闭场次。
+下游示例 `downstream_client` 的用法见上文：
 
 | 命令 | 用途 |
 | --- | --- |

@@ -5,6 +5,10 @@
 仅 `/ws` 接受 WebSocket 升级；其他路径返回 HTTP 404。当前没有独立的服务访问 token，
 默认使用回环监听，本机客户端以主播身份码发起订阅。
 
+可运行的 Rust 客户端示例见 [downstream_client.rs](../src/bin/downstream_client.rs)，
+运行方法见 [README](../README.md#下游客户端示例)。它处理事件、上游状态、缓冲溢出和
+下游断线重连；业务 `closed` 和 `error` 会结束程序，重新连接不会补发历史事件。
+
 ## 接入
 
 握手后 10 秒内发送一条 JSON 文本消息：

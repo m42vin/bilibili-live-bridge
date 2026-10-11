@@ -23,6 +23,8 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 
 `cargo run --locked --bin server` 启动下游 WebSocket 服务，联调方式见 [客户端协议](downstream-protocol.md)；
 手动验证上游也可以使用 README 中的三个示例程序。
+下游客户端使用 `cargo run --locked --bin downstream_client`，只需设置 `AUTH_CODE`，
+可选 `BRIDGE_URL`；客户端行为测试使用本地 WebSocket 桩，无需真实平台。
 
 ## 从哪里开始修改
 
@@ -38,6 +40,7 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 | 会话复用、订阅与清理 | [manager.rs](../src/session/manager.rs)、[platform.rs](../src/session/platform.rs) | [manager_test.rs](../src/session/manager_test.rs) |
 | 项目心跳分类、预算与退避 | [heartbeat.rs](../src/session/heartbeat.rs) | [heartbeat_test.rs](../src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../src/session/heartbeat_recovery_test.rs) |
 | 下游 WebSocket 与协议 | [downstream.rs](../src/downstream.rs)、[protocol.rs](../src/downstream/protocol.rs) | [downstream_test.rs](../src/downstream/downstream_test.rs) |
+| 下游客户端示例与重连 | [downstream_client.rs](../src/bin/downstream_client.rs) | [client_test.rs](../src/downstream/client_test.rs) |
 | 示例程序 | [src/bin](../src/bin/) | 构建检查；需要真实平台时手动运行 |
 
 ## 测试组织与调试
