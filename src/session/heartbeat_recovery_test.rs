@@ -249,7 +249,13 @@ async fn one_batch_backoff_does_not_block_other_normal_batches() {
     let mock = Mock::new();
     setup(&mock, 201);
     mock.push_heartbeat(Err(platform_error(5001)));
-    let manager = manager(&mock, Duration::from_secs(20));
+    let mut manager = manager(&mock, Duration::from_secs(20));
+    // 批量心跳跨 200 场测试显式扩大日志流数量；生产默认限制为 128。
+    Arc::get_mut(&mut manager.state).unwrap().log =
+        crate::session::delivery::EventLog::new(crate::session::DeliveryPolicy {
+            max_streams: 256,
+            ..crate::session::DeliveryPolicy::default()
+        });
     let _subscriptions = attach_rooms(&manager, 201).await;
     advance_to(origin + Duration::from_secs(20)).await;
     mock.wait_batches(2).await;

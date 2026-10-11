@@ -11,10 +11,18 @@
 //!
 //! 身份码只用来开启或加入会话，不会出现在调试输出里。
 
+mod delivery;
 mod error;
 mod manager;
 mod platform;
 
+#[cfg(test)]
+pub(crate) use delivery::EventLog;
+
+pub use delivery::{
+    DeliveryError, DeliveryPolicy, DeliverySubscription, EventCursor, RecordedEvent,
+    ResumeUnavailable,
+};
 pub use error::SessionError;
 pub use manager::{
     HeartbeatPolicy, Manager, ManagerOptions, ReconnectPolicy, RecvError, Subscription,

@@ -16,18 +16,17 @@ async fn fixture() -> (TcpListener, Settings) {
     (listener, settings)
 }
 
-async fn subscriber(listener: &TcpListener) -> Peer {
+async fn subscriber(listener: &TcpListener, after: Option<u64>) -> Peer {
     let (stream, _) = listener.accept().await.unwrap();
     let mut peer = accept_async(stream).await.unwrap();
     let Some(Ok(Message::Text(text))) = peer.next().await else {
         panic!("客户端应发送订阅文本");
     };
-    assert_eq!(
-        serde_json::from_str::<Value>(&text).unwrap(),
-        json!({
-            "type": "subscribe", "code": "example-code"
-        })
-    );
+    let mut expected = json!({"type":"subscribe","code":"example-code","ack":true,"ack_window":64});
+    if let Some(seq) = after {
+        expected["resume_after"] = json!({"stream_id":"stream-1","seq":seq});
+    }
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), expected);
     peer
 }
 
@@ -35,8 +34,8 @@ async fn send(peer: &mut Peer, value: Value) {
     peer.send(Message::text(value.to_string())).await.unwrap();
 }
 
-fn ready() -> Value {
-    json!({"type":"ready", "room_id":123, "game_id":"game-1"})
+fn ready(seq: u64, resumed: bool) -> Value {
+    json!({"type":"ready", "room_id":123, "game_id":"game-1", "stream_id":"stream-1", "seq":seq,"resumed":resumed,"ack_window":64})
 }
 
 #[tokio::test]
@@ -44,16 +43,18 @@ async fn receives_status_events_and_pong_then_resubscribes_after_disconnect() {
     let (listener, settings) = fixture().await;
     let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
     timeout(Duration::from_secs(8), async {
-        let mut peer = subscriber(&listener).await;
-        send(&mut peer, ready()).await;
+        let mut peer = subscriber(&listener,None).await;
+        send(&mut peer, ready(0,false)).await;
         send(&mut peer, json!({"type":"status", "state":"reconnecting"})).await;
         send(&mut peer, json!({"type":"status", "state":"connected"})).await;
         send(
             &mut peer,
-            json!({"type":"event", "room_id":123, "cmd":"FUTURE_EVENT", "data":{"value":1}}),
+            json!({"type":"event", "room_id":123, "stream_id":"stream-1", "seq":1, "cmd":"FUTURE_EVENT", "data":{"value":1}}),
         )
         .await;
-        send(&mut peer, json!({"type":"lagged", "skipped":4})).await;
+        let ack = peer.next().await.unwrap().unwrap();
+        let Message::Text(ack) = ack else { panic!("应确认处理完成的事件"); };
+        assert_eq!(serde_json::from_str::<Value>(&ack).unwrap(),json!({"type":"ack","stream_id":"stream-1","seq":1}));
         send(&mut peer, json!({"type":"future_message", "extra":true})).await;
         peer.send(Message::Ping(vec![1, 2, 3].into()))
             .await
@@ -64,8 +65,8 @@ async fn receives_status_events_and_pong_then_resubscribes_after_disconnect() {
         );
         // 不发送 closed，模拟传输层意外断开。
         drop(peer);
-        let mut peer = subscriber(&listener).await;
-        send(&mut peer, ready()).await;
+        let mut peer = subscriber(&listener,Some(1)).await;
+        send(&mut peer, ready(1,true)).await;
         send(&mut peer, json!({"type":"closed"})).await;
         assert_eq!(client.await.unwrap(), Ok(()));
         // closed 后任务已经返回，没有再次重连。
@@ -79,7 +80,7 @@ async fn server_error_stops_instead_of_retrying_invalid_code() {
     let (listener, settings) = fixture().await;
     let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
     timeout(Duration::from_secs(4), async {
-        let mut peer = subscriber(&listener).await;
+        let mut peer = subscriber(&listener, None).await;
         send(
             &mut peer,
             json!({"type":"error", "code":"attach_failed", "message":"private details"}),
@@ -103,8 +104,8 @@ async fn interrupt_closes_an_active_subscription() {
         .await
     });
     timeout(Duration::from_secs(4), async {
-        let mut peer = subscriber(&listener).await;
-        send(&mut peer, ready()).await;
+        let mut peer = subscriber(&listener, None).await;
+        send(&mut peer, ready(0, false)).await;
         stop.send(()).unwrap();
         assert!(matches!(
             peer.next().await.unwrap().unwrap(),
@@ -134,20 +135,39 @@ async fn interrupt_is_observed_while_bridge_is_unavailable() {
     assert_eq!(result, Ok(()));
 }
 
-#[test]
-fn event_before_ready_and_malformed_messages_are_rejected() {
-    let mut ready_at = None;
-    let event = ServerMessage::Event {
-        room_id: 123,
-        cmd: "DM".into(),
-        data: Value::Null,
-    };
-    assert!(
-        handle_message(event, &mut ready_at)
-            .unwrap_err()
-            .contains("ready")
-    );
-    assert!(serde_json::from_str::<ServerMessage>(r#"{"type":"ready","room_id":"bad"}"#).is_err());
-    let unknown = serde_json::from_str::<ServerMessage>(r#"{"type":"future","extra":1}"#).unwrap();
-    assert!(!handle_message(unknown, &mut ready_at).unwrap());
+#[tokio::test]
+async fn event_before_ready_and_resume_failure_stop_the_client() {
+    for message in [
+        json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"DM","data":null}),
+        json!({"type":"resume_unavailable","reason":"cursor_expired","earliest_after":10,"latest_seq":20}),
+    ] {
+        let (listener, settings) = fixture().await;
+        let client =
+            tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+        timeout(Duration::from_secs(4), async {
+            let mut peer = subscriber(&listener, None).await;
+            send(&mut peer, message).await;
+            assert!(client.await.unwrap().is_err());
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn duplicate_processed_event_is_acknowledged_and_sequence_gap_is_rejected() {
+    let (listener, settings) = fixture().await;
+    let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+    timeout(Duration::from_secs(4),async {
+        let mut peer = subscriber(&listener,None).await;
+        send(&mut peer,ready(0,false)).await;
+        let event = json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"DM","data":null});
+        for _ in 0..2 {
+            send(&mut peer,event.clone()).await;
+            let Message::Text(text) = peer.next().await.unwrap().unwrap() else {panic!("应发送 ACK");};
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["seq"],1);
+        }
+        send(&mut peer,json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":3,"cmd":"DM","data":null})).await;
+        assert!(client.await.unwrap().unwrap_err().contains("不连续"));
+    }).await.unwrap();
 }

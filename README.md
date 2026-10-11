@@ -14,6 +14,7 @@
 - **心跳有限恢复**：暂时性业务、传输和解码错误按成功时间限定恢复预算并退避重试；访问受限时降低频率，明确的鉴权、权限和参数错误立即关闭对应批次。
 - **上游健康与恢复**：运行期间发送最多等待 5 秒，60 秒没有有效事件或官方心跳回复时判失活；默认在 120 秒内恢复原场次，保留订阅及项目心跳，并通知下游状态。
 - **会话清理**：最后一个订阅者离开、互动结束、上游恢复终止或项目心跳达到关闭条件时，尝试关闭官方场次；支持等待全部会话关闭。
+- **内存续传与 ACK**：可选确认模式使用共享有界事件日志、流标识和桥侧序号，支持慢消费追赶、断线补发和结束流尾部回放；超出保留范围明确报错。
 - **下游 WebSocket**：每条 `/ws` 连接订阅一个房间，按序推送 JSON 事件；报告缓冲溢出，支持 Ping/Pong、读写限制和优雅退出。服务在最后一个客户端离开后保留上游 30 秒供重连。
 - **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
 
@@ -63,6 +64,10 @@ cargo run --locked --bin multi_client
 | `BILIBILI_ACCESS_KEY_SECRET` | 是 | 无 | 开放平台 Access Key Secret |
 | `BILIBILI_APP_ID` | 是 | 无 | 项目 ID，必须是大于 0 的 `i64` 整数 |
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
+| `BRIDGE_EVENT_RETENTION_SECS` | 否 | `300` | 内存事件与结束流保留时间，正整数秒 |
+| `BRIDGE_EVENT_LOG_MAX_BYTES` | 否 | `33554432` | 全部流共享的事件日志字节预算，正整数；不代表进程 RSS 上限 |
+| `BRIDGE_EVENT_LOG_MAX_STREAMS` | 否 | `128` | 活动与结束流数量上限，正整数 |
+| `BRIDGE_ACK_WINDOW` | 否 | `64` | 每条确认模式连接最多未确认事件数，正整数 |
 | `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` | 否 | `20` | 官方 WebSocket 心跳间隔，整数秒，范围 `1..=29` |
 | `BRIDGE_WEBSOCKET_WRITE_TIMEOUT_SECS` | 否 | `5` | 上游单次发送期限，包含准备和 flush |
 | `BRIDGE_WEBSOCKET_ACTIVITY_TIMEOUT_SECS` | 否 | `60` | 最后有效事件或官方心跳回复后的存活期限；必须大于长连接心跳间隔加发送期限 |
@@ -102,7 +107,7 @@ cargo run --locked --bin server
 ```
 
 接入成功后先收到 `ready`，再收到带 `cmd` 和 `data` 的 `event`。多条同码连接共享一场上游互动；
-最后一个客户端离开后保留上游 30 秒，期间重连复用原场次，事件不补发。
+最后一个客户端离开后保留上游 30 秒，期间重连复用原场次；上述原实时模式不补发，确认模式可按游标续传。
 Ctrl-C 或 Unix SIGTERM 会停止接入并等待清理。完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
 ### 下游客户端示例
@@ -121,17 +126,20 @@ cargo run --locked --bin downstream_client
 BRIDGE_URL='ws://127.0.0.1:8080/ws' RUST_LOG=info,downstream_client=debug cargo run --locked --bin downstream_client
 ```
 
-[`downstream_client`](src/bin/downstream_client.rs) 演示订阅、`ready`、事件接收、
-上游 `reconnecting` / `connected` 状态和 `lagged` 处理，事件正文在 debug 日志中输出。
-上游恢复时保持下游连接等待；下游网络失败、关闭帧或 90 秒无入站活动时，
-按 2、4、8、10 秒退避重新连接并订阅，后续等待封顶 10 秒。
-订阅保持 60 秒后，下次故障从 2 秒重新退避。重连空窗和缓冲丢失的事件不会补发。
+[`downstream_client`](src/bin/downstream_client.rs) 默认以 `ack:true` 订阅，处理 ready、事件、
+上游 reconnecting / connected 状态和 resume_unavailable。网络接收和业务处理分开，
+处理成功后更新进程内游标并发送累计 ACK，正文在 debug 日志中输出。
 
-收到业务消息 `closed` 时正常退出，收到 `error`、无效协议消息或 HTTP 4xx 握手拒绝
-（429 除外）时报错退出；服务正常退出会发送 `closed`，因此示例不会自动等待它重启。
-遇到身份码或接入错误，请检查配置和服务端日志后重新运行，避免自动重试反复开启场次。
-Ctrl-C 可中断建连、等待事件或重连退避，并尝试关闭当前连接。
-握手和单次发送最多等待 10 秒，关闭清理最多等待 2 秒。
+下游网络失败、关闭帧或 90 秒无入站活动时，按 2、4、8、10 秒退避重连，
+带回最后连续处理完成的 `resume_after`；订阅保持 60 秒后，下次故障从 2 秒重新退避。
+保留范围内补发桥已记录的事件，重复事件按流标识与序号去重，序号出现缺口时报错退出。
+上游恢复时保持下游连接等待；上游没有到达桥的事件无法补发。
+
+收到 closed 正常退出；接入错误、续传不可用、无效消息或 HTTP 4xx 握手拒绝
+（429 除外）时报错退出，不自动放弃游标重新开启场次。桥重启或日志过期后无法续传。
+示例只在进程内保留游标，需要跨客户端重启恢复时应将业务结果和游标一起持久化。
+Ctrl-C 可中断建连、事件等待和退避，关闭清理最多等待 2 秒。
+握手和单次发送最多等待 10 秒。完整 ACK、范围和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
 ### 日志
 
@@ -179,6 +187,9 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 `from_config` 和 `server` 使用环境配置。通过
 `Manager::with_policies(api, websocket_heartbeat, app_heartbeat, options, heartbeat_policy, upstream_policy)`
 定制两套策略，`UpstreamPolicy::reconnect = None` 禁用上游重连。
+库的 `Manager::attach_delivery(code, resume_after)` 返回日志订阅，配合 `DeliveryPolicy` 和
+`Manager::with_policies_and_delivery` 可定制内存保留范围；ACK 流量控制由下游服务实现。
+`Subscription::recv()` 仍保持原实时广播语义。
 `subscription.watch_status()` 返回 `UpstreamStatus` 的 watch 接收器，与直播事件独立，慢接收者可合并中间状态。
 
 订阅落后时，`recv()` 返回 `RecvError::Lagged { skipped }`；再次读取会从保留的事件继续，不会阻塞其他订阅者。会话结束且缓冲读完后返回 `RecvError::Closed`。

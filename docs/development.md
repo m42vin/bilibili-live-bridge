@@ -40,6 +40,7 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 | 会话复用、订阅与清理 | [manager.rs](../src/session/manager.rs)、[platform.rs](../src/session/platform.rs) | [manager_test.rs](../src/session/manager_test.rs) |
 | 项目心跳分类、预算与退避 | [heartbeat.rs](../src/session/heartbeat.rs) | [heartbeat_test.rs](../src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../src/session/heartbeat_recovery_test.rs) |
 | 下游 WebSocket 与协议 | [downstream.rs](../src/downstream.rs)、[protocol.rs](../src/downstream/protocol.rs) | [downstream_test.rs](../src/downstream/downstream_test.rs) |
+| 内存事件日志与游标 | [delivery.rs](../src/session/delivery.rs) | [delivery_test.rs](../src/session/delivery_test.rs) |
 | 下游客户端示例与重连 | [downstream_client.rs](../src/bin/downstream_client.rs) | [client_test.rs](../src/downstream/client_test.rs) |
 | 示例程序 | [src/bin](../src/bin/) | 构建检查；需要真实平台时手动运行 |
 
@@ -63,9 +64,14 @@ cargo test --locked --doc
 - HTTP 桩接收真实请求，检查路径、请求体和签名，再返回预设响应。
 - WebSocket 桩完成本地握手，检查鉴权包、心跳、Ping/Pong、同帧事件和候选地址切换。
 - 会话测试的 `Mock` 实现私有 `Platform` / `LiveSocket`，控制开启、连接、推送、心跳失败和结束时序。
-- 下游测试同时启动本地 HTTP、官方 WebSocket 和下游监听器，验证真实握手、事件分发、协议错误和任务清理。
+- 下游测试同时启动本地 HTTP、官方 WebSocket 和下游监听器，验证真实握手、事件分发、协议错误和任务清理，以及 ACK 窗口、续传、缺口和结束流回放。
+- 日志测试使用暂停时钟验证保留时间、全局容量、超大事件缺口、流淘汰和身份码归属；客户端桩验证处理后 ACK、重连游标、重复事件和缺口退出。
 
 会话并发测试优先通过桩的通知或控制入口构造时序，再使用超时限制测试等待；避免用固定 sleep 猜测任务是否完成。项目心跳策略可以用测试专用的 `beat_once` 推进，不必等待真实周期。
+
+下游 `delivery_interleaving` 回归测试使用仅测试编译的 ACK 快照钩子，固定推进确认和淘汰的交错，
+验证旧快照不误报缺口、结束流全部确认后正常关闭，以及持续全局通知不饿死事件读取。
+测试同时断言交错实际发生和输出事件序号，避免只检查未报错而漏掉交付失败。
 
 配置测试通过 `from_reader` 注入变量，不修改进程的全局环境。日志测试使用 `logging_test::capture` 创建局部 dispatcher；异步测试需要把 dispatcher 绑定到被轮询的 future，避免跨 `await` 持有线程局部日志守卫。不要在并行测试中反复调用全局 `logging::init`。
 

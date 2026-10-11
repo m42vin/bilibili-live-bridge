@@ -129,6 +129,10 @@ pub(super) async fn run(
                 }
                 let ends = event.ends_push();
                 tracing::debug!(cmd = event.cmd(), "转发直播间事件");
+                if state.log.append(&session.stream_id, &event).is_err() {
+                    tracing::error!("无法记录事件，结束流以避免静默漏发");
+                    break;
+                }
                 let _ = events.send(Arc::new(event));
                 if ends {
                     tracing::info!("平台已停止互动推送，关闭会话");
@@ -200,6 +204,7 @@ pub(super) async fn run(
     if let Err(error) = state.platform.end(started.game_id()).await {
         tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), %error, "关闭官方场次失败");
     }
+    state.log.finish(&session.stream_id);
     state.unlink(&session);
     session.phase.send_replace(super::Phase::Closed);
     drop(events);

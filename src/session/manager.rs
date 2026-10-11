@@ -11,6 +11,7 @@ use tokio::time::{Instant, sleep_until};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
+use super::delivery::{DeliveryError, DeliveryPolicy, DeliverySubscription, EventCursor, EventLog};
 use super::error::SessionError;
 use super::platform::{LivePlatform, LiveSocket, Platform};
 use crate::config::Config;
@@ -193,6 +194,80 @@ impl Manager {
         ))
     }
 
+    /// 使用显式日志与 ACK 策略创建管理器；日志在全部会话间共享容量。
+    ///
+    /// # Errors
+    /// 心跳、恢复、闲置或日志策略无效时返回参数错误。
+    pub fn with_policies_and_delivery(
+        api: api::Client,
+        websocket_heartbeat: Duration,
+        app_heartbeat: Duration,
+        options: ManagerOptions,
+        heartbeat_policy: HeartbeatPolicy,
+        upstream_policy: UpstreamPolicy,
+        delivery_policy: DeliveryPolicy,
+    ) -> Result<Self, SessionError> {
+        delivery_policy.validate().map_err(SessionError::invalid)?;
+        let mut manager = Self::with_policies(
+            api,
+            websocket_heartbeat,
+            app_heartbeat,
+            options,
+            heartbeat_policy,
+            upstream_policy,
+        )?;
+        Arc::get_mut(&mut manager.state)
+            .expect("新管理器独占状态")
+            .log = EventLog::new(delivery_policy);
+        Ok(manager)
+    }
+
+    /// 开启 ACK 模式订阅，或按身份码与游标读取已有流（不会重新 start）。
+    ///
+    /// 首次接入从加入位置开始；续传要求身份码曾关联该流，且游标仍有效。
+    /// 结束流保留期限内可补完尾部；进程重启后游标失效。
+    ///
+    /// # Errors
+    /// 开启失败返回 Attach；日志、归属或位置不可用返回 Resume。
+    pub async fn attach_delivery(
+        &self,
+        code: &str,
+        after: Option<&EventCursor>,
+    ) -> Result<DeliverySubscription, DeliveryError> {
+        let code = normalize_code(code).map_err(DeliveryError::Attach)?;
+        if self.is_shutting_down() {
+            return Err(DeliveryError::Attach(SessionError::ShuttingDown));
+        }
+        if let Some(cursor) = after {
+            let session = lock(&self.state.tables).by_code.get(code).cloned();
+            let guard = session
+                .filter(|s| s.stream_id == cursor.stream_id)
+                .and_then(|s| s.try_subscribe())
+                .map(|mut subscription| {
+                    subscription.events = broadcast::channel(1).1;
+                    subscription
+                });
+            if guard.is_some() {
+                self.state.log.add_code(&cursor.stream_id, code);
+            }
+            self.state
+                .log
+                .reader(&cursor.stream_id, code, Some(cursor.seq), guard)
+                .map_err(DeliveryError::Resume)
+        } else {
+            let mut subscription = self.attach(code).await.map_err(DeliveryError::Attach)?;
+            // ACK 订阅只需生命周期计数，不保留未使用的旧广播接收端。
+            subscription.events = broadcast::channel(1).1;
+            let id = subscription.session.stream_id.clone();
+            let base = subscription.delivery_base;
+            self.state.log.add_code(&id, code);
+            self.state
+                .log
+                .reader(&id, code, Some(base), Some(subscription))
+                .map_err(DeliveryError::Resume)
+        }
+    }
+
     /// 用进程配置创建会话管理器。
     ///
     /// # Errors
@@ -202,13 +277,14 @@ impl Manager {
     pub fn from_config(config: &Config) -> Result<Self, SessionError> {
         let api = api::Client::from_config(config)
             .map_err(|error| SessionError::invalid(error.to_string()))?;
-        Self::with_policies(
+        Self::with_policies_and_delivery(
             api,
             config.websocket_heartbeat(),
             config.app_heartbeat(),
             ManagerOptions::default(),
             config.heartbeat_policy(),
             config.upstream_policy(),
+            config.delivery_policy(),
         )
     }
 
@@ -277,6 +353,7 @@ impl Manager {
         Self {
             state: Arc::new(State {
                 platform,
+                log: EventLog::new(DeliveryPolicy::default()),
                 app_heartbeat,
                 event_capacity,
                 options,
@@ -347,6 +424,7 @@ pub struct Subscription {
     game_id: String,
     anchor: Anchor,
     events: broadcast::Receiver<Arc<LiveEvent>>,
+    delivery_base: u64,
     session: Arc<Session>,
     active: bool,
 }
@@ -442,6 +520,7 @@ impl std::error::Error for RecvError {}
 
 /// 同一个管理器及其克隆共享的索引、心跳登记和关闭信号。
 struct State {
+    log: Arc<EventLog>,
     platform: Arc<dyn Platform>,
     app_heartbeat: Duration,
     event_capacity: usize,
@@ -608,6 +687,18 @@ impl State {
             return abort(&mut leader, &session, self.stop_error()).await;
         }
 
+        let codes = lock(&session.codes).clone();
+        if let Err(message) = self.log.register(
+            &session.stream_id,
+            started.anchor().room_id,
+            started.game_id(),
+            codes,
+            session.upstream.subscribe(),
+        ) {
+            close_socket(socket, started.game_id(), started.anchor().room_id).await;
+            return abort(&mut leader, &session, SessionError::invalid(message)).await;
+        }
+
         let (events, _) = broadcast::channel(self.event_capacity);
         session.publish_ready(
             started.anchor().clone(),
@@ -644,6 +735,7 @@ impl State {
                 .by_code
                 .insert(code.to_owned(), Arc::clone(&existing));
             existing.add_code(code.to_owned());
+            self.log.add_code(&existing.stream_id, code);
             session.remove_code(code);
             return RoomDecision::Join(existing);
         }
@@ -930,6 +1022,7 @@ fn spawn_upstream(
 
 /// 被身份码和房间索引共享的会话。弱引用管理器，避免形成状态与会话的引用环。
 struct Session {
+    stream_id: String,
     state: Weak<State>,
     phase: watch::Sender<Phase>,
     upstream: watch::Sender<UpstreamStatus>,
@@ -972,6 +1065,7 @@ impl Session {
         Arc::new(Self {
             state,
             phase,
+            stream_id: uuid::Uuid::new_v4().to_string(),
             upstream: watch::channel(UpstreamStatus::Connected).0,
             stop: Stop::new(),
             subscribers: Mutex::new(Subscribers {
@@ -1068,7 +1162,12 @@ impl Session {
             subscribers.idle_deadline = None;
             self.idle.send_replace(None);
         }
+        let delivery_base = self
+            .state
+            .upgrade()
+            .map_or(0, |state| state.log.tail(&self.stream_id));
         Some(Subscription {
+            delivery_base,
             room_id,
             game_id,
             anchor,
@@ -1136,6 +1235,7 @@ impl Session {
     fn fail(self: &Arc<Self>, error: SessionError) {
         self.begin_close();
         if let Some(state) = self.state.upgrade() {
+            state.log.finish(&self.stream_id);
             state.unlink(self);
         }
         self.phase.send_replace(Phase::Failed(error));
@@ -1238,7 +1338,7 @@ fn normalize_code(code: &str) -> Result<&str, SessionError> {
     Ok(code)
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 

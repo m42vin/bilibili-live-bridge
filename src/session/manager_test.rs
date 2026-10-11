@@ -1373,3 +1373,29 @@ async fn cancelled_connect_removes_heartbeats_and_cleans_the_known_game() {
     assert_eq!(mock.ends(), ["game-1"]);
     assert_eq!(mock.end_attempts(), 1);
 }
+
+#[tokio::test]
+async fn delivery_slow_reader_keeps_more_than_broadcast_capacity_and_fresh_join_starts_live() {
+    let mock = Mock::new();
+    mock.push_ok("game-1", 7);
+    mock.push_connect_ok();
+    let manager = grace_manager(&mock);
+    let mut slow = manager.attach_delivery(CODE, None).await.unwrap();
+    let socket = mock.connection(0);
+    for index in 1..=300 {
+        socket.emit(danmaku(&index.to_string()));
+    }
+    for seq in 1..=300 {
+        let event = slow.recv().await.unwrap().unwrap();
+        assert_eq!(event.seq, seq);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(event.data.get()).unwrap()["msg"],
+            seq.to_string()
+        );
+    }
+    let mut fresh = manager.attach_delivery(CODE, None).await.unwrap();
+    assert_eq!(fresh.base_seq, 300);
+    socket.emit(danmaku("301"));
+    assert_eq!(fresh.recv().await.unwrap().unwrap().seq, 301);
+    let _ = manager.shutdown().await;
+}

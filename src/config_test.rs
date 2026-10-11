@@ -291,3 +291,31 @@ fn rejects_non_unicode_environment_values() {
     ));
     assert!(!error.to_string().contains('\u{ff}'));
 }
+
+#[test]
+fn loads_delivery_policy_and_rejects_invalid_limits() {
+    let mut vars = required_vars();
+    vars.extend([
+        (ENV_EVENT_RETENTION_SECS, "60"),
+        (ENV_EVENT_LOG_MAX_BYTES, "4096"),
+        (ENV_EVENT_LOG_MAX_STREAMS, "4"),
+        (ENV_ACK_WINDOW, "8"),
+    ]);
+    let policy = load(&vars).unwrap().delivery_policy();
+    assert_eq!(policy.retention, Duration::from_secs(60));
+    assert_eq!(policy.max_bytes, 4096);
+    assert_eq!(policy.max_streams, 4);
+    assert_eq!(policy.ack_window, 8);
+    for key in [
+        ENV_EVENT_RETENTION_SECS,
+        ENV_EVENT_LOG_MAX_BYTES,
+        ENV_EVENT_LOG_MAX_STREAMS,
+        ENV_ACK_WINDOW,
+    ] {
+        for value in ["0", "-1", "bad"] {
+            let mut vars = required_vars();
+            vars.push((key, value));
+            assert!(matches!(load(&vars), Err(ConfigError::Invalid { .. })));
+        }
+    }
+}

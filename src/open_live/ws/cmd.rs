@@ -58,6 +58,23 @@ pub enum LiveEvent {
 }
 
 impl LiveEvent {
+    pub(crate) fn data_json(&self) -> serde_json::Result<Box<serde_json::value::RawValue>> {
+        use serde_json::value::to_raw_value;
+        match self {
+            Self::Danmaku(data) => to_raw_value(data),
+            Self::DanmakuMirror(data) => to_raw_value(data),
+            Self::Gift(data) => to_raw_value(data),
+            Self::SuperChat(data) => to_raw_value(data),
+            Self::SuperChatDelete(data) => to_raw_value(data),
+            Self::Guard(data) => to_raw_value(data),
+            Self::Like(data) => to_raw_value(data),
+            Self::RoomEnter(data) => to_raw_value(data),
+            Self::LiveStart(data) | Self::LiveEnd(data) => to_raw_value(data),
+            Self::InteractionEnd(data) => to_raw_value(data),
+            Self::Unknown { data, .. } => to_raw_value(data),
+        }
+    }
+
     /// 平台协议里的 `cmd` 字符串。
     #[must_use]
     pub fn cmd(&self) -> &str {

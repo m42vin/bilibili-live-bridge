@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::open_live::ws::HealthPolicy;
-use crate::session::{HeartbeatPolicy, ReconnectPolicy, UpstreamPolicy};
+use crate::session::{DeliveryPolicy, HeartbeatPolicy, ReconnectPolicy, UpstreamPolicy};
 
 /// 开放平台 Access Key Id。
 pub const ENV_ACCESS_KEY_ID: &str = "BILIBILI_ACCESS_KEY_ID";
@@ -43,6 +43,15 @@ pub const ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS: &str =
 /// 上游恢复退避上限，单位毫秒。
 pub const ENV_UPSTREAM_RECONNECT_RETRY_MAX_MS: &str = "BRIDGE_UPSTREAM_RECONNECT_RETRY_MAX_MS";
 
+/// 内存事件日志的保留时间，单位秒。
+pub const ENV_EVENT_RETENTION_SECS: &str = "BRIDGE_EVENT_RETENTION_SECS";
+/// 全部流共享的事件日志字节预算。
+pub const ENV_EVENT_LOG_MAX_BYTES: &str = "BRIDGE_EVENT_LOG_MAX_BYTES";
+/// 活动与结束流的数量上限。
+pub const ENV_EVENT_LOG_MAX_STREAMS: &str = "BRIDGE_EVENT_LOG_MAX_STREAMS";
+/// 每条下游连接未确认事件数上限。
+pub const ENV_ACK_WINDOW: &str = "BRIDGE_ACK_WINDOW";
+
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 /// 官方文档推荐的心跳间隔。长连接约 30 秒收不到心跳会断开，互动玩法约 60 秒没有项目心跳会关闭场次。
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(20);
@@ -62,6 +71,7 @@ pub struct Config {
     app_heartbeat: Duration,
     heartbeat_policy: HeartbeatPolicy,
     upstream_policy: UpstreamPolicy,
+    delivery_policy: DeliveryPolicy,
 }
 
 impl Config {
@@ -185,6 +195,19 @@ impl Config {
                 message: message.to_owned(),
             })?;
 
+        let defaults = DeliveryPolicy::default();
+        let delivery_policy = DeliveryPolicy {
+            retention: policy_duration(
+                &read,
+                ENV_EVENT_RETENTION_SECS,
+                defaults.retention,
+                Duration::from_secs,
+            )?,
+            max_bytes: positive_number(&read, ENV_EVENT_LOG_MAX_BYTES, defaults.max_bytes)?,
+            max_streams: positive_number(&read, ENV_EVENT_LOG_MAX_STREAMS, defaults.max_streams)?,
+            ack_window: positive_number(&read, ENV_ACK_WINDOW, defaults.ack_window)?,
+        };
+
         Ok(Self {
             access_key_id,
             access_key_secret,
@@ -194,6 +217,7 @@ impl Config {
             app_heartbeat,
             heartbeat_policy,
             upstream_policy,
+            delivery_policy,
         })
     }
 
@@ -243,6 +267,11 @@ impl Config {
     pub const fn upstream_policy(&self) -> UpstreamPolicy {
         self.upstream_policy
     }
+    /// 有界内存日志和下游 ACK 窗口策略。
+    #[must_use]
+    pub const fn delivery_policy(&self) -> DeliveryPolicy {
+        self.delivery_policy
+    }
 }
 
 impl fmt::Debug for Config {
@@ -257,6 +286,7 @@ impl fmt::Debug for Config {
             .field("app_heartbeat", &self.app_heartbeat)
             .field("heartbeat_policy", &self.heartbeat_policy)
             .field("upstream_policy", &self.upstream_policy)
+            .field("delivery_policy", &self.delivery_policy)
             .finish()
     }
 }
@@ -344,6 +374,24 @@ fn policy_duration(
         });
     }
     Ok(duration)
+}
+
+fn positive_number<T: std::str::FromStr + PartialEq + Default>(
+    read: &impl Fn(&str) -> Result<String, VarError>,
+    key: &'static str,
+    default: T,
+) -> Result<T, ConfigError> {
+    let Some(value) = optional(read, key)? else {
+        return Ok(default);
+    };
+    value
+        .parse()
+        .ok()
+        .filter(|n| *n != T::default())
+        .ok_or_else(|| ConfigError::Invalid {
+            var: key,
+            message: "必须是有效正整数".into(),
+        })
 }
 
 fn parse_app_id(value: &str) -> Result<i64, ConfigError> {

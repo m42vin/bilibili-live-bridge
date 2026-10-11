@@ -13,7 +13,7 @@ use tokio_tungstenite::{MaybeTlsStream, accept_async, connect_async};
 use super::*;
 use crate::open_live::api::Client;
 use crate::open_live::ws::{Danmaku, LiveEvent};
-use crate::session::ManagerOptions;
+use crate::session::{DeliveryPolicy, HeartbeatPolicy, ManagerOptions, UpstreamPolicy};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type UpstreamMessage = (Value, oneshot::Sender<()>);
@@ -616,6 +616,10 @@ impl Fixture {
     }
 
     async fn with_app_heartbeat(app_heartbeat: Duration) -> Self {
+        Self::with_delivery(app_heartbeat, DeliveryPolicy::default()).await
+    }
+
+    async fn with_delivery(app_heartbeat: Duration, delivery_policy: DeliveryPolicy) -> Self {
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let official = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -631,7 +635,7 @@ impl Fixture {
             early_event: Default::default(),
             sockets: Default::default(),
         });
-        let manager = Manager::with_options(
+        let manager = Manager::with_policies_and_delivery(
             Client::with_origin(
                 "fake-key",
                 "fake-secret",
@@ -644,6 +648,9 @@ impl Fixture {
             ManagerOptions {
                 idle_grace: Duration::from_secs(30),
             },
+            HeartbeatPolicy::default(),
+            UpstreamPolicy::default(),
+            delivery_policy,
         )
         .unwrap();
         let url = format!("ws://{}/ws", downstream.local_addr().unwrap());
@@ -899,4 +906,583 @@ fn packet(operation: u32, body: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&1_u32.to_be_bytes());
     bytes.extend_from_slice(body);
     bytes
+}
+
+impl Fixture {
+    async fn subscribe_ack(&self, code: &str, cursor: Option<&Value>) -> (ClientSocket, Value) {
+        let mut client = self.connect().await;
+        let mut request = json!({"type":"subscribe","code":code,"ack":true});
+        if let Some(cursor) = cursor {
+            request["resume_after"] = cursor.clone();
+        }
+        client
+            .send(Message::text(request.to_string()))
+            .await
+            .unwrap();
+        let reply = next_json(&mut client).await;
+        (client, reply)
+    }
+
+    async fn emit_logged(&self, data: Value) {
+        let mut probe = self.manager.attach(CODE).await.unwrap();
+        self.state.emit(7, json!({"cmd":"SEQ","data":data})).await;
+        probe.recv().await.unwrap();
+    }
+}
+
+async fn ack(client: &mut ClientSocket, ready: &Value, seq: u64) {
+    client
+        .send(Message::text(
+            json!({"type":"ack","stream_id":ready["stream_id"],"seq":seq}).to_string(),
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ack_window_pauses_events_but_keeps_ping_and_resumes_on_cumulative_ack() {
+    let fixture = Fixture::with_delivery(
+        Duration::from_secs(20),
+        DeliveryPolicy {
+            ack_window: 2,
+            ..DeliveryPolicy::default()
+        },
+    )
+    .await;
+    let (mut client, ready) = fixture.subscribe_ack(CODE, None).await;
+    assert_eq!(ready["ack_window"], 2);
+    for seq in 1..=3 {
+        fixture.emit_logged(json!(seq)).await;
+    }
+    for seq in 1..=2 {
+        assert_eq!(next_json(&mut client).await["seq"], seq);
+    }
+    assert!(
+        timeout(Duration::from_millis(30), client.next())
+            .await
+            .is_err()
+    );
+    client.send(Message::Ping(vec![9].into())).await.unwrap();
+    assert_eq!(next_frame(&mut client).await, Message::Pong(vec![9].into()));
+    ack(&mut client, &ready, 1).await;
+    assert_eq!(next_json(&mut client).await["seq"], 3);
+    ack(&mut client, &ready, 3).await;
+    drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn disconnect_replays_unacked_and_offline_events_before_new_live_events() {
+    let fixture = Fixture::new().await;
+    let (mut first, ready) = fixture.subscribe_ack(CODE, None).await;
+    fixture.emit_logged(json!(1)).await;
+    assert_eq!(next_json(&mut first).await["seq"], 1);
+    // 业务已完成但 ACK 丢失；恢复游标由客户端保存的位置决定。
+    drop(first);
+    fixture.emit_logged(json!(2)).await;
+    fixture.emit_logged(json!(3)).await;
+    let cursor = json!({"stream_id":ready["stream_id"],"seq":0});
+    let (mut resumed, reply) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(reply["resumed"], true);
+    assert_eq!(reply["game_id"], ready["game_id"]);
+    for seq in 1..=3 {
+        assert_eq!(next_json(&mut resumed).await["seq"], seq);
+    }
+    fixture.emit_logged(json!(4)).await;
+    assert_eq!(next_json(&mut resumed).await["seq"], 4);
+    ack(&mut resumed, &reply, 4).await;
+    assert_eq!(fixture.state.starts.borrow().len(), 1);
+    drop(resumed);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn ended_stream_replays_tail_without_starting_a_new_game_and_waits_for_ack() {
+    let fixture = Fixture::new().await;
+    let (mut first, ready) = fixture.subscribe_ack(CODE, None).await;
+    fixture.emit_logged(json!(1)).await;
+    assert_eq!(next_json(&mut first).await["seq"], 1);
+    fixture
+        .state
+        .emit(
+            7,
+            json!({"cmd":"LIVE_OPEN_PLATFORM_INTERACTION_END","data":{"game_id":"game-1"}}),
+        )
+        .await;
+    assert_eq!(next_json(&mut first).await["seq"], 2);
+    fixture.state.wait_ends(1).await;
+    assert!(
+        timeout(Duration::from_millis(30), first.next())
+            .await
+            .is_err()
+    );
+    drop(first);
+    let cursor = json!({"stream_id":ready["stream_id"],"seq":1});
+    let (mut client, reply) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(reply["type"], "ready");
+    assert_eq!(
+        next_json(&mut client).await["cmd"],
+        "LIVE_OPEN_PLATFORM_INTERACTION_END"
+    );
+    ack(&mut client, &reply, 2).await;
+    assert_eq!(next_json(&mut client).await, json!({"type":"closed"}));
+    assert_eq!(fixture.state.starts.borrow().len(), 1);
+    drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn expired_unacked_events_report_gap_while_window_is_full() {
+    let fixture = Fixture::with_delivery(
+        Duration::from_secs(20),
+        DeliveryPolicy {
+            ack_window: 1,
+            max_bytes: 400,
+            ..DeliveryPolicy::default()
+        },
+    )
+    .await;
+    let (mut client, _) = fixture.subscribe_ack(CODE, None).await;
+    fixture.emit_logged(json!("x".repeat(100))).await;
+    assert_eq!(next_json(&mut client).await["seq"], 1);
+    fixture.emit_logged(json!("y".repeat(100))).await;
+    let gap = next_json(&mut client).await;
+    assert_eq!(gap["type"], "resume_unavailable");
+    assert_eq!(gap["reason"], "cursor_expired");
+    assert_eq!(gap["earliest_after"], 1);
+    drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_resume_never_starts_and_invalid_acks_close_the_connection() {
+    let fixture = Fixture::new().await;
+    let cursor = json!({"stream_id":"missing","seq":0});
+    let (_, reply) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(reply["type"], "resume_unavailable");
+    assert!(fixture.state.starts.borrow().is_empty());
+    for wrong_stream in [false, true] {
+        let (mut client, ready) = fixture.subscribe_ack(CODE, None).await;
+        let id = if wrong_stream {
+            json!("other")
+        } else {
+            ready["stream_id"].clone()
+        };
+        client
+            .send(Message::text(
+                json!({"type":"ack","stream_id":id,"seq":1}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut client).await["code"], "invalid_request");
+    }
+    fixture.stop().await;
+}
+
+#[test]
+fn ack_validation_accepts_duplicate_and_rejects_regression_future_and_wrong_stream() {
+    let acks = Acks::new();
+    assert!(acks.acknowledge("one", 0).is_err());
+    acks.start("one", 0);
+    acks.reserve(3);
+    assert!(acks.acknowledge("one", 2).is_ok());
+    assert!(acks.acknowledge("one", 2).is_ok());
+    for (id, seq) in [("other", 2), ("one", 1), ("one", 4)] {
+        assert!(acks.acknowledge(id, seq).is_err());
+    }
+    assert_eq!(acks.snapshot().acked, 2);
+    assert!(
+        parse_subscribe(
+            r#"{"type":"subscribe","code":"code","resume_after":{"stream_id":"one","seq":0}}"#
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn requested_ack_window_is_bounded_by_service_limit() {
+    let fixture = Fixture::with_delivery(
+        Duration::from_secs(20),
+        DeliveryPolicy {
+            ack_window: 3,
+            ..DeliveryPolicy::default()
+        },
+    )
+    .await;
+    for (requested, actual) in [(1, 1), (10, 3)] {
+        let mut client = fixture.connect().await;
+        client
+            .send(Message::text(
+                json!({"type":"subscribe","code":CODE,"ack":true,"ack_window":requested})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut client).await["ack_window"], actual);
+        drop(client);
+    }
+    fixture.stop().await;
+    for request in [
+        r#"{"type":"subscribe","code":"code","ack":true,"ack_window":0}"#,
+        r#"{"type":"subscribe","code":"code","ack_window":1}"#,
+    ] {
+        assert!(parse_subscribe(request).is_err());
+    }
+}
+
+#[tokio::test]
+async fn slow_ack_client_does_not_block_another_clients_progress() {
+    let fixture = Fixture::with_delivery(
+        Duration::from_secs(20),
+        DeliveryPolicy {
+            ack_window: 1,
+            ..DeliveryPolicy::default()
+        },
+    )
+    .await;
+    let (mut slow, _) = fixture.subscribe_ack(CODE, None).await;
+    let (mut fast, ready) = fixture.subscribe_ack(CODE, None).await;
+    fixture.emit_logged(json!(1)).await;
+    assert_eq!(next_json(&mut slow).await["seq"], 1);
+    assert_eq!(next_json(&mut fast).await["seq"], 1);
+    ack(&mut fast, &ready, 1).await;
+    fixture.emit_logged(json!(2)).await;
+    assert_eq!(next_json(&mut fast).await["seq"], 2);
+    assert!(
+        timeout(Duration::from_millis(30), slow.next())
+            .await
+            .is_err()
+    );
+    drop(slow);
+    drop(fast);
+    fixture.stop().await;
+}
+
+// 在 ACK 快照后的固定位置安排交错；仍运行真实的日志校验、淘汰和发送循环。
+// sink 只在真正发送消息后触发退出，断言同时检查交付结果，避免只验证没有报错。
+struct StopAfterSend {
+    output: mpsc::UnboundedSender<Message>,
+    stop: watch::Sender<bool>,
+}
+impl Sink<Message> for StopAfterSend {
+    type Error = io::Error;
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn start_send(self: Pin<&mut Self>, message: Message) -> io::Result<()> {
+        self.output.send(message).unwrap();
+        self.stop.send_replace(true);
+        Ok(())
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+fn delivery_log_fixture(
+    policy: DeliveryPolicy,
+) -> (Arc<crate::session::EventLog>, watch::Sender<UpstreamStatus>) {
+    let log = crate::session::EventLog::new(policy);
+    let (status, _) = watch::channel(UpstreamStatus::Connected);
+    log.register("one", 7, "game-1", vec!["code".into()], status.subscribe())
+        .unwrap();
+    (log, status)
+}
+fn sized_event(n: usize) -> LiveEvent {
+    LiveEvent::Unknown {
+        cmd: "TEST".into(),
+        data: json!({"n":n,"text":"x".repeat(100)}),
+    }
+}
+fn stop_after_send_sink() -> (
+    StopAfterSend,
+    mpsc::UnboundedReceiver<Message>,
+    watch::Receiver<bool>,
+) {
+    let (output, messages) = mpsc::unbounded_channel();
+    let (stop, signal) = watch::channel(false);
+    (StopAfterSend { output, stop }, messages, signal)
+}
+
+#[tokio::test]
+async fn delivery_interleaving_ack_advances_before_eviction() {
+    let (log, _status) = delivery_log_fixture(DeliveryPolicy {
+        max_bytes: 400,
+        ..DeliveryPolicy::default()
+    });
+    log.append("one", &sized_event(1)).unwrap();
+    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    assert_eq!(subscription.recv().await.unwrap().unwrap().seq, 1);
+    let acks = Acks::new();
+    acks.start("one", 0);
+    acks.reserve(1);
+    let once = AtomicBool::new(false);
+    let hook_log = Arc::clone(&log);
+    *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |acks| {
+        if !once.swap(true, Ordering::SeqCst) {
+            acks.acknowledge("one", 1).unwrap();
+            hook_log.append("one", &sized_event(2)).unwrap();
+        }
+    }));
+    let (mut sink, mut messages, mut stop) = stop_after_send_sink();
+    let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
+    let result = timeout(
+        TEST_TIMEOUT,
+        forward_delivery(
+            &mut sink,
+            &mut subscription,
+            &mut peer,
+            &Pongs::new(),
+            &acks,
+            1,
+            &mut stop,
+        ),
+    )
+    .await
+    .expect("发送循环应完成");
+    assert_eq!(acks.snapshot().acked, 1);
+    assert!(
+        subscription.validate_after(1).is_ok(),
+        "当前 ACK 可继续读取事件 2"
+    );
+    assert_eq!(
+        result,
+        Exit::End,
+        "应交付事件 2 后退出；不能使用过期的 ACK=0 快照报错"
+    );
+    let Message::Text(text) = messages.try_recv().unwrap() else {
+        panic!("应发送事件 2");
+    };
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["seq"], 2);
+    assert_eq!(acks.snapshot().sent, 2);
+}
+
+#[tokio::test]
+async fn delivery_interleaving_finished_metadata_eviction() {
+    // 同时覆盖快照已包含最终 ACK，以及最终 ACK 在快照后才到达的情况。
+    for late_ack in [false, true] {
+        let (log, status) = delivery_log_fixture(DeliveryPolicy {
+            max_streams: 1,
+            ..DeliveryPolicy::default()
+        });
+        log.append("one", &sized_event(1)).unwrap();
+        log.finish("one");
+        let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+        subscription.recv().await.unwrap().unwrap();
+        let acks = Acks::new();
+        acks.start("one", 0);
+        acks.reserve(1);
+        let visits = AtomicUsize::new(0);
+        let hook_log = Arc::clone(&log);
+        *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |acks| {
+            let turn = visits.fetch_add(1, Ordering::SeqCst);
+            // 早到 ACK：满窗口唤醒、读到 EOF，再于下一快照后淘汰流。
+            // 晚到 ACK：先读到 EOF，于结束检查的快照后同时推进 ACK 并淘汰。
+            if (!late_ack && turn == 0) || (late_ack && turn == 1) {
+                acks.acknowledge("one", 1).unwrap();
+            }
+            if (!late_ack && turn == 2) || (late_ack && turn == 1) {
+                hook_log
+                    .register("two", 8, "game-2", vec!["other".into()], status.subscribe())
+                    .unwrap();
+            }
+        }));
+        let (mut sink, mut messages, mut stop) = stop_after_send_sink();
+        let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
+        let result = timeout(
+            TEST_TIMEOUT,
+            forward_delivery(
+                &mut sink,
+                &mut subscription,
+                &mut peer,
+                &Pongs::new(),
+                &acks,
+                if late_ack { 2 } else { 1 },
+                &mut stop,
+            ),
+        )
+        .await
+        .expect("结束流应完成");
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            log.reader("one", "code", Some(1), None)
+                .err()
+                .unwrap()
+                .reason,
+            "stream_unavailable",
+            "必须实际发生元数据淘汰"
+        );
+        assert_eq!(
+            result,
+            Exit::End,
+            "全部事件已交付并确认，淘汰历史不能把正常结束变成续传失败"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delivery_interleaving_busy_room_notifications() {
+    let (log, status) = delivery_log_fixture(DeliveryPolicy::default());
+    log.register(
+        "busy",
+        8,
+        "game-2",
+        vec!["other".into()],
+        status.subscribe(),
+    )
+    .unwrap();
+    log.append("one", &sized_event(1)).unwrap();
+    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    let acks = Acks::new();
+    acks.start("one", 0);
+    let (mut sink, mut messages, mut stop) = stop_after_send_sink();
+    let stopper = sink.stop.clone();
+    let visits = Arc::new(AtomicUsize::new(0));
+    let hook_visits = Arc::clone(&visits);
+    *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |_| {
+        let turn = hook_visits.fetch_add(1, Ordering::SeqCst);
+        if turn == 1000 {
+            stopper.send_replace(true);
+        }
+        log.append("busy", &sized_event(turn)).unwrap();
+    }));
+    let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
+    let result = timeout(
+        TEST_TIMEOUT,
+        forward_delivery(
+            &mut sink,
+            &mut subscription,
+            &mut peer,
+            &Pongs::new(),
+            &acks,
+            1,
+            &mut stop,
+        ),
+    )
+    .await
+    .expect("就绪事件不能被通知饿死");
+    assert!(
+        visits.load(Ordering::SeqCst) > 0,
+        "必须实际插入其他房间通知"
+    );
+    assert_eq!(result, Exit::End);
+    let message = messages
+        .try_recv()
+        .expect("窗口空闲、事件已就绪，连续 1000 次其他房间通知不能阻止一次发送");
+    let Message::Text(text) = message else {
+        panic!("应发送事件文本");
+    };
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["seq"], 1);
+}
+
+#[tokio::test]
+async fn delivery_interleaving_ack_advance_does_not_hide_a_real_gap() {
+    let (log, _status) = delivery_log_fixture(DeliveryPolicy {
+        max_bytes: 400,
+        ..DeliveryPolicy::default()
+    });
+    log.append("one", &sized_event(1)).unwrap();
+    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    subscription.recv().await.unwrap().unwrap();
+    let acks = Acks::new();
+    acks.start("one", 0);
+    acks.reserve(1);
+    let once = AtomicBool::new(false);
+    *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |acks| {
+        if !once.swap(true, Ordering::SeqCst) {
+            acks.acknowledge("one", 1).unwrap();
+            log.append("one", &sized_event(2)).unwrap();
+            log.append("one", &sized_event(3)).unwrap();
+        }
+    }));
+    let (mut sink, mut messages, mut stop) = stop_after_send_sink();
+    let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
+    let result = timeout(
+        TEST_TIMEOUT,
+        forward_delivery(
+            &mut sink,
+            &mut subscription,
+            &mut peer,
+            &Pongs::new(),
+            &acks,
+            1,
+            &mut stop,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result,
+        Exit::Resume(ResumeUnavailable {
+            reason: "cursor_expired",
+            earliest_after: Some(2),
+            latest_seq: Some(3)
+        })
+    );
+    assert!(
+        matches!(messages.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "不能跳过已丢失的事件 2 而交付事件 3"
+    );
+}
+
+#[tokio::test]
+async fn delivery_interleaving_busy_room_notifications_keep_status_when_window_is_full() {
+    let (log, status) = delivery_log_fixture(DeliveryPolicy::default());
+    log.register(
+        "busy",
+        8,
+        "game-2",
+        vec!["other".into()],
+        status.subscribe(),
+    )
+    .unwrap();
+    log.append("one", &sized_event(1)).unwrap();
+    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    subscription.recv().await.unwrap().unwrap();
+    let acks = Acks::new();
+    acks.start("one", 0);
+    acks.reserve(1);
+    let (mut sink, mut messages, mut stop) = stop_after_send_sink();
+    let stopper = sink.stop.clone();
+    let visits = AtomicUsize::new(0);
+    *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |_| {
+        let turn = visits.fetch_add(1, Ordering::SeqCst);
+        if turn == 0 {
+            status.send_replace(UpstreamStatus::Reconnecting);
+        }
+        if turn == 1000 {
+            stopper.send_replace(true);
+        }
+        log.append("busy", &sized_event(turn)).unwrap();
+    }));
+    let (_peer_tx, mut peer) = watch::channel(PeerState::Connected);
+    let result = timeout(
+        TEST_TIMEOUT,
+        forward_delivery(
+            &mut sink,
+            &mut subscription,
+            &mut peer,
+            &Pongs::new(),
+            &acks,
+            1,
+            &mut stop,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, Exit::End);
+    let Message::Text(text) = messages.try_recv().expect("满窗口时也必须交付上游状态")
+    else {
+        panic!("应发送状态文本");
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"type":"status","state":"reconnecting"})
+    );
+    assert_eq!(acks.snapshot().sent, 1, "状态不能绕过窗口发送业务事件");
 }
