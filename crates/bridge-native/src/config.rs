@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::open_live::ws::HealthPolicy;
+use crate::resource::{RatePolicy, ResourcePolicy};
 use crate::session::{DeliveryPolicy, HeartbeatPolicy, ReconnectPolicy, UpstreamPolicy};
 
 /// 开放平台 Access Key Id。
@@ -52,6 +53,27 @@ pub const ENV_EVENT_LOG_MAX_STREAMS: &str = "BRIDGE_EVENT_LOG_MAX_STREAMS";
 /// 每条下游连接未确认事件数上限。
 pub const ENV_ACK_WINDOW: &str = "BRIDGE_ACK_WINDOW";
 
+/// 共享资源或入站频率限制。
+pub const ENV_MAX_CONNECTIONS: &str = "BRIDGE_MAX_CONNECTIONS";
+/// 共享资源或入站频率限制。
+pub const ENV_MAX_HANDSHAKES: &str = "BRIDGE_MAX_HANDSHAKES";
+/// 共享资源或入站频率限制。
+pub const ENV_MAX_PENDING_ATTACHES: &str = "BRIDGE_MAX_PENDING_ATTACHES";
+/// 共享资源或入站频率限制。
+pub const ENV_MAX_STARTING_SESSIONS: &str = "BRIDGE_MAX_STARTING_SESSIONS";
+/// 共享资源或入站频率限制。
+pub const ENV_MAX_SESSIONS: &str = "BRIDGE_MAX_SESSIONS";
+/// 共享资源或入站频率限制。
+pub const ENV_MAX_SUBSCRIBERS_PER_ROOM: &str = "BRIDGE_MAX_SUBSCRIBERS_PER_ROOM";
+/// 共享资源或入站频率限制。
+pub const ENV_START_RATE_PER_SEC: &str = "BRIDGE_START_RATE_PER_SEC";
+/// 共享资源或入站频率限制。
+pub const ENV_START_BURST: &str = "BRIDGE_START_BURST";
+/// 共享资源或入站频率限制。
+pub const ENV_CLIENT_MESSAGE_RATE_PER_SEC: &str = "BRIDGE_CLIENT_MESSAGE_RATE_PER_SEC";
+/// 共享资源或入站频率限制。
+pub const ENV_CLIENT_MESSAGE_BURST: &str = "BRIDGE_CLIENT_MESSAGE_BURST";
+
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 /// 官方文档推荐的心跳间隔。长连接约 30 秒收不到心跳会断开，互动玩法约 60 秒没有项目心跳会关闭场次。
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(20);
@@ -72,6 +94,7 @@ pub struct Config {
     heartbeat_policy: HeartbeatPolicy,
     upstream_policy: UpstreamPolicy,
     delivery_policy: DeliveryPolicy,
+    resource_policy: ResourcePolicy,
 }
 
 impl Config {
@@ -208,6 +231,63 @@ impl Config {
             ack_window: positive_number(&read, ENV_ACK_WINDOW, defaults.ack_window)?,
         };
 
+        let defaults = ResourcePolicy::default();
+        let resource_policy = ResourcePolicy {
+            max_connections: resource_number(
+                &read,
+                ENV_MAX_CONNECTIONS,
+                defaults.max_connections as u64,
+            )? as usize,
+            max_handshakes: resource_number(
+                &read,
+                ENV_MAX_HANDSHAKES,
+                defaults.max_handshakes as u64,
+            )? as usize,
+            max_pending_attaches: resource_number(
+                &read,
+                ENV_MAX_PENDING_ATTACHES,
+                defaults.max_pending_attaches as u64,
+            )? as usize,
+            max_starting_sessions: resource_number(
+                &read,
+                ENV_MAX_STARTING_SESSIONS,
+                defaults.max_starting_sessions as u64,
+            )? as usize,
+            max_sessions: resource_number(&read, ENV_MAX_SESSIONS, defaults.max_sessions as u64)?
+                as usize,
+            max_subscribers_per_room: resource_number(
+                &read,
+                ENV_MAX_SUBSCRIBERS_PER_ROOM,
+                defaults.max_subscribers_per_room as u64,
+            )? as usize,
+            start: RatePolicy {
+                per_sec: resource_number(&read, ENV_START_RATE_PER_SEC, defaults.start.per_sec)?,
+                burst: resource_number(&read, ENV_START_BURST, defaults.start.burst)?,
+            },
+            client_message: RatePolicy {
+                per_sec: resource_number(
+                    &read,
+                    ENV_CLIENT_MESSAGE_RATE_PER_SEC,
+                    defaults.client_message.per_sec,
+                )?,
+                burst: resource_number(
+                    &read,
+                    ENV_CLIENT_MESSAGE_BURST,
+                    defaults.client_message.burst,
+                )?,
+            },
+        };
+        resource_policy
+            .validate()
+            .map_err(|message| ConfigError::Invalid {
+                var: if resource_policy.max_handshakes > resource_policy.max_connections {
+                    ENV_MAX_HANDSHAKES
+                } else {
+                    ENV_MAX_STARTING_SESSIONS
+                },
+                message: message.into(),
+            })?;
+
         Ok(Self {
             access_key_id,
             access_key_secret,
@@ -218,6 +298,7 @@ impl Config {
             heartbeat_policy,
             upstream_policy,
             delivery_policy,
+            resource_policy,
         })
     }
 
@@ -272,6 +353,10 @@ impl Config {
     pub const fn delivery_policy(&self) -> DeliveryPolicy {
         self.delivery_policy
     }
+    /// server 与进程内接入共享的资源限制。
+    pub const fn resource_policy(&self) -> ResourcePolicy {
+        self.resource_policy
+    }
 }
 
 impl fmt::Debug for Config {
@@ -287,6 +372,7 @@ impl fmt::Debug for Config {
             .field("heartbeat_policy", &self.heartbeat_policy)
             .field("upstream_policy", &self.upstream_policy)
             .field("delivery_policy", &self.delivery_policy)
+            .field("resource_policy", &self.resource_policy)
             .finish()
     }
 }
@@ -374,6 +460,21 @@ fn policy_duration(
         });
     }
     Ok(duration)
+}
+
+fn resource_number(
+    read: &impl Fn(&str) -> Result<String, VarError>,
+    key: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let value = positive_number(read, key, default)?;
+    if value > u32::MAX as u64 {
+        return Err(ConfigError::Invalid {
+            var: key,
+            message: "资源或速率上限不能超过 u32::MAX".into(),
+        });
+    }
+    Ok(value)
 }
 
 fn positive_number<T: std::str::FromStr + PartialEq + Default>(

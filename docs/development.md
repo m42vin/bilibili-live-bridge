@@ -40,6 +40,8 @@ cargo tree --locked -p bridge-core
 
 | 修改内容 | 实现位置 | 验证位置 |
 | --- | --- | --- |
+| 纯资源策略、拒绝原因与显式时间令牌桶 | [core/resource.rs](../crates/bridge-core/src/resource.rs) | 同文件单元测试 |
+| 原生资源名额、取消和限速 | [native/resource.rs](../crates/bridge-native/src/resource.rs)、[manager.rs](../crates/bridge-native/src/session/manager.rs) | [resource_test.rs](../crates/bridge-native/src/session/resource_test.rs)、下游集成测试 |
 | 配置读取与校验 | [config.rs](../crates/bridge-native/src/config.rs) | [config_test.rs](../crates/bridge-native/src/config_test.rs) |
 | 日志初始化与过滤 | [logging.rs](../crates/bridge-native/src/logging.rs) | [logging_test.rs](../crates/bridge-native/src/logging_test.rs) |
 | HTTP API、响应与请求签名 | [api.rs](../crates/bridge-native/src/open_live/api.rs)、[auth.rs](../crates/bridge-core/src/open_live/auth.rs) | [api_test.rs](../crates/bridge-native/src/open_live/api_test.rs)、[auth_test.rs](../crates/bridge-core/src/open_live/auth_test.rs) |
@@ -103,6 +105,11 @@ RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 （[auth_reauth_cli.rs](../crates/bridge-native/tests/auth_reauth_cli.rs)），真实鉴权结果需要人工运行并记录。
 
 使用房间号、场次 ID、请求路径和命令名关联日志。debug 可以看到示例程序的事件详情，trace 可以看到 WebSocket 心跳；真实运行会开启和关闭平台场次。
+
+资源测试使用小预算和受控 start / connect / end 桩验证生命周期；测试构造器显式注入宽松预算，
+避免既有批量心跳测试被试运行额度遮挡。资源功能测试另行注入真实小额度，并核对拒绝前平台调用量。
+令牌桶用显式时间或暂停时钟；WS 消息限速测试冻结仅测试编译的消息时钟，网络调度延迟不会补充令牌。
+客户端重试测试等待实际重新握手并检查 resume_after，不用固定 sleep 猜测重试时刻。
 
 ## 常见扩展方式
 

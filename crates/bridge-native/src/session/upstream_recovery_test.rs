@@ -17,6 +17,8 @@ fn recovering(mock: &Arc<Mock>, grace: Duration) -> Manager {
         super::super::HeartbeatPolicy::default(),
         UpstreamPolicy::default(),
     )
+    .with_resource_budget(crate::resource::ResourceBudget::for_tests())
+    .unwrap()
 }
 
 #[tokio::test(start_paused = true)]
@@ -218,7 +220,9 @@ async fn budget_also_covers_old_socket_release() {
             }),
             ..UpstreamPolicy::default()
         },
-    );
+    )
+    .with_resource_budget(crate::resource::ResourceBudget::for_tests())
+    .unwrap();
     let mut sub = manager.attach(CODE).await.unwrap();
     let socket = mock.connection(0);
     socket.hold_close();

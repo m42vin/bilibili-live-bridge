@@ -25,14 +25,14 @@ async fn retains_without_receivers_and_reads_history_then_live_and_terminal() {
     register(&log, "one");
     log.append("one", &event(json!(1))).unwrap();
     log.append("one", &event(json!(2))).unwrap();
-    let mut reader = log.reader("one", "code", Some(0), None).unwrap();
+    let mut reader = log.test_reader("one", "code", Some(0), None).unwrap();
     assert_eq!(reader.recv().await.unwrap().unwrap().seq, 1);
     log.append("one", &event(json!(3))).unwrap();
     assert_eq!(reader.recv().await.unwrap().unwrap().seq, 2);
     assert_eq!(reader.recv().await.unwrap().unwrap().seq, 3);
     log.finish("one");
     assert!(reader.recv().await.unwrap().is_none());
-    let mut replay = log.reader("one", "code", Some(2), None).unwrap();
+    let mut replay = log.test_reader("one", "code", Some(2), None).unwrap();
     assert_eq!(replay.recv().await.unwrap().unwrap().seq, 3);
     assert!(replay.recv().await.unwrap().is_none());
 }
@@ -45,7 +45,7 @@ async fn time_eviction_and_finished_stream_expiry_are_explicit() {
     });
     register(&log, "one");
     log.append("one", &event(json!(1))).unwrap();
-    let reader = log.reader("one", "code", Some(0), None).unwrap();
+    let reader = log.test_reader("one", "code", Some(0), None).unwrap();
     tokio::time::advance(Duration::from_secs(5)).await;
     let gap = reader.validate_after(0).unwrap_err();
     assert_eq!(gap.reason, "cursor_expired");
@@ -53,7 +53,7 @@ async fn time_eviction_and_finished_stream_expiry_are_explicit() {
     log.finish("one");
     tokio::time::advance(Duration::from_secs(5)).await;
     assert_eq!(
-        log.reader("one", "code", Some(1), None)
+        log.test_reader("one", "code", Some(1), None)
             .err()
             .unwrap()
             .reason,
@@ -73,7 +73,7 @@ async fn global_bytes_and_oversized_event_keep_a_contiguous_suffix() {
     log.append("two", &event(json!("b".repeat(100)))).unwrap();
     assert!(super::super::manager::lock(&log.state).bytes <= 400);
     assert_eq!(
-        log.reader("one", "code", Some(0), None)
+        log.test_reader("one", "code", Some(0), None)
             .err()
             .unwrap()
             .reason,
@@ -81,14 +81,14 @@ async fn global_bytes_and_oversized_event_keep_a_contiguous_suffix() {
     );
     log.append("two", &event(json!("x".repeat(1000)))).unwrap();
     assert_eq!(
-        log.reader("two", "code", Some(1), None)
+        log.test_reader("two", "code", Some(1), None)
             .err()
             .unwrap()
             .earliest_after,
         Some(2)
     );
     log.append("two", &event(json!(3))).unwrap();
-    let mut reader = log.reader("two", "code", Some(2), None).unwrap();
+    let mut reader = log.test_reader("two", "code", Some(2), None).unwrap();
     assert_eq!(reader.recv().await.unwrap().unwrap().seq, 3);
 }
 
@@ -97,11 +97,11 @@ fn unknown_stream_wrong_code_and_future_cursor_do_not_expose_history() {
     let log = EventLog::new(DeliveryPolicy::default());
     register(&log, "one");
     for (id, code) in [("missing", "code"), ("one", "other")] {
-        let gap = log.reader(id, code, Some(0), None).err().unwrap();
+        let gap = log.test_reader(id, code, Some(0), None).err().unwrap();
         assert_eq!(gap, unavailable());
     }
     assert_eq!(
-        log.reader("one", "code", Some(1), None)
+        log.test_reader("one", "code", Some(1), None)
             .err()
             .unwrap()
             .reason,
@@ -129,7 +129,7 @@ fn stream_limit_rejects_active_overflow_and_evicts_finished_streams() {
     log.finish("one");
     register(&log, "two");
     assert_eq!(
-        log.reader("one", "code", Some(0), None)
+        log.test_reader("one", "code", Some(0), None)
             .err()
             .unwrap()
             .reason,
@@ -150,8 +150,8 @@ fn identity_fingerprints_are_bounded_and_recently_used_aliases_are_retained() {
             .len(),
         128
     );
-    assert!(log.reader("one", "code-0", Some(0), None).is_err());
-    assert!(log.reader("one", "code-199", Some(0), None).is_ok());
+    assert!(log.test_reader("one", "code-0", Some(0), None).is_err());
+    assert!(log.test_reader("one", "code-199", Some(0), None).is_ok());
     log.add_code("one", "code-0");
-    assert!(log.reader("one", "code-0", Some(0), None).is_ok());
+    assert!(log.test_reader("one", "code-0", Some(0), None).is_ok());
 }

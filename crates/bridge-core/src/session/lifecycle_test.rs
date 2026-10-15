@@ -197,3 +197,14 @@ fn completed_duplicate_cleanup_releases_game_before_redirect_or_failure() {
     owner.commit();
     assert_eq!(owner.cancel(), None);
 }
+
+#[test]
+fn pending_admissions_keep_ready_session_alive_until_the_last_waiter_leaves() {
+    let mut life = SessionLifecycle::<Duration>::starting(ManagerOptions::default());
+    assert!(life.begin_attach(Duration::ZERO));
+    life.ready();
+    assert_eq!(life.idle_if_unused(Duration::ZERO), IdleAction::Unchanged);
+    assert!(life.subscribe(Duration::ZERO));
+    assert_eq!(life.end_attach(Duration::ZERO), IdleAction::Unchanged);
+    assert_eq!(life.release(Duration::ZERO), IdleAction::Close);
+}

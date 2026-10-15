@@ -25,6 +25,7 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async_with_config};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
+use crate::resource::{Permit, Rejection, Resource, ResourceBudget};
 use crate::session::{
     DeliveryError, DeliverySubscription, Manager, RecvError, ResumeUnavailable, Subscription,
     UpstreamStatus,
@@ -45,6 +46,7 @@ type Reader = SplitStream<Socket>;
 enum PeerState {
     Connected,
     Invalid(&'static str),
+    Limited(Rejection),
     Closed,
 }
 
@@ -53,6 +55,7 @@ enum Exit {
     End,
     Invalid(&'static str),
     AttachFailed,
+    Resource(Rejection),
     Resume(ResumeUnavailable),
     Disconnected,
     Failed,
@@ -156,7 +159,7 @@ impl Acks {
 ///
 /// 只接受 `/ws`，每条连接订阅一个身份码。握手、首包和单次发送最多等待 10 秒，
 /// 入站消息最多 8 KiB；活动连接每 20 秒发送 Ping，10 秒内未收到对应 Pong 时断开。
-/// 客户端断开后释放订阅；接入中的请求仍推进至完成，避免取消平台开启请求。
+/// 客户端断开后释放订阅和待接入名额；共享开场任务继续持有开场与清理责任。
 ///
 /// 退出时停止接入，关闭下游，等待所有连接任务和 [`Manager::shutdown`] 完成。
 /// 本函数负责关闭传入管理器及其所有克隆共享的会话。调用方应通过 `shutdown` 退出，
@@ -170,6 +173,7 @@ pub async fn serve(
     manager: Manager,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    let budget = manager.resource_budget();
     let (stopping, _) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -182,11 +186,16 @@ pub async fn serve(
             }
             incoming = listener.accept() => match incoming {
                 Ok((stream, peer)) => {
+                    let connection_permit=match budget.acquire(Resource::Connection) {Ok(permit)=>permit,Err(_)=>{reject_http(&stream);continue;}};
+                    let handshake_permit=match budget.acquire(Resource::Handshake) {Ok(permit)=>permit,Err(_)=>{reject_http(&stream);continue;}};
                     let manager = manager.clone();
                     let signal = stopping.subscribe();
                     let span = tracing::info_span!("downstream", connection_id = %uuid::Uuid::new_v4(), %peer);
                     connections.spawn(
-                        connection(stream, manager, signal).instrument(span).with_current_subscriber()
+                        async move {
+                            let _connection_permit=connection_permit;
+                            connection(stream, manager, signal, handshake_permit).await;
+                        }.instrument(span).with_current_subscriber()
                     );
                 }
                 Err(error) => break Err(error),
@@ -213,7 +222,17 @@ async fn stopped(signal: &mut watch::Receiver<bool>) {
     let _ = signal.wait_for(|stopping| *stopping).await;
 }
 
-async fn connection(stream: TcpStream, manager: Manager, mut shutdown: watch::Receiver<bool>) {
+fn reject_http(stream: &TcpStream) {
+    // 非阻塞尽力响应；配额不足的路径不派生任务或增加等待队列。
+    let _=stream.try_write(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n");
+}
+
+async fn connection(
+    stream: TcpStream,
+    manager: Manager,
+    mut shutdown: watch::Receiver<bool>,
+    handshake_permit: Permit,
+) {
     let config = WebSocketConfig::default()
         .read_buffer_size(MAX_CLIENT_MESSAGE)
         .max_message_size(Some(MAX_CLIENT_MESSAGE))
@@ -231,6 +250,7 @@ async fn connection(stream: TcpStream, manager: Manager, mut shutdown: watch::Re
             }
         },
     };
+    drop(handshake_permit);
     tracing::info!("下游 WebSocket 已连接");
     let (mut writer, reader) = socket.split();
     let (first_tx, first_rx) = oneshot::channel();
@@ -245,6 +265,7 @@ async fn connection(stream: TcpStream, manager: Manager, mut shutdown: watch::Re
             peer_tx,
             Arc::clone(&pongs),
             Arc::clone(&acks),
+            manager.resource_budget(),
             done_rx
         ),
         async {
@@ -283,8 +304,10 @@ async fn read_peer(
     state: watch::Sender<PeerState>,
     pongs: Arc<Pongs>,
     acks: Arc<Acks>,
+    budget: ResourceBudget,
     mut done: watch::Receiver<bool>,
 ) {
+    let mut messages = budget.messages();
     let mut first = Some(first);
     let mut invalid = false;
     loop {
@@ -293,6 +316,13 @@ async fn read_peer(
             _ = stopped(&mut done) => return,
             incoming = reader.next() => incoming,
         };
+        if !invalid
+            && matches!(&incoming, Some(Ok(Message::Text(_) | Message::Binary(_))))
+            && let Err(rejection) = messages.take()
+        {
+            state.send_replace(PeerState::Limited(rejection));
+            return;
+        }
         match incoming {
             Some(Ok(Message::Text(text))) if !invalid => {
                 let result = if first.is_some() {
@@ -345,6 +375,7 @@ async fn peer_exit(peer: &mut watch::Receiver<PeerState>) -> Exit {
     {
         Ok(state) => match *state {
             PeerState::Invalid(message) => Exit::Invalid(message),
+            PeerState::Limited(rejection) => Exit::Resource(rejection),
             _ => Exit::Disconnected,
         },
         Err(_) => Exit::Disconnected,
@@ -375,13 +406,16 @@ async fn write_peer(
         let mut attach = std::pin::pin!(attach);
         let result = tokio::select! {
             biased;
-            _ = stopped(shutdown) => { drop(attach.await); return Exit::End; }
-            exit = peer_exit(peer) => { drop(attach.await); return exit; }
+            _ = stopped(shutdown) => return Exit::End,
+            exit = peer_exit(peer) => return exit,
             result = &mut attach => result,
         };
         let mut subscription = match result {
             Ok(subscription) => subscription,
             Err(DeliveryError::Resume(detail)) => return Exit::Resume(detail),
+            Err(DeliveryError::Attach(crate::session::SessionError::Resource(rejection))) => {
+                return Exit::Resource(rejection);
+            }
             Err(DeliveryError::Attach(_)) => return Exit::AttachFailed,
         };
         acks.start(&subscription.stream_id, subscription.base_seq);
@@ -410,17 +444,18 @@ async fn write_peer(
         )
         .await;
     }
-    // 客户端断开时不丢弃 attach future；取得的订阅必须正常释放，平台请求才能完整清理。
+    // 停止等待可以取消请求 future；Manager 的受预算约束后台任务继续维护开场所有权。
     let attach = manager.attach(&request.code);
     let mut attach = std::pin::pin!(attach);
     let result = tokio::select! {
         biased;
-        _ = stopped(shutdown) => { drop(attach.await); return Exit::End; }
-        exit = peer_exit(peer) => { drop(attach.await); return exit; }
+        _ = stopped(shutdown) => return Exit::End,
+        exit = peer_exit(peer) => return exit,
         result = &mut attach => result,
     };
     let mut subscription = match result {
         Ok(subscription) => subscription,
+        Err(crate::session::SessionError::Resource(rejection)) => return Exit::Resource(rejection),
         Err(error) => {
             tracing::warn!(platform_code = ?error.platform_code().map(|code| code.raw()), "下游订阅接入失败");
             return Exit::AttachFailed;
@@ -691,8 +726,17 @@ async fn finish(writer: &mut Writer, peer: &mut watch::Receiver<PeerState>, exit
             ServerMessage::Error {
                 code: "invalid_request",
                 message,
+                retry_after_ms: None,
             },
             CloseCode::Policy,
+        ),
+        Exit::Resource(rejection) => (
+            ServerMessage::Error {
+                code: rejection.code(),
+                message: "资源额度暂不可用，请稍后重试",
+                retry_after_ms: rejection.retry_after_ms,
+            },
+            CloseCode::from(1013),
         ),
         Exit::Resume(detail) => (
             ServerMessage::ResumeUnavailable { detail },
@@ -702,6 +746,7 @@ async fn finish(writer: &mut Writer, peer: &mut watch::Receiver<PeerState>, exit
             ServerMessage::Error {
                 code: "attach_failed",
                 message: "接入直播间失败，请检查身份码或服务端日志",
+                retry_after_ms: None,
             },
             CloseCode::Error,
         ),

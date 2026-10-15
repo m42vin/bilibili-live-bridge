@@ -14,6 +14,7 @@ use bilibili_live_bridge::{
     config::Config,
     downstream, logging,
     open_live::api::Client,
+    resource::ResourceBudget,
     session::{Manager, ManagerOptions},
 };
 use tokio::net::TcpListener;
@@ -22,6 +23,7 @@ use tokio::net::TcpListener;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     logging::init()?;
     let config = Config::from_env()?;
+    let budget = ResourceBudget::new(config.resource_policy())?;
     let manager = Manager::with_policies_and_delivery(
         Client::from_config(&config)?,
         config.websocket_heartbeat(),
@@ -32,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.heartbeat_policy(),
         config.upstream_policy(),
         config.delivery_policy(),
-    )?;
+    )?
+    .with_resource_budget(budget)?;
     let listener = TcpListener::bind(config.listen()).await?;
     tracing::info!(listen = %listener.local_addr()?, path = "/ws", "直播桥已开始监听");
     downstream::serve(listener, manager, shutdown_signal()).await?;

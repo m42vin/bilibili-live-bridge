@@ -10,6 +10,8 @@ use crate::open_live::ws::WsError;
 /// 接入或维持一场会话失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
+    /// 共享资源准入拒绝，可按建议延迟重试。
+    Resource(crate::resource::Rejection),
     /// 身份码为空，或心跳间隔无效。
     Invalid {
         /// 哪一项不满足约束。
@@ -81,6 +83,7 @@ impl fmt::Display for SessionError {
                 Some(end_message) => write!(formatter, "{message}；关闭场次失败：{end_message}"),
                 None => formatter.write_str(message),
             },
+            Self::Resource(error) => error.fmt(formatter),
             Self::Closed => formatter.write_str("这场会话已经结束"),
             Self::ShuttingDown => formatter.write_str("直播桥正在关闭"),
         }

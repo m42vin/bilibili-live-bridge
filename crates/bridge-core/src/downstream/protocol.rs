@@ -143,6 +143,9 @@ pub enum ServerMessage<'a> {
         code: &'a str,
         /// 错误说明，不包含请求凭据。
         message: &'a str,
+        /// 暂时错误的可选重试建议；不保证届时可以接入。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
     /// 会话已经结束。
     Closed,

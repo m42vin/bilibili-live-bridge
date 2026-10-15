@@ -13,6 +13,7 @@ use tokio_tungstenite::{MaybeTlsStream, accept_async, connect_async};
 use super::*;
 use crate::open_live::api::Client;
 use crate::open_live::ws::LiveEvent;
+use crate::resource::{RatePolicy, ResourcePolicy};
 use crate::session::{DeliveryPolicy, HeartbeatPolicy, ManagerOptions, UpstreamPolicy};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -561,6 +562,21 @@ impl Fixture {
     }
 
     async fn with_delivery(app_heartbeat: Duration, delivery_policy: DeliveryPolicy) -> Self {
+        Self::with_budget(app_heartbeat, delivery_policy, ResourceBudget::for_tests()).await
+    }
+    async fn with_resources(policy: ResourcePolicy) -> Self {
+        Self::with_budget(
+            Duration::from_secs(20),
+            DeliveryPolicy::default(),
+            ResourceBudget::new(policy).unwrap(),
+        )
+        .await
+    }
+    async fn with_budget(
+        app_heartbeat: Duration,
+        delivery_policy: DeliveryPolicy,
+        budget: ResourceBudget,
+    ) -> Self {
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let official = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -593,6 +609,8 @@ impl Fixture {
             UpstreamPolicy::default(),
             delivery_policy,
         )
+        .unwrap()
+        .with_resource_budget(budget)
         .unwrap();
         let url = format!("ws://{}/ws", downstream.local_addr().unwrap());
         let (shutdown, signal) = oneshot::channel();
@@ -1154,7 +1172,7 @@ async fn delivery_interleaving_ack_advances_before_eviction() {
         ..DeliveryPolicy::default()
     });
     log.append("one", &sized_event(1)).unwrap();
-    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    let mut subscription = log.test_reader("one", "code", Some(0), None).unwrap();
     assert_eq!(subscription.recv().await.unwrap().unwrap().seq, 1);
     let acks = Acks::new();
     acks.start("one", 0);
@@ -1210,7 +1228,7 @@ async fn delivery_interleaving_finished_metadata_eviction() {
         });
         log.append("one", &sized_event(1)).unwrap();
         log.finish("one");
-        let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+        let mut subscription = log.test_reader("one", "code", Some(0), None).unwrap();
         subscription.recv().await.unwrap().unwrap();
         let acks = Acks::new();
         acks.start("one", 0);
@@ -1251,7 +1269,7 @@ async fn delivery_interleaving_finished_metadata_eviction() {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         assert_eq!(
-            log.reader("one", "code", Some(1), None)
+            log.test_reader("one", "code", Some(1), None)
                 .err()
                 .unwrap()
                 .reason,
@@ -1278,7 +1296,7 @@ async fn delivery_interleaving_busy_room_notifications() {
     )
     .unwrap();
     log.append("one", &sized_event(1)).unwrap();
-    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    let mut subscription = log.test_reader("one", "code", Some(0), None).unwrap();
     let acks = Acks::new();
     acks.start("one", 0);
     let (mut sink, mut messages, mut stop) = stop_after_send_sink();
@@ -1328,7 +1346,7 @@ async fn delivery_interleaving_ack_advance_does_not_hide_a_real_gap() {
         ..DeliveryPolicy::default()
     });
     log.append("one", &sized_event(1)).unwrap();
-    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    let mut subscription = log.test_reader("one", "code", Some(0), None).unwrap();
     subscription.recv().await.unwrap().unwrap();
     let acks = Acks::new();
     acks.start("one", 0);
@@ -1383,7 +1401,7 @@ async fn delivery_interleaving_busy_room_notifications_keep_status_when_window_i
     )
     .unwrap();
     log.append("one", &sized_event(1)).unwrap();
-    let mut subscription = log.reader("one", "code", Some(0), None).unwrap();
+    let mut subscription = log.test_reader("one", "code", Some(0), None).unwrap();
     subscription.recv().await.unwrap().unwrap();
     let acks = Acks::new();
     acks.start("one", 0);
@@ -1426,4 +1444,140 @@ async fn delivery_interleaving_busy_room_notifications_keep_status_when_window_i
         json!({"type":"status","state":"reconnecting"})
     );
     assert_eq!(acks.snapshot().sent, 1, "状态不能绕过窗口发送业务事件");
+}
+
+async fn quota_occupied(fixture: &Fixture, index: usize, n: usize) {
+    timeout(TEST_TIMEOUT, async {
+        while fixture.manager.resource_budget().snapshot().occupied[index] != n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("资源占用未达到预期");
+}
+
+#[tokio::test]
+async fn resource_connection_and_handshake_limits_refuse_without_spawning_waiters() {
+    for handshake in [false, true] {
+        let fixture = Fixture::with_resources(ResourcePolicy {
+            max_connections: if handshake { 2 } else { 1 },
+            max_handshakes: 1,
+            ..Default::default()
+        })
+        .await;
+        if handshake {
+            let raw = TcpStream::connect(
+                fixture
+                    .url
+                    .trim_start_matches("ws://")
+                    .trim_end_matches("/ws"),
+            )
+            .await
+            .unwrap();
+            quota_occupied(&fixture, 1, 1).await;
+            assert!(
+                timeout(TEST_TIMEOUT, connect_async(&fixture.url))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(
+                fixture.manager.resource_budget().snapshot().rejected[Resource::Handshake as usize],
+                1
+            );
+            drop(raw);
+        } else {
+            let client = fixture.connect().await;
+            quota_occupied(&fixture, 1, 0).await;
+            assert_eq!(fixture.manager.resource_budget().snapshot().occupied[0], 1);
+            assert!(
+                timeout(TEST_TIMEOUT, connect_async(&fixture.url))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(
+                fixture.manager.resource_budget().snapshot().rejected
+                    [Resource::Connection as usize],
+                1
+            );
+            drop(client);
+        }
+        quota_occupied(&fixture, 0, 0).await;
+        let client = fixture.connect().await;
+        drop(client);
+        assert!(fixture.state.starts.borrow().is_empty());
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn resource_message_limit_counts_duplicate_acks_before_json_and_exempts_control_frames() {
+    let fixture = Fixture::with_resources(ResourcePolicy {
+        client_message: RatePolicy {
+            per_sec: 1,
+            burst: 3,
+        },
+        ..Default::default()
+    })
+    .await;
+    fixture.manager.resource_budget().freeze_message_clock();
+    let (mut client, ready) = fixture.subscribe_ack(CODE, None).await;
+    for _ in 0..4 {
+        client.send(Message::Ping(vec![1, 2].into())).await.unwrap();
+        assert_eq!(
+            next_frame(&mut client).await,
+            Message::Pong(vec![1, 2].into())
+        );
+    }
+    ack(&mut client, &ready, 0).await;
+    ack(&mut client, &ready, 0).await;
+    // 第四条业务消息在解析之前被限流，不能变成 invalid_request。
+    client.send(Message::text("not-json")).await.unwrap();
+    let reply = next_json(&mut client).await;
+    assert_eq!(reply["code"], "rate_limited");
+    assert_eq!(reply["retry_after_ms"], 1000);
+    drop(client);
+    quota_occupied(&fixture, 0, 0).await;
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn resource_ws_pending_and_room_refusals_preserve_the_active_stream() {
+    let fixture = Fixture::with_resources(ResourcePolicy {
+        max_pending_attaches: 1,
+        max_starting_sessions: 1,
+        max_subscribers_per_room: 1,
+        ..Default::default()
+    })
+    .await;
+    fixture.state.start_gate.send_replace(false);
+    let mut first = fixture.connect().await;
+    first
+        .send(Message::text(
+            json!({"type":"subscribe","code":CODE,"ack":true}).to_string(),
+        ))
+        .await
+        .unwrap();
+    quota_occupied(&fixture, 2, 1).await;
+    let (rejected, reply) = fixture.subscribe_ack(CODE, None).await;
+    assert_eq!(reply["code"], "server_busy");
+    assert!(reply["retry_after_ms"].is_number());
+    drop(rejected);
+    drop(first);
+    quota_occupied(&fixture, 2, 0).await;
+    assert_eq!(
+        fixture.manager.resource_budget().snapshot().occupied[3..],
+        [1, 1]
+    );
+    // 等待者断开不取消实际 start，开场结果仍可被新的等待者复用。
+    fixture.state.start_gate.send_replace(true);
+    let (client, ready) = fixture.subscribe_ack(CODE, None).await;
+    assert_eq!(ready["type"], "ready");
+    let cursor = json!({"stream_id":ready["stream_id"],"seq":ready["seq"]});
+    let (other, reply) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(reply["code"], "subscription_limit");
+    assert_eq!(fixture.state.starts.borrow().len(), 1);
+    drop((client, other));
+    fixture.stop().await;
 }

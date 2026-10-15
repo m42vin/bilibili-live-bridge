@@ -259,6 +259,28 @@ impl EventLog {
         after: Option<u64>,
         guard: Option<Subscription>,
     ) -> Result<DeliverySubscription, ResumeUnavailable> {
+        self.reader_checked(id, code, after, guard, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reader(
+        self: &Arc<Self>,
+        id: &str,
+        code: &str,
+        after: Option<u64>,
+        guard: Option<Subscription>,
+    ) -> Result<DeliverySubscription, ResumeUnavailable> {
+        self.reader_checked(id, code, after, guard, false)
+    }
+
+    fn reader_checked(
+        self: &Arc<Self>,
+        id: &str,
+        code: &str,
+        after: Option<u64>,
+        guard: Option<Subscription>,
+        require_guard: bool,
+    ) -> Result<DeliverySubscription, ResumeUnavailable> {
         // 先创建通知接收器，再读取快照，避免记录与等待之间丢失唤醒。
         let changed = self.changed.subscribe();
         let mut state = super::manager::lock(&self.state);
@@ -268,6 +290,9 @@ impl EventLog {
             .get(id)
             .filter(|s| s.codes.contains(&fingerprint(code)))
             .ok_or_else(unavailable)?;
+        if require_guard && guard.is_none() && stream.ended.is_none() {
+            return Err(unavailable());
+        }
         let base = after.unwrap_or(stream.tail);
         validate(stream, base)?;
         Ok(DeliverySubscription {

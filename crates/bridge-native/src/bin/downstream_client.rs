@@ -95,6 +95,7 @@ enum ServerMessage {
     },
     Error {
         code: String,
+        retry_after_ms: Option<u64>,
     },
     Closed,
     #[serde(other)]
@@ -103,7 +104,7 @@ enum ServerMessage {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
-    Retry,
+    Retry { retry_after_ms: Option<u64> },
     Finished,
     Stopped,
 }
@@ -131,6 +132,7 @@ async fn run_client(
             result = timeout(IO_TIMEOUT, connect_async(settings.url.as_str())) => result,
         };
         let mut stable = false;
+        let mut suggested = None;
         match connected {
             Ok(Ok((mut socket, _))) => {
                 let mut ready_at = None;
@@ -155,8 +157,19 @@ async fn run_client(
                 .await;
                 match outcome? {
                     Outcome::Finished | Outcome::Stopped => return Ok(()),
-                    Outcome::Retry => {}
+                    Outcome::Retry { retry_after_ms } => {
+                        suggested = retry_after_ms;
+                    }
                 }
+            }
+            Ok(Err(Error::Http(response))) if matches!(response.status().as_u16(), 429 | 503) => {
+                suggested = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(|s| s.checked_mul(1000));
+                tracing::warn!(retry_after_ms = suggested, "入口暂时繁忙");
             }
             Ok(Err(Error::Http(response)))
                 if response.status().is_client_error() && response.status().as_u16() != 429 =>
@@ -171,17 +184,30 @@ async fn run_client(
         if stable {
             delay = RETRY_INITIAL;
         }
+        let wait = retry_delay(delay, suggested, jitter());
         tracing::warn!(
-            retry_secs = delay.as_secs(),
+            retry_secs = wait.as_secs_f64(),
             "下游断开，等待按已处理游标续传"
         );
         tokio::select! {
             biased;
             result = shutdown.as_mut() => return interrupted(result),
-            _ = sleep(delay) => {}
+            _ = sleep(wait) => {}
         }
         delay = (delay * 2).min(RETRY_MAX);
     }
+}
+
+// 建议值设置下限，抖动只增加等待，不让大量客户端同时重试。
+fn retry_delay(base: Duration, suggestion: Option<u64>, jitter_percent: u32) -> Duration {
+    let suggested = Duration::from_millis(suggestion.unwrap_or(0));
+    let base = base.max(suggested);
+    // 不接受无法表示的远端期限，避免定时器溢出；仍保留已有游标。
+    let base = base.min(Duration::from_secs(24 * 60 * 60));
+    base.saturating_add(base.mul_f64(f64::from(jitter_percent.min(20)) / 100.0))
+}
+fn jitter() -> u32 {
+    u32::from(uuid::Uuid::new_v4().as_bytes()[0]) % 21
 }
 
 fn interrupted(result: std::io::Result<()>) -> Result<(), String> {
@@ -253,7 +279,9 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
         result = timeout(IO_TIMEOUT,socket.send(Message::text(subscribe.to_string()))) => result,
     };
     if !matches!(sent, Ok(Ok(()))) {
-        return Ok(Outcome::Retry);
+        return Ok(Outcome::Retry {
+            retry_after_ms: None,
+        });
     }
     let mut received: Option<EventCursor> = None;
     loop {
@@ -269,7 +297,7 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                     result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
                     result = timeout(IO_TIMEOUT,socket.send(Message::text(message.to_string()))) => result,
                 };
-                if !matches!(sent,Ok(Ok(()))) { return Ok(Outcome::Retry); }
+                if !matches!(sent,Ok(Ok(()))) { return Ok(Outcome::Retry {retry_after_ms:None}); }
                 continue;
             }
             result = timeout(IDLE_TIMEOUT,socket.next()) => result,
@@ -321,7 +349,9 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                                     .await,
                                 Ok(Ok(()))
                             ) {
-                                return Ok(Outcome::Retry);
+                                return Ok(Outcome::Retry {
+                                    retry_after_ms: None,
+                                });
                             }
                             continue;
                         }
@@ -339,7 +369,9 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                             })
                             .is_err()
                         {
-                            return Ok(Outcome::Retry);
+                            return Ok(Outcome::Retry {
+                                retry_after_ms: None,
+                            });
                         }
                     }
                     ServerMessage::Status { state } => match state.as_str() {
@@ -355,7 +387,17 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                         tracing::error!(%reason,?earliest_after,?latest_seq,"续传不可用，不能完整恢复");
                         return Err("续传不可用，检查日志后决定是否重新从实时位置订阅".into());
                     }
-                    ServerMessage::Error { code } => {
+                    ServerMessage::Error {
+                        code,
+                        retry_after_ms,
+                    } => {
+                        if matches!(
+                            code.as_str(),
+                            "server_busy" | "rate_limited" | "subscription_limit"
+                        ) {
+                            tracing::warn!(%code,?retry_after_ms,"暂时拒绝接入，保留游标重试");
+                            return Ok(Outcome::Retry { retry_after_ms });
+                        }
                         tracing::error!(%code,"桥接服务报告接入错误");
                         return Err("接入失败，请检查身份码和服务端日志".into());
                     }
@@ -374,13 +416,23 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                     result = timeout(IO_TIMEOUT,socket.flush()) => result,
                 };
                 if !matches!(flushed, Ok(Ok(()))) {
-                    return Ok(Outcome::Retry);
+                    return Ok(Outcome::Retry {
+                        retry_after_ms: None,
+                    });
                 }
             }
             Ok(Some(Ok(Message::Binary(_)))) => return Err("桥接服务应返回 JSON 文本帧".into()),
-            Ok(Some(Ok(Message::Close(_)))) => return Ok(Outcome::Retry),
+            Ok(Some(Ok(Message::Close(_)))) => {
+                return Ok(Outcome::Retry {
+                    retry_after_ms: None,
+                });
+            }
             Ok(Some(Ok(_))) => {}
-            _ => return Ok(Outcome::Retry),
+            _ => {
+                return Ok(Outcome::Retry {
+                    retry_after_ms: None,
+                });
+            }
         }
     }
 }

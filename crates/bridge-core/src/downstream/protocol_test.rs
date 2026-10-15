@@ -63,3 +63,22 @@ fn protocol_preserves_known_and_unknown_data() {
         assert!(subscription_code(invalid).is_err());
     }
 }
+
+#[test]
+fn retry_advice_is_optional_and_keeps_the_existing_error_shape() {
+    for advice in [None, Some(1000)] {
+        let value = serde_json::to_value(ServerMessage::Error {
+            code: "server_busy",
+            message: "busy",
+            retry_after_ms: advice,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["code"], "server_busy");
+        if let Some(ms) = advice {
+            assert_eq!(value["retry_after_ms"], ms);
+        } else {
+            assert!(value.get("retry_after_ms").is_none());
+        }
+    }
+}

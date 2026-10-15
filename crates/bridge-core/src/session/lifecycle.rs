@@ -55,6 +55,7 @@ pub enum IdleAction<T> {
 pub struct SessionLifecycle<T: Moment = Duration> {
     phase: AdmissionPhase,
     subscribers: usize,
+    pending_attaches: usize,
     idle_grace: Duration,
     idle_deadline: Option<T>,
     closing: bool,
@@ -66,6 +67,7 @@ impl<T: Moment> SessionLifecycle<T> {
         Self {
             phase: AdmissionPhase::Starting,
             subscribers: 0,
+            pending_attaches: 0,
             idle_grace: options.idle_grace,
             idle_deadline: None,
             closing: false,
@@ -130,29 +132,59 @@ impl<T: Moment> SessionLifecycle<T> {
         self.idle_deadline = None;
         true
     }
+    /// 登记一个正在等待此会话的接入者，用于后台初始化完成时的闲置判断。
+    pub fn begin_attach(&mut self, now: T) -> bool {
+        self.expire_idle(now);
+        if !self.is_joinable() {
+            return false;
+        }
+        let Some(count) = self.pending_attaches.checked_add(1) else {
+            return false;
+        };
+        self.pending_attaches = count;
+        self.idle_deadline = None;
+        true
+    }
+    /// 释放等待者；最后一个等待者离开就绪且无订阅的会话时启用闲置清理。
+    pub fn end_attach(&mut self, now: T) -> IdleAction<T> {
+        self.pending_attaches = self.pending_attaches.saturating_sub(1);
+        self.idle_if_unused(now)
+    }
+    /// 接入等待者数量。
+    pub fn pending_attaches(&self) -> usize {
+        self.pending_attaches
+    }
+    /// 就绪且没有订阅或等待者时，调度关闭；已有闲置期限不重置。
+    pub fn idle_if_unused(&mut self, now: T) -> IdleAction<T> {
+        if self.phase != AdmissionPhase::Ready
+            || self.subscribers != 0
+            || self.pending_attaches != 0
+            || self.closing
+            || self.finished
+            || self.idle_deadline.is_some()
+        {
+            return IdleAction::Unchanged;
+        }
+        if self.idle_grace.is_zero() {
+            self.closing = true;
+            return IdleAction::Close;
+        }
+        let Some(deadline) = now.checked_add(self.idle_grace) else {
+            self.closing = true;
+            return IdleAction::Close;
+        };
+        self.idle_deadline = Some(deadline);
+        IdleAction::Schedule(deadline)
+    }
     /// 释放一个订阅；只有最后一次有效释放启用宽限期。
     pub fn release(&mut self, now: T) -> IdleAction<T> {
         if self.subscribers == 0 {
             return IdleAction::Unchanged;
         }
         self.subscribers -= 1;
-        if self.subscribers != 0 || self.closing || self.finished {
-            return IdleAction::Unchanged;
-        }
-        if self.idle_grace.is_zero() {
-            self.closing = true;
-            self.idle_deadline = None;
-            return IdleAction::Close;
-        }
-        let Some(deadline) = now.checked_add(self.idle_grace) else {
-            // 无法表示期限时及时关闭，不能无限保留资源。
-            self.closing = true;
-            self.idle_deadline = None;
-            return IdleAction::Close;
-        };
-        self.idle_deadline = Some(deadline);
-        IdleAction::Schedule(deadline)
+        self.idle_if_unused(now)
     }
+
     /// 根据当前截止时间处理到期；旧计时器不会关闭已重新订阅的会话。
     pub fn expire_idle(&mut self, now: T) -> bool {
         if !self.closing

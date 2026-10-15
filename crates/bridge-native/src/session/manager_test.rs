@@ -708,6 +708,8 @@ fn grace_manager(mock: &Arc<Mock>) -> Manager {
             ..super::UpstreamPolicy::default()
         },
     )
+    .with_resource_budget(crate::resource::ResourceBudget::for_tests())
+    .unwrap()
 }
 
 fn manager(mock: &Arc<Mock>, app_heartbeat: Duration) -> Manager {
@@ -1371,11 +1373,12 @@ async fn cancelled_connect_removes_heartbeats_and_cleans_the_known_game() {
     assert_eq!(super::lock(&manager.state.beats).len(), 1);
     attach.abort();
     assert!(attach.await.unwrap_err().is_cancelled());
-    assert!(super::lock(&manager.state.beats).is_empty());
-    assert!(super::lock(&manager.state.tables).sessions.is_empty());
-    // 被取消的接入派生尽力清理，按契约先等待它结束再关闭 runtime。
-    mock.wait_ends(1).await;
+    assert_eq!(manager.resource_budget().snapshot().occupied[2], 0);
+    assert_eq!(super::lock(&manager.state.beats).len(), 1);
+    assert_eq!(super::lock(&manager.state.tables).sessions.len(), 1);
     let _ = manager.shutdown().await;
+    assert!(super::lock(&manager.state.beats).is_empty());
+    assert_eq!(manager.resource_budget().snapshot().occupied[3..], [0, 0]);
     assert_eq!(mock.ends(), ["game-1"]);
     assert_eq!(mock.end_attempts(), 1);
 }
@@ -1405,3 +1408,6 @@ async fn delivery_slow_reader_keeps_more_than_broadcast_capacity_and_fresh_join_
     assert_eq!(fresh.recv().await.unwrap().unwrap().seq, 301);
     let _ = manager.shutdown().await;
 }
+
+#[path = "resource_test.rs"]
+mod resource_test;

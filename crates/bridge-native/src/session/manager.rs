@@ -18,6 +18,7 @@ use super::recovery::NativeMoment;
 use crate::config::Config;
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
+use crate::resource::{Permit, Resource, ResourceBudget, RoomPermit};
 pub use bridge_core::session::lifecycle::ManagerOptions;
 use bridge_core::session::lifecycle::{
     AdmissionOwner, ClaimDecision, IdleAction, SessionLifecycle,
@@ -229,19 +230,32 @@ impl Manager {
         code: &str,
         after: Option<&EventCursor>,
     ) -> Result<DeliverySubscription, DeliveryError> {
+        let _pending = self
+            .state
+            .budget
+            .acquire(Resource::PendingAttach)
+            .map_err(|e| DeliveryError::Attach(SessionError::Resource(e)))?;
         let code = normalize_code(code).map_err(DeliveryError::Attach)?;
         if self.is_shutting_down() {
             return Err(DeliveryError::Attach(SessionError::ShuttingDown));
         }
         if let Some(cursor) = after {
             let session = lock(&self.state.tables).by_code.get(code).cloned();
-            let guard = session
-                .filter(|s| s.stream_id == cursor.stream_id)
-                .and_then(|s| s.try_subscribe())
-                .map(|mut subscription| {
-                    subscription.events = broadcast::channel(1).1;
-                    subscription
-                });
+            let guard = match session.filter(|s| s.stream_id == cursor.stream_id) {
+                Some(session) => {
+                    let subscription = session.try_subscribe().map_err(DeliveryError::Attach)?;
+                    if subscription.is_none() && !session.is_finished() {
+                        return Err(DeliveryError::Attach(SessionError::Resource(
+                            self.state.budget.reject(Resource::Session, Some(1000)),
+                        )));
+                    }
+                    subscription.map(|mut subscription| {
+                        subscription.events = broadcast::channel(1).1;
+                        subscription
+                    })
+                }
+                None => None,
+            };
             if guard.is_some() {
                 self.state.log.add_code(&cursor.stream_id, code);
             }
@@ -250,7 +264,10 @@ impl Manager {
                 .reader(&cursor.stream_id, code, Some(cursor.seq), guard)
                 .map_err(DeliveryError::Resume)
         } else {
-            let mut subscription = self.attach(code).await.map_err(DeliveryError::Attach)?;
+            let mut subscription = self
+                .attach_inner(code)
+                .await
+                .map_err(DeliveryError::Attach)?;
             // ACK 订阅只需生命周期计数，不保留未使用的旧广播接收端。
             subscription.events = broadcast::channel(1).1;
             let id = subscription.session.stream_id.clone();
@@ -261,6 +278,18 @@ impl Manager {
                 .reader(&id, code, Some(base), Some(subscription))
                 .map_err(DeliveryError::Resume)
         }
+    }
+
+    /// 在克隆或接入前注入共享预算；网络与进程内调用统一受该预算约束。
+    pub fn with_resource_budget(mut self, budget: ResourceBudget) -> Result<Self, SessionError> {
+        let state = Arc::get_mut(&mut self.state)
+            .ok_or_else(|| SessionError::invalid("必须在克隆或接入前注入预算"))?;
+        state.budget = budget;
+        Ok(self)
+    }
+    /// 同一个 Manager、其克隆和 server 使用的资源预算。
+    pub fn resource_budget(&self) -> ResourceBudget {
+        self.state.budget.clone()
     }
 
     /// 用进程配置创建会话管理器。
@@ -280,6 +309,9 @@ impl Manager {
             config.heartbeat_policy(),
             config.upstream_policy(),
             config.delivery_policy(),
+        )?
+        .with_resource_budget(
+            ResourceBudget::new(config.resource_policy()).map_err(SessionError::invalid)?,
         )
     }
 
@@ -298,10 +330,19 @@ impl Manager {
     /// # Errors
     ///
     /// 空身份码、管理器正在关闭、开启或建连失败，以及接入完成前会话结束时，
-    /// 返回对应的 [`SessionError`]。
+    /// 返回对应的 [`SessionError`]；资源不足返回带重试建议的 Resource。
     #[must_use = "接入失败时需要处理 SessionError"]
     #[tracing::instrument(skip_all, err(Display, level = "warn"))]
     pub async fn attach(&self, code: &str) -> Result<Subscription, SessionError> {
+        let _pending = self
+            .state
+            .budget
+            .acquire(Resource::PendingAttach)
+            .map_err(SessionError::Resource)?;
+        self.attach_inner(code).await
+    }
+
+    async fn attach_inner(&self, code: &str) -> Result<Subscription, SessionError> {
         let code = normalize_code(code)?;
         let subscription = match self.state.attach_once(code).await {
             Err(SessionError::Closed) if !self.is_shutting_down() => {
@@ -325,7 +366,7 @@ impl Manager {
     /// 官方连接关闭最多等待 5 秒，随后释放连接并继续调用 `end`。
     /// 官方连接或 `end` 清理失败会记录日志，不从本方法返回，也不自动重试；
     /// 返回不保证平台已确认场次结束成功。调用方应等待此 future 完成再退出 runtime。
-    /// 被取消的接入任务派生的尽力清理不纳入此处等待，应先协调并发接入任务结束。
+    /// 停止等待不会取消共享开场任务；清理完成后才归还开场和会话名额。
     #[must_use = "丢弃后不会等待场次关闭"]
     pub async fn shutdown(&self) {
         self.state.shutdown().await;
@@ -348,6 +389,7 @@ impl Manager {
         Self {
             state: Arc::new(State {
                 platform,
+                budget: ResourceBudget::new(Default::default()).expect("默认预算有效"),
                 log: EventLog::new(DeliveryPolicy::default()),
                 app_heartbeat,
                 event_capacity,
@@ -388,6 +430,8 @@ impl Manager {
                 ..UpstreamPolicy::default()
             },
         )
+        .with_resource_budget(ResourceBudget::for_tests())
+        .unwrap()
     }
 
     #[cfg(test)]
@@ -420,6 +464,7 @@ pub struct Subscription {
     anchor: Anchor,
     events: broadcast::Receiver<Arc<LiveEvent>>,
     delivery_base: u64,
+    _room_permit: RoomPermit,
     session: Arc<Session>,
     active: bool,
 }
@@ -515,6 +560,7 @@ impl std::error::Error for RecvError {}
 
 /// 同一个管理器及其克隆共享的索引、心跳登记和关闭信号。
 struct State {
+    budget: ResourceBudget,
     log: Arc<EventLog>,
     platform: Arc<dyn Platform>,
     app_heartbeat: Duration,
@@ -550,12 +596,27 @@ struct Tables {
 impl State {
     async fn attach_once(self: &Arc<Self>, code: &str) -> Result<Subscription, SessionError> {
         let (session, leader) = self.claim(code).await?;
+        let Some(waiter) = session.waiter() else {
+            let error = self.stop_error();
+            if leader {
+                session.fail(error.clone());
+            }
+            return Err(error);
+        };
         if leader {
-            self.lead(session, code).await
-        } else {
-            tracing::debug!("复用已有或正在建立的会话");
-            follow(session).await
+            let state = Arc::clone(self);
+            let starting = Arc::clone(&session);
+            let code = code.to_owned();
+            tokio::spawn(
+                async move {
+                    let _ = state.lead(starting, &code).await;
+                }
+                .with_current_subscriber(),
+            );
         }
+        let result = follow(Arc::clone(&session)).await;
+        drop(waiter);
+        result
     }
 
     async fn claim(self: &Arc<Self>, code: &str) -> Result<(Arc<Session>, bool), SessionError> {
@@ -575,7 +636,19 @@ impl State {
                         ClaimDecision::WaitForCleanup => Some(existing),
                     }
                 } else {
+                    let session_permit = self
+                        .budget
+                        .acquire(Resource::Session)
+                        .map_err(SessionError::Resource)?;
+                    let starting_permit = self
+                        .budget
+                        .acquire(Resource::StartingSession)
+                        .map_err(SessionError::Resource)?;
                     let session = Session::starting(Arc::downgrade(self), self.options.idle_grace);
+                    *lock(&session.permits) = SessionPermits {
+                        session: Some(session_permit),
+                        starting: Some(starting_permit),
+                    };
                     session.add_code(code.to_owned());
                     tables.by_code.insert(code.to_owned(), Arc::clone(&session));
                     tables.sessions.push(Arc::clone(&session));
@@ -589,16 +662,24 @@ impl State {
         }
     }
 
-    async fn lead(
-        self: &Arc<Self>,
-        session: Arc<Session>,
-        code: &str,
-    ) -> Result<Subscription, SessionError> {
+    async fn lead(self: &Arc<Self>, session: Arc<Session>, code: &str) -> Result<(), SessionError> {
         let mut leader = Leader {
             session: Arc::clone(&session),
             platform: Arc::clone(&self.platform),
             owner: AdmissionOwner::default(),
         };
+        if self.stopping(&session) {
+            let error = self.stop_error();
+            leader.owner.commit();
+            session.fail(error.clone());
+            return Err(error);
+        }
+        if let Err(rejection) = self.budget.start() {
+            let error = SessionError::Resource(rejection);
+            leader.owner.commit();
+            session.fail(error.clone());
+            return Err(error);
+        }
         let started = match self.platform.start(code).await {
             Ok(started) => started,
             Err(error) => {
@@ -626,6 +707,7 @@ impl State {
                 return abort(&mut leader, &session, self.stop_error()).await;
             }
             RoomDecision::Join(existing) => {
+                let target_waiter = existing.waiter();
                 let game_id = leader
                     .owner
                     .game_id()
@@ -647,7 +729,10 @@ impl State {
                     return Err(error);
                 }
                 session.redirect(&existing);
-                return follow(existing).await;
+                // 保护重定向目标，直到原会话上的等待者都转移或取消。
+                session.until_no_waiters().await;
+                drop(target_waiter);
+                return Ok(());
             }
             RoomDecision::Own => {}
         }
@@ -698,10 +783,6 @@ impl State {
             started.game_id().to_owned(),
             events.clone(),
         );
-        let Some(subscription) = session.try_subscribe() else {
-            close_socket(socket, started.game_id(), started.anchor().room_id).await;
-            return abort(&mut leader, &session, self.stop_error()).await;
-        };
 
         leader.owner.commit();
         leader.owner.release_game();
@@ -712,7 +793,7 @@ impl State {
             events,
             started,
         );
-        Ok(subscription)
+        Ok(())
     }
 
     fn decide_room(&self, session: &Arc<Session>, code: &str, room_id: i64) -> RoomDecision {
@@ -888,8 +969,7 @@ enum RoomDecision {
     Abort,
 }
 
-/// 首个接入的清理守卫。取消时只为已经取得 ID 的场次派生尽力清理任务。
-/// 派生任务不加入会话完成等待，不能替代调用方协调接入任务和显式 shutdown。
+/// 共享开场任务的清理守卫。异常取消时只对已知场次执行 end，完成后才发布失败并归还名额。
 struct Leader {
     session: Arc<Session>,
     platform: Arc<dyn Platform>,
@@ -902,8 +982,9 @@ impl Drop for Leader {
             return;
         };
         let game_id = cancelled.game_id;
-        self.session.fail(SessionError::Closed);
+        self.session.begin_close();
         if let Some(game_id) = game_id {
+            let session = Arc::clone(&self.session);
             let platform = Arc::clone(&self.platform);
             let span = tracing::info_span!("session_cleanup", %game_id);
             tokio::spawn(
@@ -912,10 +993,13 @@ impl Drop for Leader {
                     if let Err(error) = platform.end(&game_id).await {
                         tracing::warn!(%game_id, %error, "接入取消后关闭场次失败");
                     }
+                    session.fail(SessionError::Closed);
                 }
                 .instrument(span)
                 .with_current_subscriber(),
             );
+        } else {
+            self.session.fail(SessionError::Closed);
         }
     }
 }
@@ -924,7 +1008,7 @@ async fn abort(
     leader: &mut Leader,
     session: &Arc<Session>,
     error: SessionError,
-) -> Result<Subscription, SessionError> {
+) -> Result<(), SessionError> {
     session.begin_close();
     if let Some(game_id) = leader.owner.game_id().map(str::to_owned) {
         if let Err(error) = leader.platform.end(&game_id).await {
@@ -956,7 +1040,7 @@ async fn follow(session: Arc<Session>) -> Result<Subscription, SessionError> {
             };
             match action {
                 Action::Subscribe => {
-                    return session.try_subscribe().ok_or(SessionError::Closed);
+                    return session.try_subscribe()?.ok_or(SessionError::Closed);
                 }
                 Action::Fail(error) => return Err(error),
                 Action::Redirect(target) => {
@@ -1014,7 +1098,21 @@ fn spawn_upstream(
 }
 
 /// 被身份码和房间索引共享的会话。弱引用管理器，避免形成状态与会话的引用环。
+#[derive(Default)]
+struct SessionPermits {
+    session: Option<Permit>,
+    starting: Option<Permit>,
+}
+struct Waiter(Arc<Session>);
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.0.release_waiter();
+    }
+}
+
 struct Session {
+    permits: Mutex<SessionPermits>,
+    no_waiters: Notify,
     stream_id: String,
     state: Weak<State>,
     phase: watch::Sender<Phase>,
@@ -1049,6 +1147,8 @@ impl Session {
         let (idle, _) = watch::channel(None);
         Arc::new(Self {
             state,
+            permits: Mutex::new(SessionPermits::default()),
+            no_waiters: Notify::new(),
             phase,
             stream_id: uuid::Uuid::new_v4().to_string(),
             upstream: watch::channel(UpstreamStatus::Connected).0,
@@ -1124,10 +1224,12 @@ impl Session {
             anchor,
             events,
         });
+        lock(&self.permits).starting.take();
+        self.apply_idle(lifecycle.idle_if_unused(NativeMoment(Instant::now())));
     }
 
-    fn try_subscribe(self: &Arc<Self>) -> Option<Subscription> {
-        let (room_id, game_id, anchor, events) = {
+    fn try_subscribe(self: &Arc<Self>) -> Result<Option<Subscription>, SessionError> {
+        let (room_id, game_id, anchor, events, room_permit) = {
             // 生命周期与通知投影在同一锁内发布；不能在关闭开始后增加订阅。
             let mut lifecycle = lock(&self.lifecycle);
             self.expire_idle_locked(&mut lifecycle);
@@ -1139,30 +1241,85 @@ impl Session {
                     events,
                 } => Some((*room_id, game_id.clone(), anchor.clone(), events.clone())),
                 _ => None,
-            }?;
+            };
+            let Some(ready) = ready else {
+                return Ok(None);
+            };
+            if lifecycle.is_closing() || lifecycle.is_finished() {
+                return Ok(None);
+            }
+            let state = self.state.upgrade().ok_or(SessionError::Closed)?;
+            let room_permit = state
+                .budget
+                .subscribe(ready.0)
+                .map_err(SessionError::Resource)?;
             if !lifecycle.subscribe(NativeMoment(Instant::now())) {
                 if lifecycle.is_closing() {
                     self.idle.send_replace(None);
                     self.stop.cancel();
                 }
-                return None;
+                return Ok(None);
             }
             self.idle.send_replace(None);
-            ready
+            (ready.0, ready.1, ready.2, ready.3, room_permit)
         };
         let delivery_base = self
             .state
             .upgrade()
             .map_or(0, |state| state.log.tail(&self.stream_id));
-        Some(Subscription {
+        Ok(Some(Subscription {
             delivery_base,
+            _room_permit: room_permit,
             room_id,
             game_id,
             anchor,
             events: events.subscribe(),
             session: Arc::clone(self),
             active: true,
-        })
+        }))
+    }
+
+    fn waiter(self: &Arc<Self>) -> Option<Waiter> {
+        let mut life = lock(&self.lifecycle);
+        if !life.begin_attach(NativeMoment(Instant::now())) {
+            if life.is_closing() {
+                self.idle.send_replace(None);
+                self.stop.cancel();
+            }
+            return None;
+        }
+        self.idle.send_replace(None);
+        Some(Waiter(Arc::clone(self)))
+    }
+    fn release_waiter(&self) {
+        let mut life = lock(&self.lifecycle);
+        self.apply_idle(life.end_attach(NativeMoment(Instant::now())));
+        if life.pending_attaches() == 0 {
+            self.no_waiters.notify_waiters();
+        }
+    }
+    fn apply_idle(&self, action: IdleAction<NativeMoment>) {
+        match action {
+            IdleAction::Unchanged => {}
+            IdleAction::Schedule(at) => {
+                self.idle.send_replace(Some(at.0));
+            }
+            IdleAction::Close => {
+                self.idle.send_replace(None);
+                self.stop.cancel();
+            }
+        }
+    }
+    async fn until_no_waiters(&self) {
+        loop {
+            let notified = self.no_waiters.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if lock(&self.lifecycle).pending_attaches() == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn release(&self) {
@@ -1254,6 +1411,9 @@ impl Session {
             self.upstream.send_replace(UpstreamStatus::Closed);
         }
         if lock(&self.lifecycle).complete_cleanup() {
+            let mut permits = lock(&self.permits);
+            permits.starting.take();
+            permits.session.take();
             self.done.notify_waiters();
         }
     }

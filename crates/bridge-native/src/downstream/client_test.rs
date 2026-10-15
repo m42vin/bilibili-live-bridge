@@ -171,3 +171,64 @@ async fn duplicate_processed_event_is_acknowledged_and_sequence_gap_is_rejected(
         assert!(client.await.unwrap().unwrap_err().contains("不连续"));
     }).await.unwrap();
 }
+
+#[test]
+fn retry_advice_and_jitter_keep_a_positive_bounded_backoff() {
+    assert_eq!(
+        retry_delay(Duration::from_secs(2), None, 0),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        retry_delay(Duration::from_secs(2), Some(3000), 20),
+        Duration::from_millis(3600)
+    );
+    assert!(
+        retry_delay(Duration::from_secs(2), Some(u64::MAX), 20)
+            <= Duration::from_secs(2 * 24 * 60 * 60)
+    );
+}
+
+#[tokio::test]
+async fn temporary_resource_errors_retry_without_discarding_the_processed_cursor() {
+    for (code, advice) in [
+        ("server_busy", Some(1)),
+        ("rate_limited", None),
+        ("subscription_limit", Some(0)),
+    ] {
+        let (listener, settings) = fixture().await;
+        let client =
+            tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+        timeout(Duration::from_secs(12),async {
+            let mut peer=subscriber(&listener,None).await;
+            send(&mut peer,ready(0,false)).await;
+            send(&mut peer,json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"TEST","data":null})).await;
+            let Message::Text(ack)=peer.next().await.unwrap().unwrap() else {panic!("应在重试前确认业务处理");};
+            assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"],1);
+            let mut reply=json!({"type":"error","code":code,"message":"busy"});
+            if let Some(ms)=advice {reply["retry_after_ms"]=json!(ms);}
+            send(&mut peer,reply).await;
+            // 应答关闭，使客户端不用等待清理超时；随后直接等待重连请求。
+            while let Some(Ok(message))=peer.next().await {
+                if matches!(message,Message::Close(_)) {let _=peer.flush().await;break;}
+            }
+            let mut peer=subscriber(&listener,Some(1)).await;
+            send(&mut peer,ready(1,true)).await;send(&mut peer,json!({"type":"closed"})).await;
+            assert_eq!(client.await.unwrap(),Ok(()));
+        }).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn http_busy_response_retries_without_service_access_credentials() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (listener, settings) = fixture().await;
+    let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+    timeout(Duration::from_secs(12),async {
+        let (mut stream,_)=listener.accept().await.unwrap();
+        let mut buffer=[0;4096];let _=stream.read(&mut buffer).await.unwrap();
+        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n").await.unwrap();drop(stream);
+        let mut peer=subscriber(&listener,None).await;
+        send(&mut peer,ready(0,false)).await;send(&mut peer,json!({"type":"closed"})).await;
+        assert_eq!(client.await.unwrap(),Ok(()));
+    }).await.unwrap();
+}

@@ -79,6 +79,16 @@ cargo run --locked --bin multi_client
 | `BILIBILI_ACCESS_KEY_SECRET` | 是 | 无 | 开放平台 Access Key Secret |
 | `BILIBILI_APP_ID` | 是 | 无 | 项目 ID，必须是大于 0 的 `i64` 整数 |
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
+| `BRIDGE_MAX_CONNECTIONS` | 否 | `512` | 全部下游连接，含握手和等待订阅 |
+| `BRIDGE_MAX_HANDSHAKES` | 否 | `32` | 正在执行下游 HTTP→WS 升级的连接 |
+| `BRIDGE_MAX_PENDING_ATTACHES` | 否 | `64` | 等待接入结果的请求，含进程内和同码等待者 |
+| `BRIDGE_MAX_STARTING_SESSIONS` | 否 | `4` | 平台开启、上游连接与鉴权任务，含失败清理 |
+| `BRIDGE_MAX_SESSIONS` | 否 | `64` | 建立、活动及清理中的会话；结束日志不计入 |
+| `BRIDGE_START_RATE_PER_SEC` | 否 | `1` | 实际 start 请求每秒补充配额，失败不退还 |
+| `BRIDGE_START_BURST` | 否 | `2` | start 令牌桶突发容量 |
+| `BRIDGE_MAX_SUBSCRIBERS_PER_ROOM` | 否 | `32` | 每房间活动订阅数，含进程内订阅 |
+| `BRIDGE_CLIENT_MESSAGE_RATE_PER_SEC` | 否 | `1000` | 每连接入站业务消息补充速率，含 ACK |
+| `BRIDGE_CLIENT_MESSAGE_BURST` | 否 | `2000` | 每连接业务消息突发容量；控制帧不消耗 |
 | `BRIDGE_EVENT_RETENTION_SECS` | 否 | `300` | 内存事件与结束流保留时间，正整数秒 |
 | `BRIDGE_EVENT_LOG_MAX_BYTES` | 否 | `33554432` | 全部流共享的事件日志字节预算，正整数；不代表进程 RSS 上限 |
 | `BRIDGE_EVENT_LOG_MAX_STREAMS` | 否 | `128` | 活动与结束流数量上限，正整数 |
@@ -125,6 +135,27 @@ cargo run --locked --bin server
 最后一个客户端离开后保留上游 30 秒，期间重连复用原场次；上述原实时模式不补发，确认模式可按游标续传。
 Ctrl-C 或 Unix SIGTERM 会停止接入并等待清理。完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
+### 第一阶段资源保护
+
+上述资源默认值用于工程试运行，不代表平台官方配额。全部值须在 `1..=u32::MAX` 内，
+握手上限不能超过连接上限，开场上限不能超过会话上限。遇到资源不足立即拒绝，不排无界队列。
+server 创建一份 `ResourceBudget` 注入 Manager；连接、Manager 克隆和进程内接入共享它。
+库构造器也默认启用同一组限制；可在克隆或接入前通过 `with_resource_budget` 注入自定义预算。
+
+同码复用已有会话不消耗 start 令牌或开场并发；未知身份码先通过准入，取得房间号后才合并。
+失败的 start 也消耗频率额度；取消等待立即退还待接入名额，共享后台任务继续维护已开启场次。
+会话名额在 end 等必要清理完成后归还；日志保留不延长该名额占用。
+活动流续传仍需房间订阅名额，结束流回放只占连接及接入请求额度。
+
+暂时错误为 `server_busy`、`rate_limited` 和 `subscription_limit`，可附带 `retry_after_ms`。
+升级前尽力返回 HTTP 503 和 Retry-After；资源不足以回应时直接断开，不另起拒绝任务。
+消息超额在 JSON 解析前结束连接；重复 ACK 可以接受，但仍计入消息频率。
+`ResourceBudget::snapshot()` 提供当前五类名额占用、活动订阅、start 调用及分类拒绝累计数；
+结构化日志以固定资源名记录取得、释放和拒绝，不包含身份码。
+
+公网入口的代理、TLS、用户认证和按 IP 配额均不在此阶段；客户端只需主播身份码。
+发送字节预算、历史回放限速和失败身份码冷却留待后续实现。
+
 ### 下游客户端示例
 
 先在一个终端配置平台凭据并启动 `server`，再在另一个终端运行：
@@ -145,13 +176,15 @@ BRIDGE_URL='ws://127.0.0.1:8080/ws' RUST_LOG=info,downstream_client=debug cargo 
 上游 reconnecting / connected 状态和 resume_unavailable。网络接收和业务处理分开，
 处理成功后更新进程内游标并发送累计 ACK，正文在 debug 日志中输出。
 
-下游网络失败、关闭帧或 90 秒无入站活动时，按 2、4、8、10 秒退避重连，
+下游网络失败、关闭帧或 90 秒无入站活动时，按 2、4、8、10 秒基础退避加 0–20% 抖动重连，
 带回最后连续处理完成的 `resume_after`；订阅保持 60 秒后，下次故障从 2 秒重新退避。
 保留范围内补发桥已记录的事件，重复事件按流标识与序号去重，序号出现缺口时报错退出。
 上游恢复时保持下游连接等待；上游没有到达桥的事件无法补发。
 
-收到 closed 正常退出；接入错误、续传不可用、无效消息或 HTTP 4xx 握手拒绝
-（429 除外）时报错退出，不自动放弃游标重新开启场次。桥重启或日志过期后无法续传。
+收到 closed 正常退出；server_busy、rate_limited、subscription_limit 和 HTTP 429/503 采用退避重试，
+等待至少为基础退避与 retry_after_ms 建议的较大者，再增加抖动（远端建议最多采纳一天）。
+缺少建议值也可重试；重试保留进程内已处理游标。attach_failed、invalid_request、续传不可用、
+无效消息或其他 HTTP 4xx 握手拒绝时报错退出，不自动放弃游标重新开启场次。桥重启或日志过期后无法续传。
 示例只在进程内保留游标，需要跨客户端重启恢复时应将业务结果和游标一起持久化。
 Ctrl-C 可中断建连、事件等待和退避，关闭清理最多等待 2 秒。
 握手和单次发送最多等待 10 秒。完整 ACK、范围和错误语义见 [客户端协议](docs/downstream-protocol.md)。

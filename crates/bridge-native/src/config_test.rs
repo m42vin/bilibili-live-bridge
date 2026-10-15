@@ -319,3 +319,46 @@ fn loads_delivery_policy_and_rejects_invalid_limits() {
         }
     }
 }
+
+#[test]
+fn resource_defaults_limits_and_conflicts_are_checked() {
+    assert_eq!(
+        load(&required_vars()).unwrap().resource_policy(),
+        ResourcePolicy::default()
+    );
+    for key in [
+        ENV_MAX_CONNECTIONS,
+        ENV_MAX_HANDSHAKES,
+        ENV_MAX_PENDING_ATTACHES,
+        ENV_MAX_STARTING_SESSIONS,
+        ENV_MAX_SESSIONS,
+        ENV_MAX_SUBSCRIBERS_PER_ROOM,
+        ENV_START_RATE_PER_SEC,
+        ENV_START_BURST,
+        ENV_CLIENT_MESSAGE_RATE_PER_SEC,
+        ENV_CLIENT_MESSAGE_BURST,
+    ] {
+        for value in ["0", "-1", "bad", "4294967296", "18446744073709551616"] {
+            let mut vars = required_vars();
+            vars.push((key, value));
+            assert!(
+                matches!(load(&vars),Err(ConfigError::Invalid {var,..}) if var==key),
+                "{key}={value}"
+            );
+        }
+    }
+    for (key, value) in [
+        (ENV_MAX_HANDSHAKES, "513"),
+        (ENV_MAX_STARTING_SESSIONS, "65"),
+    ] {
+        let mut vars = required_vars();
+        vars.push((key, value));
+        assert!(matches!(load(&vars),Err(ConfigError::Invalid {var,..}) if var==key));
+    }
+    let mut vars = required_vars();
+    vars.push((ENV_MAX_PENDING_ATTACHES, "3"));
+    vars.push((ENV_START_BURST, "5"));
+    let p = load(&vars).unwrap().resource_policy();
+    assert_eq!(p.max_pending_attaches, 3);
+    assert_eq!(p.start.burst, 5);
+}

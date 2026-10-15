@@ -66,6 +66,8 @@ fn policy_manager(mock: &Arc<Mock>, every: Duration, policy: HeartbeatPolicy) ->
             ..super::super::UpstreamPolicy::default()
         },
     )
+    .with_resource_budget(crate::resource::ResourceBudget::for_tests())
+    .unwrap()
 }
 
 #[tokio::test(start_paused = true)]

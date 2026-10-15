@@ -81,3 +81,5 @@ pub mod open_live;
 pub mod session;
 
 mod policy;
+
+pub mod resource;
