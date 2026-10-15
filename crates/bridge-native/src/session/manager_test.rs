@@ -68,7 +68,13 @@ async fn heartbeat_and_background_cleanup_failures_are_logged() {
         super::lock(&manager.state.beats)
             .get_mut("game-1")
             .unwrap()
-            .last_confirmed = tokio::time::Instant::now() - Duration::from_secs(46);
+            .recovery = bridge_core::session::recovery::HeartbeatRecovery::new(
+            manager.state.heartbeat_policy,
+            manager.state.app_heartbeat,
+            crate::session::recovery::NativeMoment(
+                tokio::time::Instant::now() - Duration::from_secs(46),
+            ),
+        );
         manager.beat_once().await;
         let _ = manager.shutdown().await;
     }

@@ -14,9 +14,11 @@ use tracing::instrument::WithSubscriber;
 use super::delivery::{DeliveryError, DeliveryPolicy, DeliverySubscription, EventCursor, EventLog};
 use super::error::SessionError;
 use super::platform::{LivePlatform, LiveSocket, Platform};
+use super::recovery::NativeMoment;
 use crate::config::Config;
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
+use bridge_core::session::recovery::HeartbeatRecovery;
 
 #[path = "heartbeat.rs"]
 mod heartbeat;
@@ -538,9 +540,7 @@ struct State {
 
 struct BeatSlot {
     session: Weak<Session>,
-    last_confirmed: Instant,
-    failures: u32,
-    retry_at: Option<Instant>,
+    recovery: HeartbeatRecovery<NativeMoment>,
     normal_due: Option<Instant>,
     in_flight: bool,
 }
@@ -807,9 +807,11 @@ impl State {
             game_id.to_owned(),
             BeatSlot {
                 session: Arc::downgrade(session),
-                last_confirmed: Instant::now(),
-                failures: 0,
-                retry_at: None,
+                recovery: HeartbeatRecovery::new(
+                    self.heartbeat_policy,
+                    self.app_heartbeat,
+                    NativeMoment(Instant::now()),
+                ),
                 normal_due: None,
                 in_flight: false,
             },

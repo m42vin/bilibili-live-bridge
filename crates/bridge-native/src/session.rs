@@ -28,3 +28,5 @@ pub use manager::{
     HeartbeatPolicy, Manager, ManagerOptions, ReconnectPolicy, RecvError, Subscription,
     UpstreamPolicy, UpstreamStatus,
 };
+
+mod recovery;

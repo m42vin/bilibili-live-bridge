@@ -4,14 +4,16 @@ use std::future::Future;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
-use tokio::time::{Instant, sleep, sleep_until, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use super::{Session, State, close_socket, until_idle};
 use crate::open_live::api::StartResult;
 use crate::open_live::ws::{LiveEvent, WsError};
 use crate::session::platform::LiveSocket;
 
+use crate::session::recovery::NativeMoment;
 use bridge_core::session::failure::UpstreamFailure;
+use bridge_core::session::recovery::UpstreamRecovery;
 pub use bridge_core::session::{ReconnectPolicy, UpstreamPolicy};
 
 /// 当前上游状态。状态流是可合并中间变化的最新快照。
@@ -25,12 +27,6 @@ pub enum UpstreamStatus {
     Closed,
 }
 
-struct Recovery {
-    deadline: Instant,
-    failures: u32,
-    attempts: u32,
-}
-
 pub(super) async fn run(
     state: Arc<State>,
     session: Arc<Session>,
@@ -40,16 +36,15 @@ pub(super) async fn run(
 ) {
     let policy = state.upstream_policy;
     let mut socket = Some(socket);
-    let mut connected_at = Instant::now();
-    let mut recovery: Option<Recovery> = None;
+    let mut recovery = UpstreamRecovery::new(policy, NativeMoment(Instant::now()));
     tracing::info!("直播间会话已建立");
     loop {
-        let stable_at = connected_at + policy.health.activity_timeout;
+        let stable_at = recovery.stable_at().map(|at| at.0);
         let result = active(&session, async {
             tokio::select! {
                 biased;
                 incoming = socket.as_mut().unwrap().recv() => Some(incoming),
-                _ = sleep_until(stable_at), if recovery.is_some() => None,
+                _ = until_idle(stable_at), if stable_at.is_some() => None,
             }
         })
         .await;
@@ -58,14 +53,12 @@ pub(super) async fn run(
         };
         match result {
             None => {
-                recovery = None;
+                recovery.observe_healthy(NativeMoment(Instant::now()));
                 tracing::debug!("上游持续健康，清除恢复预算");
                 continue;
             }
             Some(Ok(Some(event))) => {
-                if recovery.is_some() && Instant::now() >= stable_at {
-                    recovery = None;
-                }
+                recovery.observe_healthy(NativeMoment(Instant::now()));
                 let ends = event.ends_push();
                 tracing::debug!(cmd = event.cmd(), "转发直播间事件");
                 if state.log.append(&session.stream_id, &event).is_err() {
@@ -89,25 +82,21 @@ pub(super) async fn run(
                 tracing::info!("官方长连接已关闭");
             }
         }
-        let Some(reconnect) = policy.reconnect else {
+        if policy.reconnect.is_none() {
             break;
-        };
-        let window = recovery.get_or_insert_with(|| Recovery {
-            deadline: Instant::now() + reconnect.failure_timeout,
-            failures: 0,
-            attempts: 0,
-        });
-        if Instant::now() >= window.deadline {
+        }
+        if !recovery.disconnected(NativeMoment(Instant::now())) {
             tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), reason = "reconnect_deadline", "上游恢复预算已耗尽");
             drop(socket.take());
             break;
         }
+        let deadline = recovery.deadline().expect("已开启恢复窗口").0;
         session.upstream.send_replace(UpstreamStatus::Reconnecting);
         let old = socket.take().unwrap();
         let endpoint = old.endpoint().map(str::to_owned);
         if !matches!(
             timeout_at(
-                window.deadline,
+                deadline,
                 active(
                     &session,
                     close_socket(old, started.game_id(), started.anchor().room_id)
@@ -123,15 +112,13 @@ pub(super) async fn run(
             &session,
             &started,
             endpoint.as_deref(),
-            reconnect,
-            window,
+            &mut recovery,
         )
         .await;
         let Some(restored) = restored else {
             break;
         };
         socket = Some(restored);
-        connected_at = Instant::now();
         session.upstream.send_replace(UpstreamStatus::Connected);
         tracing::info!("原场次上游已恢复");
     }
@@ -157,38 +144,37 @@ async fn restore(
     session: &Session,
     started: &StartResult,
     endpoint: Option<&str>,
-    policy: ReconnectPolicy,
-    recovery: &mut Recovery,
+    recovery: &mut UpstreamRecovery<NativeMoment>,
 ) -> Option<Box<dyn LiveSocket>> {
     loop {
-        if Instant::now() >= recovery.deadline || session.stop.is_cancelled() {
+        if session.stop.is_cancelled() {
             return None;
         }
-        recovery.attempts = recovery.attempts.saturating_add(1);
+        let attempt = recovery.begin_attempt(NativeMoment(Instant::now()))?;
+        let deadline = recovery.deadline().expect("已开启恢复窗口").0;
         tracing::info!(
-            attempt = recovery.attempts,
-            remaining_secs = recovery
-                .deadline
+            attempt,
+            remaining_secs = deadline
                 .saturating_duration_since(Instant::now())
                 .as_secs_f64(),
             "尝试恢复官方长连接"
         );
         match timeout_at(
-            recovery.deadline,
+            deadline,
             active(session, state.platform.reconnect(started, endpoint)),
         )
         .await
         {
             Ok(Some(Ok(socket))) => {
                 // timeout_at 可能先轮询已就绪的建连 future，再检查期限。
-                if Instant::now() >= recovery.deadline || session.stop.is_cancelled() {
+                if session.stop.is_cancelled() || !recovery.restored(NativeMoment(Instant::now())) {
                     drop(socket);
                     return None;
                 }
                 return Some(socket);
             }
             Ok(Some(Err(error))) => {
-                tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), attempt = recovery.attempts, %error, "恢复官方长连接失败");
+                tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), attempt, %error, "恢复官方长连接失败");
                 if !retryable(&error) {
                     return None;
                 }
@@ -198,15 +184,10 @@ async fn restore(
                 return None;
             }
         }
-        recovery.failures = recovery.failures.saturating_add(1);
-        let delay = policy.retry_delay(recovery.failures, jitter());
-        tracing::debug!(
-            attempt = recovery.attempts,
-            delay_secs = delay.as_secs_f64(),
-            "上游恢复退避"
-        );
+        let delay = recovery.attempt_failed(NativeMoment(Instant::now()), jitter())?;
+        tracing::debug!(attempt, delay_secs = delay.as_secs_f64(), "上游恢复退避");
         if !matches!(
-            timeout_at(recovery.deadline, active(session, sleep(delay))).await,
+            timeout_at(deadline, active(session, sleep(delay))).await,
             Ok(Some(()))
         ) {
             return None;

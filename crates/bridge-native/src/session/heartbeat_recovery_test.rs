@@ -1,5 +1,8 @@
 use super::*;
+use crate::session::recovery::NativeMoment;
 use crate::session::{HeartbeatPolicy, Subscription};
+use bridge_core::session::failure::FailureKind;
+use bridge_core::session::recovery::{HeartbeatOutcome, HeartbeatRecovery};
 use tokio::time::Instant;
 
 fn platform_error(code: i64) -> ApiError {
@@ -29,7 +32,9 @@ fn retry_at(manager: &Manager, game_id: &str) -> Instant {
     super::super::lock(&manager.state.beats)
         .get(game_id)
         .unwrap()
-        .retry_at
+        .recovery
+        .retry_at()
+        .map(|at| at.0)
         .unwrap()
 }
 
@@ -84,9 +89,9 @@ async fn transient_error_recovers_and_returns_to_shared_schedule() {
     {
         let beats = super::super::lock(&manager.state.beats);
         let slot = beats.get("game-000").unwrap();
-        assert_eq!(slot.last_confirmed, first_retry);
-        assert_eq!(slot.failures, 0);
-        assert!(slot.retry_at.is_none());
+        assert_eq!(slot.recovery.last_confirmed().0, first_retry);
+        assert_eq!(slot.recovery.failures(), 0);
+        assert!(slot.recovery.retry_at().is_none());
     }
     advance_to(origin + Duration::from_secs(40)).await;
     assert_eq!(
@@ -97,8 +102,8 @@ async fn transient_error_recovers_and_returns_to_shared_schedule() {
     {
         let beats = super::super::lock(&manager.state.beats);
         let slot = beats.get("game-000").unwrap();
-        assert_eq!(slot.failures, 1);
-        assert_eq!(slot.last_confirmed, first_retry);
+        assert_eq!(slot.recovery.failures(), 1);
+        assert_eq!(slot.recovery.last_confirmed().0, first_retry);
     }
     assert!(mock.ends().is_empty());
     assert_eq!(mock.heartbeat_peak.load(Ordering::SeqCst), 1);
@@ -154,7 +159,7 @@ async fn request_timeout_is_retryable_and_a_later_request_recovers() {
     assert_eq!(mock.batches().len(), 2);
     {
         let beats = super::super::lock(&manager.state.beats);
-        assert!(beats.get("game-000").unwrap().retry_at.is_none());
+        assert!(beats.get("game-000").unwrap().recovery.retry_at().is_none());
     }
     assert!(mock.ends().is_empty());
     assert_eq!(mock.heartbeat_peak.load(Ordering::SeqCst), 1);
@@ -194,7 +199,7 @@ async fn unknown_and_ambiguous_expiration_errors_preserve_multi_id_sessions() {
         assert!(
             super::super::lock(&manager.state.beats)
                 .values()
-                .all(|slot| slot.retry_at.is_some())
+                .all(|slot| slot.recovery.retry_at().is_some())
         );
         let _ = manager.shutdown().await;
     }
@@ -236,7 +241,8 @@ async fn access_limits_do_not_increase_request_frequency() {
             super::super::lock(&manager.state.beats)
                 .get("game-000")
                 .unwrap()
-                .retry_at
+                .recovery
+                .retry_at()
                 .is_none()
         );
         let _ = manager.shutdown().await;
@@ -281,8 +287,11 @@ async fn normal_tick_has_priority_when_retry_is_due_at_the_same_instant() {
     {
         let mut beats = super::super::lock(&manager.state.beats);
         let retry = beats.get_mut("game-000").unwrap();
-        retry.retry_at = Some(origin + Duration::from_secs(20));
-        retry.failures = 1;
+        retry.recovery.complete(
+            NativeMoment(origin + Duration::from_secs(18)),
+            HeartbeatOutcome::Failure(FailureKind::Retryable),
+            100,
+        );
     }
     manager.state.heartbeat_wake.notify_one();
     advance_to(origin + Duration::from_secs(20)).await;
@@ -333,7 +342,11 @@ async fn late_success_does_not_revive_an_expired_member_of_an_inflight_batch() {
     super::super::lock(&manager.state.beats)
         .get_mut("game-000")
         .unwrap()
-        .last_confirmed = origin - Duration::from_secs(20);
+        .recovery = HeartbeatRecovery::new(
+        manager.state.heartbeat_policy,
+        manager.state.app_heartbeat,
+        NativeMoment(origin - Duration::from_secs(20)),
+    );
     advance_to(origin + Duration::from_secs(20)).await;
     advance_to(retry_at(&manager, "game-000")).await;
     entered.wait_for(|entered| *entered).await.unwrap();
@@ -348,7 +361,7 @@ async fn late_success_does_not_revive_an_expired_member_of_an_inflight_batch() {
     assert!(!super::super::lock(&manager.state.beats).contains_key("game-000"));
     {
         let beats = super::super::lock(&manager.state.beats);
-        assert!(beats.get("game-001").unwrap().retry_at.is_none());
+        assert!(beats.get("game-001").unwrap().recovery.retry_at().is_none());
     }
     mock.connection(1).emit(danmaku("survives"));
     assert_eq!(text(&subscriptions[1].recv().await.unwrap()), "survives");
@@ -379,7 +392,7 @@ async fn late_failure_does_not_close_a_replacement_registration() {
     settle().await;
     {
         let beats = super::super::lock(&manager.state.beats);
-        assert!(beats.get("game-000").unwrap().retry_at.is_none());
+        assert!(beats.get("game-000").unwrap().recovery.retry_at().is_none());
         assert!(!beats.get("game-000").unwrap().in_flight);
     }
     mock.connection(2).emit(danmaku("new registration"));

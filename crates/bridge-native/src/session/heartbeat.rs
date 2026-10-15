@@ -10,6 +10,8 @@ use super::{Session, State, Stop, lock, until_idle};
 use crate::open_live::api::{BatchHeartbeatResult, MAX_BATCH_HEARTBEAT, REQUEST_TIMEOUT};
 use crate::open_live::error::ApiError;
 use crate::session::platform::BoxFuture;
+use crate::session::recovery::NativeMoment;
+use bridge_core::session::recovery::{HeartbeatDecision, HeartbeatOutcome};
 
 pub use bridge_core::session::HeartbeatPolicy;
 use bridge_core::session::failure::{self, ApiFailure, FailureKind};
@@ -81,29 +83,20 @@ fn close_sessions(closing: Vec<Closing>) {
     }
 }
 
-fn recovery_deadline(state: &State, confirmed: Instant) -> Instant {
-    // 极端时钟边界下尽早结束恢复，不能让后台任务因加法溢出而退出。
-    confirmed
-        .checked_add(state.heartbeat_policy.failure_timeout)
-        .unwrap_or(confirmed)
-}
-
 fn expire_recoveries(state: &State) {
     let now = Instant::now();
     let closing = {
         let mut beats = lock(&state.beats);
         let closing: Vec<_> = beats
             .iter()
-            .filter(|(_, slot)| {
-                slot.retry_at.is_some() && recovery_deadline(state, slot.last_confirmed) <= now
-            })
+            .filter(|(_, slot)| slot.recovery.expired(NativeMoment(now)))
             .map(|(game_id, slot)| Closing {
                 beat: PendingBeat {
                     game_id: game_id.clone(),
                     session: slot.session.clone(),
                 },
                 reason: "recovery_budget_exhausted",
-                failures: slot.failures,
+                failures: slot.recovery.failures(),
             })
             .collect();
         for close in &closing {
@@ -177,53 +170,40 @@ fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome)
                 continue;
             }
             slot.in_flight = false;
-            let reason = if failed.contains(beat.game_id.as_str()) {
-                Some("failed_game_id")
+            let outcome = if failed.contains(beat.game_id.as_str()) {
+                HeartbeatOutcome::FailedGame
             } else if let Some(kind) = kind {
-                slot.failures = slot.failures.saturating_add(1);
-                let deadline = recovery_deadline(state, slot.last_confirmed);
-                if kind == FailureKind::Permanent {
-                    Some("permanent_error")
-                } else if deadline <= now {
-                    Some("recovery_budget_exhausted")
-                } else {
-                    let delay = state.heartbeat_policy.retry_delay_for(
-                        kind,
-                        state.app_heartbeat,
-                        slot.failures,
-                        jitter,
-                    );
-                    slot.retry_at = Some(now.checked_add(delay).unwrap_or(deadline));
+                HeartbeatOutcome::Failure(kind)
+            } else {
+                HeartbeatOutcome::Confirmed
+            };
+            let reason = match slot.recovery.complete(NativeMoment(now), outcome, jitter) {
+                HeartbeatDecision::Close(reason) => Some(reason.label()),
+                HeartbeatDecision::Retry { delay, deadline } => {
                     slot.normal_due = None;
                     tracing::warn!(
                         game_id = %beat.game_id,
-                        error_category = kind.label(),
+                        error_category = kind.expect("重试只可能来自请求失败").label(),
                         ?platform_code,
-                        failures = slot.failures,
+                        failures = slot.recovery.failures(),
                         retry_delay_secs = delay.as_secs_f64(),
-                        remaining_budget_secs = deadline.duration_since(now).as_secs_f64(),
+                        remaining_budget_secs = deadline.0.duration_since(now).as_secs_f64(),
                         "项目心跳等待重试"
                     );
                     None
                 }
-            } else {
-                if slot.failures > 0 {
-                    tracing::info!(
-                        game_id = %beat.game_id,
-                        failures = slot.failures,
-                        "项目心跳已恢复"
-                    );
+                HeartbeatDecision::Confirmed { previous_failures } => {
+                    if previous_failures > 0 {
+                        tracing::info!(game_id = %beat.game_id, failures = previous_failures, "项目心跳已恢复");
+                    }
+                    None
                 }
-                slot.last_confirmed = now;
-                slot.failures = 0;
-                slot.retry_at = None;
-                None
             };
             if let Some(reason) = reason {
                 closing.push(Closing {
                     beat: beat.clone(),
                     reason,
-                    failures: slot.failures,
+                    failures: slot.recovery.failures(),
                 });
             }
         }
@@ -238,7 +218,7 @@ fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome)
 fn mark_normal_due(state: &State) {
     let now = Instant::now();
     for slot in lock(&state.beats).values_mut() {
-        if slot.retry_at.is_none() && !slot.in_flight {
+        if slot.recovery.retry_at().is_none() && !slot.in_flight {
             slot.normal_due.get_or_insert(now);
         }
     }
@@ -253,13 +233,9 @@ fn take_batch(state: &State) -> Vec<PendingBeat> {
         if slot.in_flight {
             continue;
         }
-        if let Some(at) = slot.retry_at {
+        if let Some(at) = slot.recovery.retry_at().map(|at| at.0) {
             if at <= now {
-                retry.push((
-                    recovery_deadline(state, slot.last_confirmed),
-                    at,
-                    id.clone(),
-                ));
+                retry.push((slot.recovery.deadline().0, at, id.clone()));
             }
         } else if let Some(at) = slot.normal_due {
             normal.push((at, at, id.clone()));
@@ -286,16 +262,7 @@ fn take_batch(state: &State) -> Vec<PendingBeat> {
 fn next_timer(state: &State, in_flight: bool) -> Option<Instant> {
     lock(&state.beats)
         .values()
-        .filter_map(|slot| {
-            slot.retry_at.map(|at| {
-                let deadline = recovery_deadline(state, slot.last_confirmed);
-                if in_flight {
-                    deadline
-                } else {
-                    deadline.min(at)
-                }
-            })
-        })
+        .filter_map(|slot| slot.recovery.next_deadline(in_flight).map(|at| at.0))
         .min()
 }
 
