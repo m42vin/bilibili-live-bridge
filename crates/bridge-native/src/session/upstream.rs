@@ -132,7 +132,7 @@ pub(super) async fn run(
     }
     state.log.finish(&session.stream_id);
     state.unlink(&session);
-    session.phase.send_replace(super::Phase::Closed);
+    session.publish_closed();
     drop(events);
     session.upstream.send_replace(UpstreamStatus::Closed);
     tracing::info!("直播间会话已结束");

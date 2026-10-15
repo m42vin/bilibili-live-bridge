@@ -48,7 +48,8 @@ cargo tree --locked -p bridge-core
 | 官方连接、鉴权和心跳 | [conn.rs](../crates/bridge-native/src/open_live/ws/conn.rs) | [conn_test.rs](../crates/bridge-native/src/open_live/ws/conn_test.rs) |
 | 二进制包与压缩 | [packet.rs](../crates/bridge-core/src/open_live/ws/packet.rs) | [packet_test.rs](../crates/bridge-core/src/open_live/ws/packet_test.rs) |
 | 直播事件字段与命令 | [cmd.rs](../crates/bridge-core/src/open_live/ws/cmd.rs) | [cmd_test.rs](../crates/bridge-core/src/open_live/ws/cmd_test.rs) |
-| 会话复用、订阅与清理 | [manager.rs](../crates/bridge-native/src/session/manager.rs)、[platform.rs](../crates/bridge-native/src/session/platform.rs) | [manager_test.rs](../crates/bridge-native/src/session/manager_test.rs) |
+| 纯接入/关闭生命周期 | [lifecycle.rs](../crates/bridge-core/src/session/lifecycle.rs) | [lifecycle_test.rs](../crates/bridge-core/src/session/lifecycle_test.rs) |
+| 原生会话复用、订阅与清理 | [manager.rs](../crates/bridge-native/src/session/manager.rs)、[platform.rs](../crates/bridge-native/src/session/platform.rs) | [manager_test.rs](../crates/bridge-native/src/session/manager_test.rs) |
 | 纯策略、失败分类与退避 | [policy.rs](../crates/bridge-core/src/session/policy.rs)、[failure.rs](../crates/bridge-core/src/session/failure.rs) | [policy_test.rs](../crates/bridge-core/src/session/policy_test.rs)、[failure_test.rs](../crates/bridge-core/src/session/failure_test.rs) |
 | 纯恢复状态与截止时间 | [recovery.rs](../crates/bridge-core/src/session/recovery.rs) | [recovery_test.rs](../crates/bridge-core/src/session/recovery_test.rs) |
 | 原生心跳调度与恢复预算 | [heartbeat.rs](../crates/bridge-native/src/session/heartbeat.rs) | [heartbeat_test.rs](../crates/bridge-native/src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../crates/bridge-native/src/session/heartbeat_recovery_test.rs) |
@@ -125,7 +126,7 @@ RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 
 ### 修改会话生命周期
 
-先阅读架构说明中的 [状态与并发约束](architecture.md#状态与并发约束) 和 [关闭与失败处理](architecture.md#关闭与失败处理)。索引更新、订阅计数、停止信号与网络清理的顺序属于行为约束。
+先阅读架构说明中的 [状态与并发约束](architecture.md#状态与并发约束) 和 [关闭与失败处理](architecture.md#关闭与失败处理)。索引更新、订阅计数、停止信号与网络清理的顺序属于行为约束。纯状态修改放在 core 的 `session::lifecycle`，使用显式时间测试；native 负责在生命周期锁内应用状态并发布 watch 投影，在锁外执行网络清理。不要将 `begin_close` 与 `complete_cleanup` 合并，前者拒绝新接入，后者才允许同码重新开启及 shutdown 返回。
 
 根据改动选择相应的行为验证：
 

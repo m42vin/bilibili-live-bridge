@@ -20,7 +20,7 @@
 
 ## Workspace 结构
 
-- `bridge-core`：请求签名、API 数据模型与响应解析、官方二进制协议和事件、下游 JSON 协议、交付模型，以及健康/心跳/重连的纯策略、失败分类、退避计算及恢复状态。不依赖 Tokio、HTTP 客户端或系统网络。
+- `bridge-core`：请求签名、API 数据模型与响应解析、官方二进制协议和事件、下游 JSON 协议、交付模型，以及健康/心跳/重连的纯策略、失败分类、退避计算、恢复状态及接入/关闭生命周期。不依赖 Tokio、HTTP 客户端或系统网络。
 - `bridge-native`：原生 HTTP / WebSocket、会话管理、心跳与恢复、内存日志、配置、日志初始化和所有可执行入口，单向依赖 `bridge-core`。
 
 `bridge-native` 保留库名 `bilibili_live_bridge`，原公共类型路径通过重导出保持可用。Cargo 包名已从 `bilibili-live-bridge` 改为 `bridge-native`；外部项目的本地依赖改为：
@@ -31,7 +31,7 @@ bilibili-live-bridge = { package = "bridge-native", path = "../bilibili-live-bri
 ```
 
 在仓库根目录仍可执行 `cargo run --locked --bin server`。验证所有成员使用 `cargo test --locked --workspace`；仅验证纯核心使用 `cargo test --locked -p bridge-core`。
-心跳与上游恢复状态已移入 core，原生会话调度和接入/关闭生命周期仍在 native；尚不包含 Workers 运行时或持久化日志。
+心跳、上游恢复和单会话接入/关闭决策已移入 core；native 保留索引、锁、通知、网络清理及调度。尚不包含 Workers 运行时或持久化日志。
 
 ## 快速开始
 

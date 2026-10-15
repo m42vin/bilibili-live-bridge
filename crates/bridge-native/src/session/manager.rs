@@ -18,6 +18,10 @@ use super::recovery::NativeMoment;
 use crate::config::Config;
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
+pub use bridge_core::session::lifecycle::ManagerOptions;
+use bridge_core::session::lifecycle::{
+    AdmissionOwner, ClaimDecision, IdleAction, SessionLifecycle,
+};
 use bridge_core::session::recovery::HeartbeatRecovery;
 
 #[path = "heartbeat.rs"]
@@ -32,16 +36,6 @@ pub use upstream::{ReconnectPolicy, UpstreamPolicy, UpstreamStatus};
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 /// 尽力发送关闭帧的上限，不能让写端背压阻塞场次结束和本地清理。
 const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 会话生命周期选项。默认在最后一个订阅者离开后立即关闭。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ManagerOptions {
-    /// 最后一个订阅者离开后保留上游的时间。
-    ///
-    /// 宽限期内继续接收事件和发送两类心跳；新订阅复用原场次，但不回放期间的事件。
-    /// 上游结束、心跳失效和主动 shutdown 不等待这个时间。
-    pub idle_grace: Duration,
-}
 
 /// 直播桥上的全部会话。
 ///
@@ -572,14 +566,14 @@ impl State {
                     return Err(SessionError::ShuttingDown);
                 }
                 if let Some(existing) = tables.by_code.get(code).cloned() {
-                    if existing.is_joinable() {
-                        return Ok((existing, false));
+                    match existing.claim() {
+                        ClaimDecision::Reuse => return Ok((existing, false)),
+                        ClaimDecision::Replace => {
+                            remove_session(&mut tables, code, &existing);
+                            continue;
+                        }
+                        ClaimDecision::WaitForCleanup => Some(existing),
                     }
-                    if existing.is_finished() {
-                        remove_session(&mut tables, code, &existing);
-                        continue;
-                    }
-                    Some(existing)
                 } else {
                     let session = Session::starting(Arc::downgrade(self), self.options.idle_grace);
                     session.add_code(code.to_owned());
@@ -603,19 +597,18 @@ impl State {
         let mut leader = Leader {
             session: Arc::clone(&session),
             platform: Arc::clone(&self.platform),
-            game_id: None,
-            committed: false,
+            owner: AdmissionOwner::default(),
         };
         let started = match self.platform.start(code).await {
             Ok(started) => started,
             Err(error) => {
                 let error = SessionError::from_start(error);
-                leader.committed = true;
+                leader.owner.commit();
                 session.fail(error.clone());
                 return Err(error);
             }
         };
-        leader.game_id = Some(started.game_id().to_owned());
+        leader.owner.acquired(started.game_id().to_owned());
         session.set_game_id(started.game_id().to_owned());
         tracing::debug!(
             room_id = started.anchor().room_id,
@@ -634,8 +627,9 @@ impl State {
             }
             RoomDecision::Join(existing) => {
                 let game_id = leader
-                    .game_id
-                    .clone()
+                    .owner
+                    .game_id()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| started.game_id().to_owned());
                 tracing::info!(
                     room_id = started.anchor().room_id,
@@ -645,8 +639,8 @@ impl State {
                 if let Err(error) = self.platform.end(&game_id).await {
                     tracing::warn!(%game_id, %error, "关闭重复场次失败");
                 }
-                leader.game_id = None;
-                leader.committed = true;
+                leader.owner.release_game();
+                leader.owner.commit();
                 if self.stopping(&session) {
                     let error = self.stop_error();
                     session.fail(error.clone());
@@ -672,8 +666,8 @@ impl State {
             Some(Err(error)) => {
                 session.begin_close();
                 let end = self.platform.end(started.game_id()).await;
-                leader.game_id = None;
-                leader.committed = true;
+                leader.owner.release_game();
+                leader.owner.commit();
                 let error = SessionError::from_connect(error, end);
                 session.fail(error.clone());
                 return Err(error);
@@ -709,8 +703,8 @@ impl State {
             return abort(&mut leader, &session, self.stop_error()).await;
         };
 
-        leader.committed = true;
-        leader.game_id = None;
+        leader.owner.commit();
+        leader.owner.release_game();
         spawn_upstream(
             Arc::clone(self),
             Arc::clone(&session),
@@ -799,8 +793,8 @@ impl State {
     }
 
     fn register_beat(self: &Arc<Self>, game_id: &str, session: &Arc<Session>) -> bool {
-        let subscribers = lock(&session.subscribers);
-        if subscribers.closing || self.shutdown.load(Ordering::SeqCst) {
+        let lifecycle = lock(&session.lifecycle);
+        if lifecycle.is_closing() || self.shutdown.load(Ordering::SeqCst) {
             return false;
         }
         lock(&self.beats).insert(
@@ -817,7 +811,7 @@ impl State {
             },
         );
         // 与 begin_close 的关闭标记串行，避免它移除心跳后又重新登记。
-        drop(subscribers);
+        drop(lifecycle);
         self.ensure_heartbeat();
         self.heartbeat_wake.notify_one();
         true
@@ -899,17 +893,15 @@ enum RoomDecision {
 struct Leader {
     session: Arc<Session>,
     platform: Arc<dyn Platform>,
-    game_id: Option<String>,
-    committed: bool,
+    owner: AdmissionOwner,
 }
 
 impl Drop for Leader {
     fn drop(&mut self) {
-        if self.committed {
+        let Some(cancelled) = self.owner.cancel() else {
             return;
-        }
-        self.committed = true;
-        let game_id = self.game_id.take();
+        };
+        let game_id = cancelled.game_id;
         self.session.fail(SessionError::Closed);
         if let Some(game_id) = game_id {
             let platform = Arc::clone(&self.platform);
@@ -934,13 +926,13 @@ async fn abort(
     error: SessionError,
 ) -> Result<Subscription, SessionError> {
     session.begin_close();
-    if let Some(game_id) = leader.game_id.clone() {
+    if let Some(game_id) = leader.owner.game_id().map(str::to_owned) {
         if let Err(error) = leader.platform.end(&game_id).await {
             tracing::warn!(%game_id, %error, "接入中止后关闭场次失败");
         }
-        leader.game_id = None;
+        leader.owner.release_game();
     }
-    leader.committed = true;
+    leader.owner.commit();
     session.fail(error.clone());
     Err(error)
 }
@@ -1028,23 +1020,15 @@ struct Session {
     phase: watch::Sender<Phase>,
     upstream: watch::Sender<UpstreamStatus>,
     stop: Stop,
-    subscribers: Mutex<Subscribers>,
-    idle_grace: Duration,
+    lifecycle: Mutex<SessionLifecycle<NativeMoment>>,
     idle: watch::Sender<Option<Instant>>,
     codes: Mutex<Vec<String>>,
     room_id: Mutex<Option<i64>>,
     game_id: Mutex<Option<String>>,
-    finished: AtomicBool,
     done: Notify,
 }
 
-struct Subscribers {
-    count: usize,
-    closing: bool,
-    idle_deadline: Option<Instant>,
-}
-
-/// 接入状态通过 watch 发布；正在关闭另由订阅计数中的 closing 标记表达。
+/// 生命周期的通知投影，包含运行时资源；纯阶段及关闭决策以 lifecycle 为准。
 #[derive(Clone)]
 enum Phase {
     Starting,
@@ -1069,17 +1053,11 @@ impl Session {
             stream_id: uuid::Uuid::new_v4().to_string(),
             upstream: watch::channel(UpstreamStatus::Connected).0,
             stop: Stop::new(),
-            subscribers: Mutex::new(Subscribers {
-                count: 0,
-                closing: false,
-                idle_deadline: None,
-            }),
-            idle_grace,
+            lifecycle: Mutex::new(SessionLifecycle::starting(ManagerOptions { idle_grace })),
             idle,
             codes: Mutex::new(Vec::new()),
             room_id: Mutex::new(None),
             game_id: Mutex::new(None),
-            finished: AtomicBool::new(false),
             done: Notify::new(),
         })
     }
@@ -1108,20 +1086,25 @@ impl Session {
     }
 
     fn is_closing(&self) -> bool {
-        let mut subscribers = lock(&self.subscribers);
-        self.expire_idle_locked(&mut subscribers);
-        subscribers.closing
+        let mut lifecycle = lock(&self.lifecycle);
+        self.expire_idle_locked(&mut lifecycle);
+        lifecycle.is_closing()
     }
 
     fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::SeqCst)
+        lock(&self.lifecycle).is_finished()
+    }
+
+    fn claim(&self) -> ClaimDecision {
+        let mut lifecycle = lock(&self.lifecycle);
+        self.expire_idle_locked(&mut lifecycle);
+        lifecycle.claim()
     }
 
     fn is_joinable(&self) -> bool {
-        if self.is_finished() || self.is_closing() {
-            return false;
-        }
-        matches!(&*self.phase.borrow(), Phase::Starting | Phase::Ready { .. })
+        let mut lifecycle = lock(&self.lifecycle);
+        self.expire_idle_locked(&mut lifecycle);
+        lifecycle.is_joinable()
     }
 
     fn publish_ready(
@@ -1131,6 +1114,10 @@ impl Session {
         events: broadcast::Sender<Arc<LiveEvent>>,
     ) {
         let room_id = self.room_id().unwrap_or(anchor.room_id);
+        let mut lifecycle = lock(&self.lifecycle);
+        if !lifecycle.ready() {
+            return;
+        }
         self.phase.send_replace(Phase::Ready {
             room_id,
             game_id,
@@ -1141,8 +1128,10 @@ impl Session {
 
     fn try_subscribe(self: &Arc<Self>) -> Option<Subscription> {
         let (room_id, game_id, anchor, events) = {
-            let phase = self.phase.borrow();
-            match &*phase {
+            // 生命周期与通知投影在同一锁内发布；不能在关闭开始后增加订阅。
+            let mut lifecycle = lock(&self.lifecycle);
+            self.expire_idle_locked(&mut lifecycle);
+            let ready = match &*self.phase.borrow() {
                 Phase::Ready {
                     room_id,
                     game_id,
@@ -1150,19 +1139,17 @@ impl Session {
                     events,
                 } => Some((*room_id, game_id.clone(), anchor.clone(), events.clone())),
                 _ => None,
-            }
-        }?;
-        {
-            // Ready 与正在关闭可以同时存在，必须在计数锁内再次确认能否加入。
-            let mut subscribers = lock(&self.subscribers);
-            self.expire_idle_locked(&mut subscribers);
-            if subscribers.closing {
+            }?;
+            if !lifecycle.subscribe(NativeMoment(Instant::now())) {
+                if lifecycle.is_closing() {
+                    self.idle.send_replace(None);
+                    self.stop.cancel();
+                }
                 return None;
             }
-            subscribers.count += 1;
-            subscribers.idle_deadline = None;
             self.idle.send_replace(None);
-        }
+            ready
+        };
         let delivery_base = self
             .state
             .upgrade()
@@ -1179,42 +1166,35 @@ impl Session {
     }
 
     fn release(&self) {
-        let mut subscribers = lock(&self.subscribers);
-        subscribers.count = subscribers.count.saturating_sub(1);
-        if subscribers.count == 0 && !subscribers.closing {
-            if self.idle_grace.is_zero() {
-                subscribers.closing = true;
+        let mut lifecycle = lock(&self.lifecycle);
+        match lifecycle.release(NativeMoment(Instant::now())) {
+            IdleAction::Unchanged => {}
+            IdleAction::Schedule(deadline) => {
+                self.idle.send_replace(Some(deadline.0));
+            }
+            IdleAction::Close => {
+                self.idle.send_replace(None);
                 self.stop.cancel();
-            } else {
-                let deadline = Instant::now() + self.idle_grace;
-                subscribers.idle_deadline = Some(deadline);
-                self.idle.send_replace(Some(deadline));
             }
         }
     }
 
     fn expire_idle(&self) -> bool {
-        self.expire_idle_locked(&mut lock(&self.subscribers))
+        self.expire_idle_locked(&mut lock(&self.lifecycle))
     }
 
-    fn expire_idle_locked(&self, subscribers: &mut Subscribers) -> bool {
-        if !subscribers.closing
-            && subscribers.count == 0
-            && subscribers
-                .idle_deadline
-                .is_some_and(|deadline| deadline <= Instant::now())
-        {
-            subscribers.closing = true;
-            subscribers.idle_deadline = None;
+    fn expire_idle_locked(&self, lifecycle: &mut SessionLifecycle<NativeMoment>) -> bool {
+        if lifecycle.expire_idle(NativeMoment(Instant::now())) {
             self.idle.send_replace(None);
             self.stop.cancel();
-            return true;
+            true
+        } else {
+            false
         }
-        false
     }
 
     fn begin_close(&self) {
-        lock(&self.subscribers).closing = true;
+        lock(&self.lifecycle).begin_close();
         self.stop.cancel();
         self.leave_heartbeat();
     }
@@ -1239,7 +1219,12 @@ impl Session {
             state.log.finish(&self.stream_id);
             state.unlink(self);
         }
-        self.phase.send_replace(Phase::Failed(error));
+        {
+            let mut lifecycle = lock(&self.lifecycle);
+            if lifecycle.fail() {
+                self.phase.send_replace(Phase::Failed(error));
+            }
+        }
         self.mark_finished();
     }
 
@@ -1247,24 +1232,37 @@ impl Session {
         if let Some(state) = self.state.upgrade() {
             state.unlink(self);
         }
-        self.phase
-            .send_replace(Phase::Attach(Arc::downgrade(target)));
+        {
+            let mut lifecycle = lock(&self.lifecycle);
+            if lifecycle.redirect() {
+                self.phase
+                    .send_replace(Phase::Attach(Arc::downgrade(target)));
+            }
+        }
         self.mark_finished();
+    }
+
+    fn publish_closed(&self) {
+        let mut lifecycle = lock(&self.lifecycle);
+        if lifecycle.close() {
+            self.phase.send_replace(Phase::Closed);
+        }
     }
 
     fn mark_finished(&self) {
         if *self.upstream.borrow() != UpstreamStatus::Closed {
             self.upstream.send_replace(UpstreamStatus::Closed);
         }
-        self.finished.store(true, Ordering::SeqCst);
-        self.done.notify_waiters();
+        if lock(&self.lifecycle).complete_cleanup() {
+            self.done.notify_waiters();
+        }
     }
 
     async fn until_finished(&self) {
         let notified = self.done.notified();
         let mut notified = std::pin::pin!(notified);
         notified.as_mut().enable();
-        if self.finished.load(Ordering::SeqCst) {
+        if self.is_finished() {
             return;
         }
         notified.await;
