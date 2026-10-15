@@ -11,143 +11,19 @@ use crate::open_live::api::{BatchHeartbeatResult, MAX_BATCH_HEARTBEAT, REQUEST_T
 use crate::open_live::error::ApiError;
 use crate::session::platform::BoxFuture;
 
-const DEFAULT_FAILURE_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// 项目心跳的有限恢复策略。
-///
-/// 默认从最后确认成功起保留 45 秒，失败后以 2 秒起、10 秒封顶的指数退避重试。
-/// 退避加入 ±20% 抖动；访问限制的延迟至少为正常项目心跳间隔。
-/// 首次登记作为初始成功时间；恢复期限仅在首次失败后启用。
-///
-/// 默认预算按最短 60 秒平台失效窗口，为请求响应延迟和安全余量留出 15 秒。
-/// 不安全的组合仅警告，不修改参数；自定义参数不能保证在平台失效前恢复。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeartbeatPolicy {
-    /// 从最后确认成功起计算的恢复期限。默认 45 秒，必须非零且在时钟范围内。
-    pub failure_timeout: Duration,
-    /// 第一次普通重试的基础延迟。默认 2 秒，必须非零且在时钟范围内。
-    pub retry_initial_delay: Duration,
-    /// 普通退避延迟的上限，含抖动。默认 10 秒，必须非零且在时钟范围内。
-    ///
-    /// 访问限制的最终延迟可能超过此值，因为它至少等于正常心跳间隔。
-    pub retry_max_delay: Duration,
-}
-
-impl Default for HeartbeatPolicy {
-    fn default() -> Self {
-        Self {
-            failure_timeout: DEFAULT_FAILURE_TIMEOUT,
-            retry_initial_delay: Duration::from_secs(2),
-            retry_max_delay: Duration::from_secs(10),
-        }
-    }
-}
-
-impl HeartbeatPolicy {
-    pub(super) fn validate(self) -> Result<(), &'static str> {
-        for duration in [
-            self.failure_timeout,
-            self.retry_initial_delay,
-            self.retry_max_delay,
-        ] {
-            if duration.is_zero() {
-                return Err("项目心跳恢复策略时长必须大于 0");
-            }
-            if Instant::now().checked_add(duration).is_none() {
-                return Err("项目心跳恢复策略时长超出时钟范围");
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn warn_if_unsafe(self, every: Duration) {
-        if self.failure_timeout > DEFAULT_FAILURE_TIMEOUT {
-            tracing::warn!(
-                failure_timeout_secs = self.failure_timeout.as_secs_f64(),
-                "项目心跳恢复期限超过建议的 45 秒，保留配置但无法保证最短平台失效窗口"
-            );
-        }
-        if every.saturating_add(REQUEST_TIMEOUT) >= self.failure_timeout {
-            tracing::warn!(
-                interval_secs = every.as_secs_f64(),
-                request_timeout_secs = REQUEST_TIMEOUT.as_secs_f64(),
-                failure_timeout_secs = self.failure_timeout.as_secs_f64(),
-                "项目心跳间隔与请求超时未给恢复期限留出余量，保留配置"
-            );
-        }
-        if self.retry_initial_delay > self.retry_max_delay {
-            tracing::warn!(
-                retry_initial_secs = self.retry_initial_delay.as_secs_f64(),
-                retry_max_secs = self.retry_max_delay.as_secs_f64(),
-                "项目心跳初始退避超过上限，保留配置并按上限封顶"
-            );
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureKind {
-    Permanent,
-    Retryable,
-    AccessLimited,
-    AmbiguousExpired,
-    Unknown,
-}
-
-impl FailureKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Permanent => "permanent",
-            Self::Retryable => "retryable",
-            Self::AccessLimited => "access_limited",
-            Self::AmbiguousExpired => "ambiguous_expired",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+pub use bridge_core::session::HeartbeatPolicy;
+use bridge_core::session::failure::{self, ApiFailure, FailureKind};
 
 fn classify(error: &ApiError, batch_size: usize) -> FailureKind {
-    match error {
-        ApiError::Invalid { .. } => FailureKind::Permanent,
-        ApiError::Transport { .. } | ApiError::Decode { .. } => FailureKind::Retryable,
-        ApiError::Status { status: 429 } => FailureKind::AccessLimited,
-        ApiError::Status { status }
-            if (400..500).contains(status) && !matches!(status, 408 | 425) =>
-        {
-            FailureKind::Permanent
-        }
-        ApiError::Status { .. } => FailureKind::Retryable,
-        ApiError::Platform { code, .. } => match code.raw() {
-            4003 | 4004 | 5000..=5002 => FailureKind::Retryable,
-            4009 => FailureKind::AccessLimited,
-            4000..=4002 | 4005..=4008 | 4010..=4013 | 5003..=5005 | 5011 | 7004 | 7005 | 8002 => {
-                FailureKind::Permanent
-            }
-            7000 | 7003 if batch_size == 1 => FailureKind::Permanent,
-            7000 | 7003 => FailureKind::AmbiguousExpired,
-            _ => FailureKind::Unknown,
-        },
-    }
+    let failure = match error {
+        ApiError::Invalid { .. } => ApiFailure::Invalid,
+        ApiError::Transport { .. } => ApiFailure::Transport,
+        ApiError::Decode { .. } => ApiFailure::Decode,
+        ApiError::Status { status } => ApiFailure::HttpStatus(*status),
+        ApiError::Platform { code, .. } => ApiFailure::Platform(*code),
+    };
+    failure::classify(failure, batch_size)
 }
-
-fn retry_delay(policy: HeartbeatPolicy, failures: u32, jitter_percent: u32) -> Duration {
-    let factor = 1_u128
-        .checked_shl(failures.saturating_sub(1))
-        .unwrap_or(u128::MAX);
-    let nanos = policy
-        .retry_initial_delay
-        .as_nanos()
-        .saturating_mul(factor)
-        .min(policy.retry_max_delay.as_nanos());
-    let nanos = (nanos * u128::from(jitter_percent) / 100)
-        .min(policy.retry_max_delay.as_nanos())
-        .max(1);
-    Duration::new(
-        (nanos / 1_000_000_000) as u64,
-        (nanos % 1_000_000_000) as u32,
-    )
-}
-
 fn jitter_percent() -> u32 {
     let random = uuid::Uuid::new_v4();
     let bytes = random.as_bytes();
@@ -311,10 +187,12 @@ fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome)
                 } else if deadline <= now {
                     Some("recovery_budget_exhausted")
                 } else {
-                    let mut delay = retry_delay(state.heartbeat_policy, slot.failures, jitter);
-                    if kind == FailureKind::AccessLimited {
-                        delay = delay.max(state.app_heartbeat);
-                    }
+                    let delay = state.heartbeat_policy.retry_delay_for(
+                        kind,
+                        state.app_heartbeat,
+                        slot.failures,
+                        jitter,
+                    );
                     slot.retry_at = Some(now.checked_add(delay).unwrap_or(deadline));
                     slot.normal_due = None;
                     tracing::warn!(

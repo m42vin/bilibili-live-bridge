@@ -174,10 +174,9 @@ impl Manager {
                 return Err(SessionError::invalid("心跳间隔超出时钟范围"));
             }
         }
-        heartbeat_policy.validate().map_err(SessionError::invalid)?;
-        heartbeat_policy.warn_if_unsafe(app_heartbeat);
-        upstream_policy
-            .validate(websocket_heartbeat)
+        crate::policy::validate_heartbeat(heartbeat_policy).map_err(SessionError::invalid)?;
+        crate::policy::warn_heartbeat(heartbeat_policy, app_heartbeat);
+        crate::policy::validate_upstream(upstream_policy, websocket_heartbeat)
             .map_err(SessionError::invalid)?;
         let platform: Arc<dyn Platform> = Arc::new(LivePlatform::new(
             api,

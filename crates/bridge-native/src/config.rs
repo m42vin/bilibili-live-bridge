@@ -155,12 +155,12 @@ impl Config {
                 Duration::from_secs,
             )?,
         };
-        health
-            .validate(websocket_heartbeat)
-            .map_err(|message| ConfigError::Invalid {
+        crate::policy::validate_health(health, websocket_heartbeat).map_err(|message| {
+            ConfigError::Invalid {
                 var: ENV_WEBSOCKET_ACTIVITY_TIMEOUT_SECS,
                 message: message.to_owned(),
-            })?;
+            }
+        })?;
         let reconnect = match optional(&read, ENV_UPSTREAM_RECONNECT_TIMEOUT_SECS)? {
             Some(value) if value.parse::<u64>().ok() == Some(0) => None,
             _ => {
@@ -188,12 +188,12 @@ impl Config {
             }
         };
         let upstream_policy = UpstreamPolicy { health, reconnect };
-        upstream_policy
-            .validate(websocket_heartbeat)
-            .map_err(|message| ConfigError::Invalid {
+        crate::policy::validate_upstream(upstream_policy, websocket_heartbeat).map_err(
+            |message| ConfigError::Invalid {
                 var: ENV_UPSTREAM_RECONNECT_RETRY_INITIAL_MS,
                 message: message.to_owned(),
-            })?;
+            },
+        )?;
 
         let defaults = DeliveryPolicy::default();
         let delivery_policy = DeliveryPolicy {

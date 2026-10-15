@@ -295,11 +295,13 @@ fn health_policy_and_terminal_close_codes_are_checked() {
         .is_err()
     );
     assert!(
-        HealthPolicy {
-            activity_timeout: Duration::from_secs(u64::MAX),
-            ..HealthPolicy::default()
-        }
-        .validate(Duration::from_secs(20))
+        crate::policy::validate_health(
+            HealthPolicy {
+                activity_timeout: Duration::from_secs(u64::MAX),
+                ..HealthPolicy::default()
+            },
+            Duration::from_secs(20)
+        )
         .is_err()
     );
     for code in [

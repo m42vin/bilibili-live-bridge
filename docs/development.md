@@ -34,7 +34,7 @@ cargo check --locked -p bridge-core --target wasm32-unknown-unknown
 cargo tree --locked -p bridge-core
 ```
 
-核心禁止引入 Tokio、原生网络、系统时间与随机数生成；运行时提供这些能力。共享模型通过 native 重导出，新增协议应在 core 测试，连接和任务行为在 native 测试。
+核心禁止引入 Tokio、原生网络、系统时间与随机数生成；运行时提供这些能力。共享模型通过 native 重导出，新增协议和纯策略应在 core 测试，时钟范围、错误摘要适配、连接和任务行为在 native 测试。
 
 ## 从哪里开始修改
 
@@ -49,7 +49,8 @@ cargo tree --locked -p bridge-core
 | 二进制包与压缩 | [packet.rs](../crates/bridge-core/src/open_live/ws/packet.rs) | [packet_test.rs](../crates/bridge-core/src/open_live/ws/packet_test.rs) |
 | 直播事件字段与命令 | [cmd.rs](../crates/bridge-core/src/open_live/ws/cmd.rs) | [cmd_test.rs](../crates/bridge-core/src/open_live/ws/cmd_test.rs) |
 | 会话复用、订阅与清理 | [manager.rs](../crates/bridge-native/src/session/manager.rs)、[platform.rs](../crates/bridge-native/src/session/platform.rs) | [manager_test.rs](../crates/bridge-native/src/session/manager_test.rs) |
-| 项目心跳分类、预算与退避 | [heartbeat.rs](../crates/bridge-native/src/session/heartbeat.rs) | [heartbeat_test.rs](../crates/bridge-native/src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../crates/bridge-native/src/session/heartbeat_recovery_test.rs) |
+| 纯策略、失败分类与退避 | [policy.rs](../crates/bridge-core/src/session/policy.rs)、[failure.rs](../crates/bridge-core/src/session/failure.rs) | [policy_test.rs](../crates/bridge-core/src/session/policy_test.rs)、[failure_test.rs](../crates/bridge-core/src/session/failure_test.rs) |
+| 原生心跳调度与恢复预算 | [heartbeat.rs](../crates/bridge-native/src/session/heartbeat.rs) | [heartbeat_test.rs](../crates/bridge-native/src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../crates/bridge-native/src/session/heartbeat_recovery_test.rs) |
 | 下游 WebSocket 与协议 | [downstream.rs](../crates/bridge-native/src/downstream.rs)、[protocol.rs](../crates/bridge-core/src/downstream/protocol.rs) | [protocol_test.rs](../crates/bridge-core/src/downstream/protocol_test.rs)、[downstream_test.rs](../crates/bridge-native/src/downstream/downstream_test.rs) |
 | 内存事件日志与游标 | [delivery.rs](../crates/bridge-native/src/session/delivery.rs) | [delivery_test.rs](../crates/bridge-native/src/session/delivery_test.rs) |
 | 下游客户端示例与重连 | [downstream_client.rs](../crates/bridge-native/src/bin/downstream_client.rs) | [client_test.rs](../crates/bridge-native/src/downstream/client_test.rs) |

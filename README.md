@@ -20,7 +20,7 @@
 
 ## Workspace 结构
 
-- `bridge-core`：请求签名、API 数据模型与响应解析、官方二进制协议和事件、下游 JSON 协议及交付模型。不依赖 Tokio、HTTP 客户端或系统网络。
+- `bridge-core`：请求签名、API 数据模型与响应解析、官方二进制协议和事件、下游 JSON 协议、交付模型，以及健康/心跳/重连的纯策略、失败分类与退避计算。不依赖 Tokio、HTTP 客户端或系统网络。
 - `bridge-native`：原生 HTTP / WebSocket、会话管理、心跳与恢复、内存日志、配置、日志初始化和所有可执行入口，单向依赖 `bridge-core`。
 
 `bridge-native` 保留库名 `bilibili_live_bridge`，原公共类型路径通过重导出保持可用。Cargo 包名已从 `bilibili-live-bridge` 改为 `bridge-native`；外部项目的本地依赖改为：

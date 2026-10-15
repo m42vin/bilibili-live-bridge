@@ -13,6 +13,10 @@
 
 原生库沿用 `bilibili_live_bridge` 名称及公共模块路径，重导出共享类型。核心的 `ResponseError` / `ProtocolError` 在原生边界转换成原有 `ApiError` / `WsError` 变体，传输错误及其原始错误链仍由原生库保存。
 
+`bridge-core::session::policy` 定义 `HealthPolicy`、`HeartbeatPolicy`、`ReconnectPolicy` 和 `UpstreamPolicy`，提供纯数值校验、显式抖动输入的退避计算和结构化配置诊断。`session::failure` 根据 `ApiFailure` / `UpstreamFailure` 摘要分类，保留批量过期错误与访问限制的处理规则。原生库重导出这些策略，现有调用路径不变。
+
+native 的 `policy` 模块额外检查 Tokio 时钟可表示范围并输出诊断日志；网络适配器保留完整错误，仅将类别交给 core。随机抖动仍由 native 生成。core 不读取时钟、不生成随机数、不记录日志；`HeartbeatPolicy::validate` 不因风险提示拒绝配置，上游初始退避大于上限仍属于无效参数。
+
 `Manager`、两类心跳、重连、日志保留策略与内存日志仍由 native 的 Tokio 运行时驱动。本次未将这些并发流程改写为跨运行时状态机。
 
 ## 模块边界

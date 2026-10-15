@@ -100,7 +100,7 @@ impl Connection {
         if heartbeat.is_zero() {
             return Err(WsError::invalid("心跳间隔必须大于 0"));
         }
-        health.validate(heartbeat).map_err(WsError::invalid)?;
+        crate::policy::validate_health(health, heartbeat).map_err(WsError::invalid)?;
         let links: Vec<String> = links
             .into_iter()
             .map(|link| link.as_ref().trim().to_owned())

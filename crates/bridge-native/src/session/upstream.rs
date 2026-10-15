@@ -2,78 +2,17 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 use super::{Session, State, close_socket, until_idle};
 use crate::open_live::api::StartResult;
-use crate::open_live::ws::{HealthPolicy, LiveEvent, WsError};
+use crate::open_live::ws::{LiveEvent, WsError};
 use crate::session::platform::LiveSocket;
 
-/// 原场次的官方连接恢复策略，不重新开启场次。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReconnectPolicy {
-    /// 从首次故障起计算的恢复预算，默认 120 秒。
-    pub failure_timeout: Duration,
-    /// 第一轮失败后的基础退避，默认 2 秒。
-    pub retry_initial_delay: Duration,
-    /// 退避最终上限，含抖动，默认 10 秒。
-    pub retry_max_delay: Duration,
-}
-
-impl Default for ReconnectPolicy {
-    fn default() -> Self {
-        Self {
-            failure_timeout: Duration::from_secs(120),
-            retry_initial_delay: Duration::from_secs(2),
-            retry_max_delay: Duration::from_secs(10),
-        }
-    }
-}
-
-/// 上游连接健康检查和原场次恢复策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UpstreamPolicy {
-    /// 连接发送及有效入站活动期限。
-    pub health: HealthPolicy,
-    /// 恢复策略；None 表示断开后立即结束会话。默认启用。
-    pub reconnect: Option<ReconnectPolicy>,
-}
-
-impl Default for UpstreamPolicy {
-    fn default() -> Self {
-        Self {
-            health: HealthPolicy::default(),
-            reconnect: Some(ReconnectPolicy::default()),
-        }
-    }
-}
-
-impl UpstreamPolicy {
-    pub(crate) fn validate(self, heartbeat: Duration) -> Result<(), &'static str> {
-        self.health.validate(heartbeat)?;
-        if let Some(policy) = self.reconnect {
-            for duration in [
-                policy.failure_timeout,
-                policy.retry_initial_delay,
-                policy.retry_max_delay,
-            ] {
-                if duration.is_zero() {
-                    return Err("上游恢复策略时长必须大于 0");
-                }
-                if Instant::now().checked_add(duration).is_none() {
-                    return Err("上游恢复策略时长超出时钟范围");
-                }
-            }
-            if policy.retry_initial_delay > policy.retry_max_delay {
-                return Err("上游初始退避不得超过退避上限");
-            }
-        }
-        Ok(())
-    }
-}
+use bridge_core::session::failure::UpstreamFailure;
+pub use bridge_core::session::{ReconnectPolicy, UpstreamPolicy};
 
 /// 当前上游状态。状态流是可合并中间变化的最新快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +199,7 @@ async fn restore(
             }
         }
         recovery.failures = recovery.failures.saturating_add(1);
-        let delay = retry_delay(policy, recovery.failures, jitter());
+        let delay = policy.retry_delay(recovery.failures, jitter());
         tracing::debug!(
             attempt = recovery.attempts,
             delay_secs = delay.as_secs_f64(),
@@ -276,27 +215,15 @@ async fn restore(
 }
 
 fn retryable(error: &WsError) -> bool {
-    matches!(error, WsError::Transport { .. } | WsError::Connect { .. })
+    let failure = match error {
+        WsError::Invalid { .. } => UpstreamFailure::Invalid,
+        WsError::Connect { .. } => UpstreamFailure::Connect,
+        WsError::Transport { .. } => UpstreamFailure::Transport,
+        WsError::Protocol { .. } => UpstreamFailure::Protocol,
+        WsError::Decode { .. } => UpstreamFailure::Decode,
+    };
+    failure.retryable()
 }
-
-fn retry_delay(policy: ReconnectPolicy, failures: u32, jitter_percent: u32) -> Duration {
-    let factor = 1_u128
-        .checked_shl(failures.saturating_sub(1))
-        .unwrap_or(u128::MAX);
-    let nanos = policy
-        .retry_initial_delay
-        .as_nanos()
-        .saturating_mul(factor)
-        .min(policy.retry_max_delay.as_nanos());
-    let nanos = (nanos * u128::from(jitter_percent) / 100)
-        .min(policy.retry_max_delay.as_nanos())
-        .max(1);
-    Duration::new(
-        (nanos / 1_000_000_000) as u64,
-        (nanos % 1_000_000_000) as u32,
-    )
-}
-
 fn jitter() -> u32 {
     let random = uuid::Uuid::new_v4();
     80 + u32::from(u16::from_be_bytes([
@@ -318,34 +245,5 @@ async fn active<T>(session: &Session, future: impl Future<Output = T>) -> Option
             _ = until_idle(deadline) => { if session.expire_idle() { return None; } },
             result = &mut future => return Some(result),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_validation_and_jitter_bounds() {
-        let policy = UpstreamPolicy::default();
-        assert_eq!(
-            policy.reconnect.unwrap().failure_timeout,
-            Duration::from_secs(120)
-        );
-        assert!(policy.validate(Duration::from_secs(20)).is_ok());
-        for failures in [1, 2, 3, 4, u32::MAX] {
-            for jitter in [80, 100, 120] {
-                let delay = retry_delay(policy.reconnect.unwrap(), failures, jitter);
-                assert!(!delay.is_zero() && delay <= Duration::from_secs(10));
-            }
-        }
-        let invalid = UpstreamPolicy {
-            reconnect: Some(ReconnectPolicy {
-                retry_initial_delay: Duration::from_secs(11),
-                ..ReconnectPolicy::default()
-            }),
-            ..policy
-        };
-        assert!(invalid.validate(Duration::from_secs(20)).is_err());
     }
 }

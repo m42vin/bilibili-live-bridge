@@ -89,37 +89,6 @@ fn classifies_http_transport_decode_and_local_invalid_errors() {
 }
 
 #[test]
-fn backoff_is_exponential_jittered_capped_and_saturating() {
-    let policy = HeartbeatPolicy::default();
-    for (failures, base) in [(1, 2), (2, 4), (3, 8), (4, 10), (u32::MAX, 10)] {
-        for jitter in 80..=120 {
-            let expected = (Duration::from_secs(base).mul_f64(f64::from(jitter) / 100.0))
-                .min(policy.retry_max_delay);
-            assert_eq!(retry_delay(policy, failures, jitter), expected);
-        }
-    }
-    let tiny = HeartbeatPolicy {
-        retry_initial_delay: Duration::from_nanos(1),
-        retry_max_delay: Duration::from_secs(10),
-        ..policy
-    };
-    assert_eq!(retry_delay(tiny, 1, 80), Duration::from_nanos(1));
-    assert_eq!(
-        retry_delay(tiny, 34, 100),
-        Duration::from_nanos(1_u64 << 33)
-    );
-    assert_eq!(retry_delay(tiny, u32::MAX, 100), Duration::from_secs(10));
-    let oversized_initial = HeartbeatPolicy {
-        retry_initial_delay: Duration::from_secs(20),
-        ..policy
-    };
-    assert_eq!(
-        retry_delay(oversized_initial, 1, 120),
-        Duration::from_secs(10)
-    );
-}
-
-#[test]
 fn zero_and_unrepresentable_policy_durations_are_invalid() {
     let policy = HeartbeatPolicy::default();
     for duration in [Duration::ZERO, Duration::MAX] {
@@ -137,8 +106,8 @@ fn zero_and_unrepresentable_policy_durations_are_invalid() {
                 ..policy
             },
         ] {
-            assert!(candidate.validate().is_err());
+            assert!(crate::policy::validate_heartbeat(candidate).is_err());
         }
     }
-    assert!(policy.validate().is_ok());
+    assert!(crate::policy::validate_heartbeat(policy).is_ok());
 }
