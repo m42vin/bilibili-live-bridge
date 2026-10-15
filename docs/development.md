@@ -11,10 +11,10 @@
 ```sh
 rustc --version
 cargo --version
-cargo build --locked
-cargo test --locked
-cargo fmt --check
-RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
+cargo build --locked --workspace
+cargo test --locked --workspace
+cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --workspace --no-deps
 ```
 
 `--locked` 用于避免检查过程更新 `Cargo.lock`。首次构建可能需要下载依赖；缓存齐全时可追加 `--offline`，或使用 `--frozen` 同时要求锁文件不变且不访问网络。
@@ -26,23 +26,34 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --no-deps
 下游客户端使用 `cargo run --locked --bin downstream_client`，只需设置 `AUTH_CODE`，
 可选 `BRIDGE_URL`；客户端行为测试使用本地 WebSocket 桩，无需真实平台。
 
+单独检查核心及 Wasm 编译（需预先安装 `wasm32-unknown-unknown` target）：
+
+```sh
+cargo test --locked -p bridge-core
+cargo check --locked -p bridge-core --target wasm32-unknown-unknown
+cargo tree --locked -p bridge-core
+```
+
+核心禁止引入 Tokio、原生网络、系统时间与随机数生成；运行时提供这些能力。共享模型通过 native 重导出，新增协议应在 core 测试，连接和任务行为在 native 测试。
+
 ## 从哪里开始修改
 
 | 修改内容 | 实现位置 | 验证位置 |
 | --- | --- | --- |
-| 配置读取与校验 | [config.rs](../src/config.rs) | [config_test.rs](../src/config_test.rs) |
-| 日志初始化与过滤 | [logging.rs](../src/logging.rs) | [logging_test.rs](../src/logging_test.rs) |
-| HTTP API、响应与请求签名 | [api.rs](../src/open_live/api.rs)、[auth.rs](../src/open_live/auth.rs) | [api_test.rs](../src/open_live/api_test.rs)、[auth_test.rs](../src/open_live/auth_test.rs) |
-| 平台业务错误码 | [error.rs](../src/open_live/error.rs) | [error_test.rs](../src/open_live/error_test.rs) |
-| 官方连接、鉴权和心跳 | [conn.rs](../src/open_live/ws/conn.rs) | [conn_test.rs](../src/open_live/ws/conn_test.rs) |
-| 二进制包与压缩 | [packet.rs](../src/open_live/ws/packet.rs) | [packet_test.rs](../src/open_live/ws/packet_test.rs) |
-| 直播事件字段与命令 | [cmd.rs](../src/open_live/ws/cmd.rs) | [cmd_test.rs](../src/open_live/ws/cmd_test.rs) |
-| 会话复用、订阅与清理 | [manager.rs](../src/session/manager.rs)、[platform.rs](../src/session/platform.rs) | [manager_test.rs](../src/session/manager_test.rs) |
-| 项目心跳分类、预算与退避 | [heartbeat.rs](../src/session/heartbeat.rs) | [heartbeat_test.rs](../src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../src/session/heartbeat_recovery_test.rs) |
-| 下游 WebSocket 与协议 | [downstream.rs](../src/downstream.rs)、[protocol.rs](../src/downstream/protocol.rs) | [downstream_test.rs](../src/downstream/downstream_test.rs) |
-| 内存事件日志与游标 | [delivery.rs](../src/session/delivery.rs) | [delivery_test.rs](../src/session/delivery_test.rs) |
-| 下游客户端示例与重连 | [downstream_client.rs](../src/bin/downstream_client.rs) | [client_test.rs](../src/downstream/client_test.rs) |
-| 示例程序 | [src/bin](../src/bin/) | 构建检查；需要真实平台时手动运行 |
+| 配置读取与校验 | [config.rs](../crates/bridge-native/src/config.rs) | [config_test.rs](../crates/bridge-native/src/config_test.rs) |
+| 日志初始化与过滤 | [logging.rs](../crates/bridge-native/src/logging.rs) | [logging_test.rs](../crates/bridge-native/src/logging_test.rs) |
+| HTTP API、响应与请求签名 | [api.rs](../crates/bridge-native/src/open_live/api.rs)、[auth.rs](../crates/bridge-core/src/open_live/auth.rs) | [api_test.rs](../crates/bridge-native/src/open_live/api_test.rs)、[auth_test.rs](../crates/bridge-core/src/open_live/auth_test.rs) |
+| API 响应模型与校验 | [model.rs](../crates/bridge-core/src/open_live/model.rs) | [model_test.rs](../crates/bridge-core/src/open_live/model_test.rs) |
+| 平台业务错误码 | [error.rs](../crates/bridge-core/src/open_live/error.rs) | [error_test.rs](../crates/bridge-core/src/open_live/error_test.rs) |
+| 官方连接、鉴权和心跳 | [conn.rs](../crates/bridge-native/src/open_live/ws/conn.rs) | [conn_test.rs](../crates/bridge-native/src/open_live/ws/conn_test.rs) |
+| 二进制包与压缩 | [packet.rs](../crates/bridge-core/src/open_live/ws/packet.rs) | [packet_test.rs](../crates/bridge-core/src/open_live/ws/packet_test.rs) |
+| 直播事件字段与命令 | [cmd.rs](../crates/bridge-core/src/open_live/ws/cmd.rs) | [cmd_test.rs](../crates/bridge-core/src/open_live/ws/cmd_test.rs) |
+| 会话复用、订阅与清理 | [manager.rs](../crates/bridge-native/src/session/manager.rs)、[platform.rs](../crates/bridge-native/src/session/platform.rs) | [manager_test.rs](../crates/bridge-native/src/session/manager_test.rs) |
+| 项目心跳分类、预算与退避 | [heartbeat.rs](../crates/bridge-native/src/session/heartbeat.rs) | [heartbeat_test.rs](../crates/bridge-native/src/session/heartbeat_test.rs)、[heartbeat_recovery_test.rs](../crates/bridge-native/src/session/heartbeat_recovery_test.rs) |
+| 下游 WebSocket 与协议 | [downstream.rs](../crates/bridge-native/src/downstream.rs)、[protocol.rs](../crates/bridge-core/src/downstream/protocol.rs) | [protocol_test.rs](../crates/bridge-core/src/downstream/protocol_test.rs)、[downstream_test.rs](../crates/bridge-native/src/downstream/downstream_test.rs) |
+| 内存事件日志与游标 | [delivery.rs](../crates/bridge-native/src/session/delivery.rs) | [delivery_test.rs](../crates/bridge-native/src/session/delivery_test.rs) |
+| 下游客户端示例与重连 | [downstream_client.rs](../crates/bridge-native/src/bin/downstream_client.rs) | [client_test.rs](../crates/bridge-native/src/downstream/client_test.rs) |
+| 示例程序 | [src/bin](../crates/bridge-native/src/bin/) | 构建检查；需要真实平台时手动运行 |
 
 ## 测试组织与调试
 
@@ -86,7 +97,7 @@ RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 `auth_reauth` 单独验证原场次的 `auth_body` 能否重新鉴权，即上游恢复的前提；它开启一场真实互动，
 按 `wss_link` 顺序握手、释放、再用原鉴权重复握手，并在恢复后调用项目心跳确认场次存续。
 `.env` 不会被自动加载，需要先 `set -a && . ./.env && set +a`。测试套件只覆盖它的参数与凭据校验
-（[auth_reauth_cli.rs](../tests/auth_reauth_cli.rs)），真实鉴权结果需要人工运行并记录。
+（[auth_reauth_cli.rs](../crates/bridge-native/tests/auth_reauth_cli.rs)），真实鉴权结果需要人工运行并记录。
 
 使用房间号、场次 ID、请求路径和命令名关联日志。debug 可以看到示例程序的事件详情，trace 可以看到 WebSocket 心跳；真实运行会开启和关闭平台场次。
 
@@ -143,7 +154,7 @@ RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 生成可浏览的公共 API 文档：
 
 ```sh
-cargo doc --locked --no-deps --open
+cargo doc --locked --workspace --no-deps --open
 ```
 
 查看内部实现的 rustdoc 时追加 `--document-private-items`。README 和本文中的文件链接均相对仓库定位，新增或移动文件时需检查链接。

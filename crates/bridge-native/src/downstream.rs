@@ -31,8 +31,6 @@ use crate::session::{
 };
 
 mod protocol;
-#[cfg(test)]
-use protocol::subscription_code;
 use protocol::{ClientMessage, ServerMessage, Subscribe, parse_subscribe};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);

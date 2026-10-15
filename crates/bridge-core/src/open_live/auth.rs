@@ -7,19 +7,27 @@ use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 
-pub(super) const SIGNATURE_METHOD: &str = "HMAC-SHA256";
-pub(super) const SIGNATURE_VERSION: &str = "1.0";
+/// 平台要求的签名算法名称。
+pub const SIGNATURE_METHOD: &str = "HMAC-SHA256";
+/// 平台要求的签名版本。
+pub const SIGNATURE_VERSION: &str = "1.0";
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub(super) struct Signature {
-    pub(super) content_md5: String,
-    pub(super) timestamp: String,
-    pub(super) nonce: String,
-    pub(super) authorization: String,
+/// 请求签名结果；authorization 属于敏感凭据，不应记录。
+pub struct Signature {
+    /// 请求正文的小写十六进制 MD5。
+    pub content_md5: String,
+    /// 调用方提供的 Unix 秒时间戳字符串。
+    pub timestamp: String,
+    /// 调用方提供的请求随机标识。
+    pub nonce: String,
+    /// 规范请求头的 HMAC-SHA256 签名。
+    pub authorization: String,
 }
 
-pub(super) fn sign(
+/// 对实际发送的正文签名；时间戳与 nonce 由运行时生成。
+pub fn sign(
     access_key_id: &str,
     access_key_secret: &str,
     body: &str,
@@ -46,7 +54,8 @@ pub(super) fn sign(
     }
 }
 
-pub(super) fn canonical_string(pairs: &[(&str, &str)]) -> String {
+/// 筛选 x-bili- 请求头并按名称排序，以换行连接且无末尾换行。
+pub fn canonical_string(pairs: &[(&str, &str)]) -> String {
     let mut pairs: Vec<_> = pairs
         .iter()
         .copied()
@@ -60,11 +69,13 @@ pub(super) fn canonical_string(pairs: &[(&str, &str)]) -> String {
         .join("\n")
 }
 
-pub(super) fn content_md5(body: &str) -> String {
+/// 请求正文的小写十六进制 MD5。
+pub fn content_md5(body: &str) -> String {
     hex_encode(Md5::digest(body.as_bytes()).as_ref())
 }
 
-pub(super) fn hmac_sha256_hex(secret: &str, message: &str) -> String {
+/// 计算消息的 HMAC-SHA256，返回小写十六进制字符串。
+pub fn hmac_sha256_hex(secret: &str, message: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(message.as_bytes());

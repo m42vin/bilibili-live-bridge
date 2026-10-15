@@ -18,6 +18,21 @@
 - **下游 WebSocket**：每条 `/ws` 连接订阅一个房间，按序推送 JSON 事件；报告缓冲溢出，支持 Ping/Pong、读写限制和优雅退出。服务在最后一个客户端离开后保留上游 30 秒供重连。
 - **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
 
+## Workspace 结构
+
+- `bridge-core`：请求签名、API 数据模型与响应解析、官方二进制协议和事件、下游 JSON 协议及交付模型。不依赖 Tokio、HTTP 客户端或系统网络。
+- `bridge-native`：原生 HTTP / WebSocket、会话管理、心跳与恢复、内存日志、配置、日志初始化和所有可执行入口，单向依赖 `bridge-core`。
+
+`bridge-native` 保留库名 `bilibili_live_bridge`，原公共类型路径通过重导出保持可用。Cargo 包名已从 `bilibili-live-bridge` 改为 `bridge-native`；外部项目的本地依赖改为：
+
+```toml
+[dependencies]
+bilibili-live-bridge = { package = "bridge-native", path = "../bilibili-live-bridge/crates/bridge-native" }
+```
+
+在仓库根目录仍可执行 `cargo run --locked --bin server`。验证所有成员使用 `cargo test --locked --workspace`；仅验证纯核心使用 `cargo test --locked -p bridge-core`。
+此次拆分保留原生会话调度，不包含 Workers 运行时、可移植会话状态机或持久化日志。
+
 ## 快速开始
 
 ### 准备
@@ -126,7 +141,7 @@ cargo run --locked --bin downstream_client
 BRIDGE_URL='ws://127.0.0.1:8080/ws' RUST_LOG=info,downstream_client=debug cargo run --locked --bin downstream_client
 ```
 
-[`downstream_client`](src/bin/downstream_client.rs) 默认以 `ack:true` 订阅，处理 ready、事件、
+[`downstream_client`](crates/bridge-native/src/bin/downstream_client.rs) 默认以 `ack:true` 订阅，处理 ready、事件、
 上游 reconnecting / connected 状态和 resume_unavailable。网络接收和业务处理分开，
 处理成功后更新进程内游标并发送累计 ACK，正文在 debug 日志中输出。
 
@@ -198,9 +213,9 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 重连成功后连续健康一个存活周期（默认 60 秒）才清除旧恢复预算，短暂成功不能无限延长恢复。
 恢复空窗不补发事件，也不跨连接去重；原场次失效、协议/业务解码错误、鉴权拒绝或预算耗尽后结束订阅，需要重新 `attach`。
 下游新增 `status` 消息，状态为 `reconnecting` 或 `connected`，客户端需要接受该消息类型。
-如果直接使用 `open_live::api::Client` 和 `open_live::ws::Connection`，调用方需要自行维护项目心跳、持续调用 `Connection::recv()` 驱动心跳和健康检查，自己处理重连，并在结束时调用 `Client::end()`。完整示例见 [`ws_listen`](src/bin/ws_listen.rs) 和 [`multi_client`](src/bin/multi_client.rs)。
+如果直接使用 `open_live::api::Client` 和 `open_live::ws::Connection`，调用方需要自行维护项目心跳、持续调用 `Connection::recv()` 驱动心跳和健康检查，自己处理重连，并在结束时调用 `Client::end()`。完整示例见 [`ws_listen`](crates/bridge-native/src/bin/ws_listen.rs) 和 [`multi_client`](crates/bridge-native/src/bin/multi_client.rs)。
 
-[库入口的 rustdoc](src/lib.rs) 提供包含退出清理与订阅落后处理的接入示例，该示例由 doctest 检查编译。
+[库入口的 rustdoc](crates/bridge-native/src/lib.rs) 提供包含退出清理与订阅落后处理的接入示例，该示例由 doctest 检查编译。
 
 ## 开发与文档
 
@@ -217,12 +232,12 @@ cargo doc --no-deps --open
 | [架构说明](docs/architecture.md) | 模块边界、会话复用、心跳、事件分发与关闭流程 |
 | [开发指南](docs/development.md) | 开发环境、测试与调试、常见扩展方式和注释维护 |
 | [下游客户端协议](docs/downstream-protocol.md) | WebSocket 接入、消息封装、心跳、重连和关闭语义 |
-| [`src/config.rs`](src/config.rs) | 环境变量配置与校验 |
-| [`src/logging.rs`](src/logging.rs) | tracing 初始化与 `RUST_LOG` 过滤 |
-| [`src/open_live/`](src/open_live/) | 开放平台 API、鉴权、错误码与官方 WebSocket 客户端 |
-| [`src/session/`](src/session/) | 会话复用、订阅分发、批量心跳与生命周期管理 |
-| [`src/downstream.rs`](src/downstream.rs) | 下游 WebSocket 服务和连接生命周期 |
-| [`src/bin/`](src/bin/) | 示例程序与 WebSocket 服务入口 |
+| [`crates/bridge-native/src/config.rs`](crates/bridge-native/src/config.rs) | 环境变量配置与校验 |
+| [`crates/bridge-native/src/logging.rs`](crates/bridge-native/src/logging.rs) | tracing 初始化与 `RUST_LOG` 过滤 |
+| [`crates/bridge-native/src/open_live/`](crates/bridge-native/src/open_live/) | 开放平台 API、鉴权、错误码与官方 WebSocket 客户端 |
+| [`crates/bridge-native/src/session/`](crates/bridge-native/src/session/) | 会话复用、订阅分发、批量心跳与生命周期管理 |
+| [`crates/bridge-native/src/downstream.rs`](crates/bridge-native/src/downstream.rs) | 下游 WebSocket 服务和连接生命周期 |
+| [`crates/bridge-native/src/bin/`](crates/bridge-native/src/bin/) | 示例程序与 WebSocket 服务入口 |
 | [`docs/open-live/`](docs/open-live/README.md) | 收录的开放平台鉴权、应用 API、长链协议与事件命令文档 |
 
 ## 许可证

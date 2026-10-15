@@ -3,7 +3,7 @@
 `server` 默认监听 `ws://127.0.0.1:8080/ws`，通过 `BRIDGE_LISTEN` 修改。
 只有 `/ws` 接受升级；其他路径返回 HTTP 404。当前没有独立服务访问 token，
 默认回环监听，使用主播身份码订阅。客户端示例见
-[downstream_client.rs](../src/bin/downstream_client.rs) 和 [README](../README.md#下游客户端示例)。
+[downstream_client.rs](../crates/bridge-native/src/bin/downstream_client.rs) 和 [README](../README.md#下游客户端示例)。
 
 ## 接入与兼容
 

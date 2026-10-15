@@ -12,72 +12,13 @@ use tokio_tungstenite::{MaybeTlsStream, accept_async, connect_async};
 
 use super::*;
 use crate::open_live::api::Client;
-use crate::open_live::ws::{Danmaku, LiveEvent};
+use crate::open_live::ws::LiveEvent;
 use crate::session::{DeliveryPolicy, HeartbeatPolicy, ManagerOptions, UpstreamPolicy};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type UpstreamMessage = (Value, oneshot::Sender<()>);
 const CODE: &str = "private-identity-code";
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
-
-#[test]
-fn protocol_preserves_known_and_unknown_data() {
-    let event = LiveEvent::Danmaku(Danmaku {
-        msg: "hello".to_owned(),
-        room_id: 7,
-        ..Danmaku::default()
-    });
-    let value = serde_json::to_value(ServerMessage::event(7, &event)).unwrap();
-    assert_eq!(value["type"], "event");
-    assert_eq!(value["cmd"], "LIVE_OPEN_PLATFORM_DM");
-    assert_eq!(value["room_id"], 7);
-    assert_eq!(value["data"]["msg"], "hello");
-    assert_eq!(value["data"]["uid"], 0);
-    for data in [json!({"future_field": [1, true, null]}), Value::Null] {
-        let event = LiveEvent::Unknown {
-            cmd: "FUTURE_EVENT".into(),
-            data: data.clone(),
-        };
-        assert_eq!(
-            serde_json::to_value(ServerMessage::event(7, &event)).unwrap(),
-            json!({"type":"event", "room_id":7, "cmd":"FUTURE_EVENT", "data":data})
-        );
-    }
-    let events = [
-        LiveEvent::DanmakuMirror(Default::default()),
-        LiveEvent::Gift(Default::default()),
-        LiveEvent::SuperChat(Default::default()),
-        LiveEvent::SuperChatDelete(Default::default()),
-        LiveEvent::Guard(Default::default()),
-        LiveEvent::Like(Default::default()),
-        LiveEvent::RoomEnter(Default::default()),
-        LiveEvent::LiveStart(Default::default()),
-        LiveEvent::LiveEnd(Default::default()),
-        LiveEvent::InteractionEnd(Default::default()),
-    ];
-    for event in events {
-        let value = serde_json::to_value(ServerMessage::event(7, &event)).unwrap();
-        assert_eq!(value["cmd"], event.cmd());
-        assert!(value["data"].is_object());
-    }
-    assert_eq!(
-        serde_json::to_value(ServerMessage::Closed).unwrap(),
-        json!({"type":"closed"})
-    );
-    assert_eq!(
-        subscription_code(r#"{"type":"subscribe","code":"  abc  "}"#),
-        Ok("abc".into())
-    );
-    for invalid in [
-        "no-json",
-        "{}",
-        r#"{"type":"subscribe","code":" "}"#,
-        r#"{"type":"subscribe","code":1}"#,
-        r#"{"type":"unsubscribe"}"#,
-    ] {
-        assert!(subscription_code(invalid).is_err());
-    }
-}
 
 #[tokio::test]
 async fn two_clients_share_one_upstream_and_receive_events_in_order() {

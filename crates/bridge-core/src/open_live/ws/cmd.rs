@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::error::WsError;
+use super::error::ProtocolError;
 
 const CMD_DM: &str = "LIVE_OPEN_PLATFORM_DM";
 const CMD_DM_MIRROR: &str = "LIVE_OPEN_PLATFORM_DM_MIRROR";
@@ -58,7 +58,8 @@ pub enum LiveEvent {
 }
 
 impl LiveEvent {
-    pub(crate) fn data_json(&self) -> serde_json::Result<Box<serde_json::value::RawValue>> {
+    /// 序列化事件正文，未知命令保留原始 data。
+    pub fn data_json(&self) -> serde_json::Result<Box<serde_json::value::RawValue>> {
         use serde_json::value::to_raw_value;
         match self {
             Self::Danmaku(data) => to_raw_value(data),
@@ -521,14 +522,14 @@ pub struct InteractionEnd {
 }
 
 /// 从完整的命令 JSON 解析事件。已知命令缺失或为 null 的 data 按空对象处理。
-pub(super) fn parse_command(bytes: &[u8]) -> Result<LiveEvent, WsError> {
+pub fn parse_command(bytes: &[u8]) -> Result<LiveEvent, ProtocolError> {
     let value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| WsError::decode(format!("开放平台推送不是 JSON：{error}")))?;
+        .map_err(|error| ProtocolError::decode(format!("开放平台推送不是 JSON：{error}")))?;
     let cmd = value
         .get("cmd")
         .and_then(Value::as_str)
         .filter(|cmd| !cmd.is_empty())
-        .ok_or_else(|| WsError::decode("开放平台推送缺少 cmd"))?;
+        .ok_or_else(|| ProtocolError::decode("开放平台推送缺少 cmd"))?;
     let data = match value.get("data").cloned() {
         None | Some(Value::Null) => Value::Object(serde_json::Map::new()),
         Some(data) => data,
@@ -555,9 +556,9 @@ pub(super) fn parse_command(bytes: &[u8]) -> Result<LiveEvent, WsError> {
     Ok(event)
 }
 
-fn parse_data<T: for<'de> Deserialize<'de>>(cmd: &str, data: Value) -> Result<T, WsError> {
+fn parse_data<T: for<'de> Deserialize<'de>>(cmd: &str, data: Value) -> Result<T, ProtocolError> {
     serde_json::from_value(data)
-        .map_err(|error| WsError::decode(format!("{cmd} 无法解析：{error}")))
+        .map_err(|error| ProtocolError::decode(format!("{cmd} 无法解析：{error}")))
 }
 
 #[cfg(test)]

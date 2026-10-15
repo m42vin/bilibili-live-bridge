@@ -64,12 +64,6 @@ impl WsError {
             message: message.into(),
         }
     }
-
-    pub(super) fn decode(message: impl Into<String>) -> Self {
-        Self::Decode {
-            message: message.into(),
-        }
-    }
 }
 
 impl fmt::Display for WsError {
@@ -89,6 +83,17 @@ impl std::error::Error for WsError {
         match self {
             Self::Transport { source, .. } => Some(source.as_ref()),
             _ => None,
+        }
+    }
+}
+
+impl From<bridge_core::open_live::ws::ProtocolError> for WsError {
+    fn from(error: bridge_core::open_live::ws::ProtocolError) -> Self {
+        use bridge_core::open_live::ws::ProtocolError;
+        match error {
+            ProtocolError::Invalid { message } => Self::Invalid { message },
+            ProtocolError::Protocol { message } => Self::Protocol { message },
+            ProtocolError::Decode { message } => Self::Decode { message },
         }
     }
 }

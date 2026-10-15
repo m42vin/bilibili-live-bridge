@@ -53,25 +53,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
-name = "bilibili-live-bridge"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "futures-util",
- "hmac",
- "md-5",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -84,6 +65,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "bridge-core"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "hmac",
+ "md-5",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "bridge-native"
+version = "0.1.0"
+dependencies = [
+ "bridge-core",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

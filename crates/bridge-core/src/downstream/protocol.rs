@@ -2,34 +2,49 @@
 
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::delivery::{EventCursor, RecordedEvent, ResumeUnavailable};
 use crate::open_live::ws::LiveEvent;
-use crate::session::{EventCursor, RecordedEvent, ResumeUnavailable};
 
+/// 客户端发送的订阅或累计确认消息。
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum ClientMessage {
+pub enum ClientMessage {
+    /// 请求订阅，业务约束由 parse_subscribe 校验。
     Subscribe {
+        /// 主播身份码。
         code: String,
+        /// 是否启用累计确认与续传。
         #[serde(default)]
         ack: bool,
+        /// 最多允许的未确认事件数量。
         ack_window: Option<u64>,
+        /// 最后连续处理完成的位置；补发从其后开始。
         resume_after: Option<EventCursor>,
     },
+    /// 累计确认同一流内已连续处理的事件。
     Ack {
+        /// 事件流标识，用于区分不同流的序号。
         stream_id: String,
+        /// 桥侧序号。
         seq: u64,
     },
 }
 
+/// 经解析与校验的订阅参数。
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Subscribe {
+pub struct Subscribe {
+    /// 主播身份码。
     pub code: String,
+    /// 是否启用累计确认与续传。
     pub ack: bool,
+    /// 最多允许的未确认事件数量。
     pub ack_window: Option<u64>,
+    /// 最后连续处理完成的位置；补发从其后开始。
     pub resume_after: Option<EventCursor>,
 }
 
-pub(super) fn parse_subscribe(text: &str) -> Result<Subscribe, &'static str> {
+/// 解析首条订阅消息，校验非空身份码、ACK 窗口与续传约束。
+pub fn parse_subscribe(text: &str) -> Result<Subscribe, &'static str> {
     let ClientMessage::Subscribe {
         code,
         ack,
@@ -56,59 +71,86 @@ pub(super) fn parse_subscribe(text: &str) -> Result<Subscribe, &'static str> {
     })
 }
 
-#[cfg(test)]
-pub(super) fn subscription_code(text: &str) -> Result<String, &'static str> {
-    parse_subscribe(text).map(|request| request.code)
-}
-
+/// 服务端发给下游客户端的 JSON 消息。
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum ServerMessage<'a> {
+pub enum ServerMessage<'a> {
+    /// 上游连接状态变化。
     Status {
+        /// 上游状态，如 connected 或 reconnecting。
         state: &'static str,
     },
+    /// 实时模式订阅已就绪。
     Ready {
+        /// 直播间编号。
         room_id: i64,
+        /// 平台互动场次标识。
         game_id: &'a str,
     },
+    /// 确认模式订阅已就绪，包含续传位置和窗口。
     #[serde(rename = "ready")]
     DeliveryReady {
+        /// 直播间编号。
         room_id: i64,
+        /// 平台互动场次标识。
         game_id: &'a str,
+        /// 事件流标识，用于区分不同流的序号。
         stream_id: &'a str,
+        /// 桥侧序号。
         seq: u64,
+        /// 是否成功续传已有事件流。
         resumed: bool,
+        /// 最多允许的未确认事件数量。
         ack_window: u64,
     },
+    /// 实时模式事件，不含桥侧序号。
     Event {
+        /// 直播间编号。
         room_id: i64,
+        /// 平台事件命令名。
         cmd: &'a str,
+        /// 事件正文。
         data: EventData<'a>,
     },
+    /// 确认模式事件，包含流标识和桥侧序号。
     #[serde(rename = "event")]
     Recorded {
+        /// 直播间编号。
         room_id: i64,
+        /// 事件流标识，用于区分不同流的序号。
         stream_id: &'a str,
+        /// 桥侧序号。
         seq: u64,
+        /// 平台事件命令名。
         cmd: &'a str,
+        /// 事件正文。
         data: &'a serde_json::value::RawValue,
     },
+    /// 无法按给定游标继续完整交付。
     ResumeUnavailable {
+        /// 续传失败原因与当前日志保留范围。
         #[serde(flatten)]
         detail: &'a ResumeUnavailable,
     },
+    /// 实时订阅落后，部分事件已被覆盖。
     Lagged {
+        /// 被覆盖而无法交付的事件数量。
         skipped: u64,
     },
+    /// 接入或协议错误。
     Error {
+        /// 错误分类。
         code: &'a str,
+        /// 错误说明，不包含请求凭据。
         message: &'a str,
     },
+    /// 会话已经结束。
     Closed,
 }
 
 impl<'a> ServerMessage<'a> {
-    pub(super) fn recorded(room_id: i64, stream_id: &'a str, record: &'a RecordedEvent) -> Self {
+    /// 将日志记录封装成确认模式事件。
+    pub fn recorded(room_id: i64, stream_id: &'a str, record: &'a RecordedEvent) -> Self {
         Self::Recorded {
             room_id,
             stream_id,
@@ -117,7 +159,8 @@ impl<'a> ServerMessage<'a> {
             data: &record.data,
         }
     }
-    pub(super) fn event(room_id: i64, event: &'a LiveEvent) -> Self {
+    /// 将直播事件封装成实时模式消息。
+    pub fn event(room_id: i64, event: &'a LiveEvent) -> Self {
         Self::Event {
             room_id,
             cmd: event.cmd(),
@@ -126,7 +169,8 @@ impl<'a> ServerMessage<'a> {
     }
 }
 
-pub(super) struct EventData<'a>(&'a LiveEvent);
+/// 直播事件正文的序列化适配器。
+pub struct EventData<'a>(&'a LiveEvent);
 
 impl Serialize for EventData<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -136,3 +180,7 @@ impl Serialize for EventData<'_> {
             .serialize(serializer)
     }
 }
+
+#[cfg(test)]
+#[path = "protocol_test.rs"]
+mod protocol_test;

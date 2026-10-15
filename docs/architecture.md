@@ -5,9 +5,19 @@
 当前项目提供开放平台客户端、进程内会话管理及下游 WebSocket 服务。下文中的“订阅者”指持有
 `Subscription` 的调用方，也包括每条下游连接；外部协议见 [客户端协议](downstream-protocol.md)。
 
+## Crate 边界
+
+依赖方向为 `bridge-native → bridge-core`。核心仅处理显式输入，不读取环境变量、不生成随机数、不访问时钟或网络。
+
+`bridge-core::open_live` 包含签名、API 请求与响应模型、错误码、官方包解析及事件模型；`bridge-core::downstream::protocol` 定义下游消息；`bridge-core::delivery` 定义游标、事件记录与续传失败信息。
+
+原生库沿用 `bilibili_live_bridge` 名称及公共模块路径，重导出共享类型。核心的 `ResponseError` / `ProtocolError` 在原生边界转换成原有 `ApiError` / `WsError` 变体，传输错误及其原始错误链仍由原生库保存。
+
+`Manager`、两类心跳、重连、日志保留策略与内存日志仍由 native 的 Tokio 运行时驱动。本次未将这些并发流程改写为跨运行时状态机。
+
 ## 模块边界
 
-项目是一个 Cargo 包，库入口是 [src/lib.rs](../src/lib.rs)，可执行入口位于 [src/bin](../src/bin/)。
+项目是包含 `bridge-core` 与 `bridge-native` 的 Cargo workspace。原生库入口是 [src/lib.rs](../crates/bridge-native/src/lib.rs)，可执行入口位于 [src/bin](../crates/bridge-native/src/bin/)。
 
 | 模块 | 职责 | 主要入口 |
 | --- | --- | --- |
@@ -19,7 +29,7 @@
 | `downstream` | WebSocket 接入、JSON 封装、独立发送及连接任务收尾 | `serve` |
 | `bin` | 组装库功能，处理服务和示例程序的退出及日志 | `server`、`http_auth`、`ws_listen`、`multi_client` |
 
-会话层通过私有的 [Platform / LiveSocket](../src/session/platform.rs) 调用平台能力。生产实现包装 `Client` 和 `Connection`，测试实现使用模拟平台。签名、二进制包和命令解析细节保留在各自模块内部。
+会话层通过私有的 [Platform / LiveSocket](../crates/bridge-native/src/session/platform.rs) 调用平台能力。生产实现包装 `Client` 和 `Connection`，测试实现使用模拟平台。签名、二进制包和命令解析细节保留在各自模块内部。
 
 ```mermaid
 flowchart LR
@@ -52,7 +62,7 @@ flowchart LR
 
 ## 会话接入与复用
 
-接入逻辑位于 [manager.rs](../src/session/manager.rs)。
+接入逻辑位于 [manager.rs](../crates/bridge-native/src/session/manager.rs)。
 
 1. `attach` 去掉身份码首尾空白，拒绝空码；管理器开始关闭后拒绝新的接入。
 2. 在 `by_code` 中占位。首个调用方负责开启，后续同码调用方等待同一会话的状态变化，避免并发重复调用 `start`。
@@ -131,7 +141,7 @@ flowchart LR
 恢复期限超过 45 秒、正常间隔加 10 秒请求超时不小于恢复期限，或初始退避超过上限时，
 管理器只记录警告并保留配置，退避仍封顶。自定义不安全组合不能保证在平台失效前恢复；
 如果首次失败时预算已耗尽，立即清理。格式错误、零值和时钟范围溢出仍返回参数错误。
-环境变量与库入口见 README；调度实现位于 [heartbeat.rs](../src/session/heartbeat.rs)。
+环境变量与库入口见 README；调度实现位于 [heartbeat.rs](../crates/bridge-native/src/session/heartbeat.rs)。
 
 使用低层 `Client` 和 `Connection` 时，调用方自己负责项目心跳。`Connection` 不会启动独立的心跳任务；长时间停止读取或在事件处理中阻塞，会影响 WebSocket 心跳和 Ping/Pong。
 
@@ -162,9 +172,9 @@ Phase::Ready 在恢复期间仍表示可以订阅；独立 watch 通道发布 Co
 
 ## 事件解析与订阅
 
-[packet.rs](../src/open_live/ws/packet.rs) 按 16 字节大端包头拆包，支持原文和 zlib 压缩包，以及同帧多包、嵌套压缩。单包长度、解压输出、包数量和嵌套深度都有上限；新增协议支持时需要保留这些限制。
+[packet.rs](../crates/bridge-core/src/open_live/ws/packet.rs) 按 16 字节大端包头拆包，支持原文和 zlib 压缩包，以及同帧多包、嵌套压缩。单包长度、解压输出、包数量和嵌套深度都有上限；新增协议支持时需要保留这些限制。
 
-[cmd.rs](../src/open_live/ws/cmd.rs) 根据 `cmd` 构造 `LiveEvent`。已知命令的缺失字段使用声明的默认值，字段类型不匹配会返回解析错误；未知字段不保留在已知事件结构中。未知命令保留 `cmd` 与原始 `data`，缺失的 `data` 为 JSON `null`。
+[cmd.rs](../crates/bridge-core/src/open_live/ws/cmd.rs) 根据 `cmd` 构造 `LiveEvent`。已知命令的缺失字段使用声明的默认值，字段类型不匹配会返回解析错误；未知字段不保留在已知事件结构中。未知命令保留 `cmd` 与原始 `data`，缺失的 `data` 为 JSON `null`。
 
 只有 `InteractionEnd` 的 `ends_push()` 为真。普通 `LiveEnd` 是下播事件，仍会转发，不会单独触发会话关闭。
 
@@ -177,7 +187,7 @@ Phase::Ready 在恢复期间仍表示可以订阅；独立 watch 通道发布 Co
 
 ## 有界日志、确认模式与续传
 
-[delivery.rs](../src/session/delivery.rs) 为一个 Manager 的所有会话维护共享内存日志。
+[delivery.rs](../crates/bridge-native/src/session/delivery.rs) 为一个 Manager 的所有会话维护共享内存日志。
 上游任务在解析事件后先序列化记录，再广播；即使没有订阅者也会记录。
 日志保存共享的 JSON 数据、命令与桥侧 seq，流标识为随机 UUID；原场次上游恢复不重置。
 独立 watch 只发布变化通知，读取游标和事件正文以日志为准，通知合并不会丢事件。
