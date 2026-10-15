@@ -1,7 +1,7 @@
 //! 下游客户端示例：身份码订阅、处理后 ACK、状态处理和按已处理游标续传。
 //!
 //! 先启动 `server`，再设置 `AUTH_CODE` 并运行本程序；无需平台 Access Key。
-//! `BRIDGE_URL` 默认为 `ws://127.0.0.1:8080/ws`。网络断开按 2–10 秒退避重连；
+//! `BRIDGE_URL` 可设为 HTTP(S) 接入地址，先 POST 获取短期连接凭证；默认直连地址为 `ws://127.0.0.1:8080/ws`。网络断开按 2–10 秒退避重连；
 //! `closed`、服务端 `error`、续传失败或无效业务消息结束程序。游标仅存于进程内。
 //! 业务处理独立于网络读取，Ctrl-C 在连接和退避期间均有效。
 
@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bilibili_live_bridge::session::EventCursor;
+use bridge_core::downstream::admission::{
+    AdmissionFailure, AdmissionRequest, AdmissionResponse, is_retryable_code,
+};
+use bridge_core::downstream::protocol::ClientMessage;
 use tokio::sync::{mpsc, watch};
 
 use futures_util::{SinkExt, StreamExt};
@@ -18,7 +22,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -44,6 +47,10 @@ struct Settings {
 }
 
 impl Settings {
+    fn is_http(&self) -> bool {
+        self.url.starts_with("http://") || self.url.starts_with("https://")
+    }
+
     fn from_env() -> Result<Self, String> {
         let code = std::env::var("AUTH_CODE").map_err(|_| "缺少环境变量 AUTH_CODE")?;
         let code = code.trim().to_owned();
@@ -55,14 +62,162 @@ impl Settings {
             Err(std::env::VarError::NotPresent) => "ws://127.0.0.1:8080/ws".into(),
             Err(_) => return Err("BRIDGE_URL 必须是有效文本".into()),
         };
-        let request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|_| "BRIDGE_URL 必须是有效的 ws:// 或 wss:// 地址")?;
-        if !matches!(request.uri().scheme_str(), Some("ws" | "wss")) {
-            return Err("BRIDGE_URL 必须使用 ws:// 或 wss://".into());
-        }
+        validate_endpoint(&url)?;
+        let url = reqwest::Url::parse(&url)
+            .map_err(|_| "无效 BRIDGE_URL")?
+            .to_string();
         Ok(Self { url, code })
+    }
+}
+
+fn validate_endpoint(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "BRIDGE_URL 不是有效地址")?;
+    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("BRIDGE_URL 必须为无用户信息和片段的 http(s)/ws(s) 地址".into());
+    }
+    Ok(())
+}
+
+enum ConnectFailure {
+    Retry(Option<u64>),
+    Fatal(String),
+}
+
+async fn connect(
+    settings: &Settings,
+    after: Option<EventCursor>,
+) -> Result<Socket, ConnectFailure> {
+    let (url, expires) = if settings.is_http() {
+        let started = Instant::now();
+        let response = timeout(IO_TIMEOUT, admit(settings, after))
+            .await
+            .map_err(|_| ConnectFailure::Retry(None))??;
+        let remaining =
+            Duration::from_millis(response.expires_in_ms).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(ConnectFailure::Retry(None));
+        }
+        (response.websocket_url, IO_TIMEOUT.min(remaining))
+    } else {
+        (settings.url.clone(), IO_TIMEOUT)
+    };
+    match timeout(expires, connect_async(url.as_str())).await {
+        Ok(Ok((socket, _))) => Ok(socket),
+        Ok(Err(Error::Http(response))) => {
+            let status = response.status().as_u16();
+            if matches!(status, 429 | 503) {
+                return Err(ConnectFailure::Retry(retry_after(
+                    response
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok()),
+                )));
+            }
+            // 已签发的凭证可能在网络传输中到期；重新接入，不复用旧 URL。
+            if settings.is_http() && matches!(status, 401 | 410) {
+                return Err(ConnectFailure::Retry(None));
+            }
+            if response.status().is_client_error() || response.status().is_redirection() {
+                return Err(ConnectFailure::Fatal(format!(
+                    "桥接服务拒绝握手，HTTP {status}，请检查 BRIDGE_URL 或访问权限"
+                )));
+            }
+            Err(ConnectFailure::Retry(None))
+        }
+        _ => Err(ConnectFailure::Retry(None)),
+    }
+}
+
+fn retry_after(value: Option<&str>) -> Option<u64> {
+    value?.parse::<u64>().ok()?.checked_mul(1000)
+}
+
+async fn admit(
+    settings: &Settings,
+    after: Option<EventCursor>,
+) -> Result<AdmissionResponse, ConnectFailure> {
+    let request = AdmissionRequest {
+        code: settings.code.clone(),
+        ack: true,
+        ack_window: Some(64),
+        resume_after: after,
+    }
+    .validate()
+    .map_err(|message| ConnectFailure::Fatal(message.into()))?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| ConnectFailure::Fatal("无法初始化 HTTP 接入客户端".into()))?;
+    let mut response = client
+        .post(&settings.url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|_| ConnectFailure::Retry(None))?;
+    let status = response.status();
+    let advice = retry_after(
+        response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok()),
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ConnectFailure::Retry(None))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > 8192 {
+            return Err(ConnectFailure::Fatal("HTTP 接入响应超过 8 KiB".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if status.as_u16() == 200 {
+        let granted: AdmissionResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| ConnectFailure::Fatal("无效 HTTP 接入响应".into()))?;
+        validate_endpoint(&granted.websocket_url)
+            .map_err(|_| ConnectFailure::Fatal("接入服务返回无效 WebSocket 地址".into()))?;
+        let url = reqwest::Url::parse(&granted.websocket_url).unwrap();
+        if !matches!(url.scheme(), "ws" | "wss")
+            || (settings.url.starts_with("https://") && url.scheme() != "wss")
+            || granted.expires_in_ms == 0
+        {
+            return Err(ConnectFailure::Fatal(
+                "接入服务返回无效或不安全的凭证".into(),
+            ));
+        }
+        return Ok(granted);
+    }
+    if let Ok(failure) = serde_json::from_slice::<AdmissionFailure>(&bytes) {
+        return Err(match failure {
+            AdmissionFailure::ResumeUnavailable { .. } => {
+                ConnectFailure::Fatal("续传不可用，不能自动放弃游标".into())
+            }
+            AdmissionFailure::Error {
+                code,
+                retry_after_ms,
+                ..
+            } if is_retryable_code(&code) => {
+                ConnectFailure::Retry(retry_after_ms.into_iter().chain(advice).max())
+            }
+            AdmissionFailure::Error { .. } => {
+                ConnectFailure::Fatal("接入失败，请检查身份码和服务端日志".into())
+            }
+        });
+    }
+    if status.as_u16() == 429 || status.is_server_error() {
+        Err(ConnectFailure::Retry(advice))
+    } else {
+        Err(ConnectFailure::Fatal(format!(
+            "HTTP 接入被拒绝或响应无效，HTTP {}",
+            status.as_u16()
+        )))
     }
 }
 
@@ -70,6 +225,9 @@ impl Settings {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
+    Ping {
+        nonce: String,
+    },
     Ready {
         room_id: i64,
         game_id: String,
@@ -126,19 +284,20 @@ async fn run_client(
     let cursor: CursorState = Arc::new(Mutex::new(None));
     loop {
         tracing::info!("连接直播桥");
+        let after = cursor.lock().unwrap().clone();
         let connected = tokio::select! {
             biased;
             result = shutdown.as_mut() => return interrupted(result),
-            result = timeout(IO_TIMEOUT, connect_async(settings.url.as_str())) => result,
+            result = connect(settings, after) => result,
         };
         let mut stable = false;
-        let mut suggested = None;
+        let suggested;
         match connected {
-            Ok(Ok((mut socket, _))) => {
+            Ok(mut socket) => {
                 let mut ready_at = None;
                 let outcome = listen(
                     &mut socket,
-                    &settings.code,
+                    (!settings.is_http()).then_some(settings.code.as_str()),
                     &cursor,
                     &mut ready_at,
                     shutdown.as_mut(),
@@ -162,24 +321,11 @@ async fn run_client(
                     }
                 }
             }
-            Ok(Err(Error::Http(response))) if matches!(response.status().as_u16(), 429 | 503) => {
-                suggested = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .and_then(|s| s.checked_mul(1000));
-                tracing::warn!(retry_after_ms = suggested, "入口暂时繁忙");
+            Err(ConnectFailure::Retry(retry_after_ms)) => {
+                suggested = retry_after_ms;
+                tracing::warn!(retry_after_ms = suggested, "接入失败或入口暂时繁忙");
             }
-            Ok(Err(Error::Http(response)))
-                if response.status().is_client_error() && response.status().as_u16() != 429 =>
-            {
-                return Err(format!(
-                    "桥接服务拒绝握手，HTTP {}，请检查 BRIDGE_URL 或访问权限",
-                    response.status().as_u16()
-                ));
-            }
-            _ => tracing::warn!("握手失败或超时"),
+            Err(ConnectFailure::Fatal(message)) => return Err(message),
         }
         if stable {
             delay = RETRY_INITIAL;
@@ -232,7 +378,7 @@ async fn process_events(
 
 async fn listen<F: Future<Output = std::io::Result<()>>>(
     socket: &mut Socket,
-    code: &str,
+    code: Option<&str>,
     cursor: &CursorState,
     ready_at: &mut Option<Instant>,
     shutdown: Pin<&mut F>,
@@ -247,7 +393,7 @@ async fn listen<F: Future<Output = std::io::Result<()>>>(
     let worker = tokio::spawn(process_events(pending, Arc::clone(cursor), done));
     let result = receive(
         socket,
-        subscribe,
+        code.map(|_| subscribe),
         after,
         cursor,
         work,
@@ -265,7 +411,7 @@ async fn listen<F: Future<Output = std::io::Result<()>>>(
 #[allow(clippy::too_many_arguments)]
 async fn receive<F: Future<Output = std::io::Result<()>>>(
     socket: &mut Socket,
-    subscribe: Value,
+    subscribe: Option<Value>,
     after: Option<EventCursor>,
     cursor: &CursorState,
     work: mpsc::Sender<Work>,
@@ -273,16 +419,19 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
     ready_at: &mut Option<Instant>,
     mut shutdown: Pin<&mut F>,
 ) -> Result<Outcome, String> {
-    let sent = tokio::select! {
-        biased;
-        result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
-        result = timeout(IO_TIMEOUT,socket.send(Message::text(subscribe.to_string()))) => result,
-    };
-    if !matches!(sent, Ok(Ok(()))) {
-        return Ok(Outcome::Retry {
-            retry_after_ms: None,
-        });
+    if let Some(subscribe) = subscribe {
+        let sent = tokio::select! {
+            biased;
+            result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
+            result = timeout(IO_TIMEOUT,socket.send(Message::text(subscribe.to_string()))) => result,
+        };
+        if !matches!(sent, Ok(Ok(()))) {
+            return Ok(Outcome::Retry {
+                retry_after_ms: None,
+            });
+        }
     }
+    let mut last_incoming = Instant::now();
     let mut received: Option<EventCursor> = None;
     loop {
         let incoming = tokio::select! {
@@ -300,13 +449,32 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                 if !matches!(sent,Ok(Ok(()))) { return Ok(Outcome::Retry {retry_after_ms:None}); }
                 continue;
             }
-            result = timeout(IDLE_TIMEOUT,socket.next()) => result,
+            result = tokio::time::timeout_at(last_incoming + IDLE_TIMEOUT,socket.next()) => result,
         };
+        if matches!(&incoming, Ok(Some(Ok(_)))) {
+            last_incoming = Instant::now();
+        }
         match incoming {
             Ok(Some(Ok(Message::Text(text)))) => {
                 let message: ServerMessage =
                     serde_json::from_str(&text).map_err(|_| "桥接服务返回了无效 JSON 消息")?;
                 match message {
+                    ServerMessage::Ping { nonce } => {
+                        if nonce.len() > 256 {
+                            return Err("保活 nonce 过长".into());
+                        }
+                        let pong = serde_json::to_string(&ClientMessage::Pong { nonce }).unwrap();
+                        let sent = tokio::select! {
+                            biased;
+                            result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
+                            result = timeout(IO_TIMEOUT, socket.send(Message::text(pong))) => result,
+                        };
+                        if !matches!(sent, Ok(Ok(()))) {
+                            return Ok(Outcome::Retry {
+                                retry_after_ms: None,
+                            });
+                        }
+                    }
                     ServerMessage::Ready {
                         room_id,
                         game_id,
@@ -391,10 +559,7 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                         code,
                         retry_after_ms,
                     } => {
-                        if matches!(
-                            code.as_str(),
-                            "server_busy" | "rate_limited" | "subscription_limit"
-                        ) {
+                        if is_retryable_code(&code) {
                             tracing::warn!(%code,?retry_after_ms,"暂时拒绝接入，保留游标重试");
                             return Ok(Outcome::Retry { retry_after_ms });
                         }

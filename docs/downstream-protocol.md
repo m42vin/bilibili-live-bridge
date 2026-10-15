@@ -210,3 +210,63 @@ closed 使用关闭码 1000。读写故障或连接已断开时可能直接断�
 Ctrl-C 或 Unix SIGTERM 停止接入、通知下游关闭，并等待共享开场与会话结束请求完成。
 待接入请求可以取消等待，共享任务不因单个请求退出而丢弃已发出的平台开启请求。
 发送字节预算、历史回放限速和失败身份码冷却不在此阶段实现。
+
+
+## HTTP 接入协议（为 Worker 适配预留）
+
+core 定义 `downstream::admission`，native 的 `downstream_client` 已支持此协议。
+当前 native `server` 仍只提供原有 `/ws`，尚未实现 HTTP 接入服务或 Room DO。
+
+客户端向配置的完整 HTTP(S) 接入地址发送 POST，Content-Type 为 application/json。
+正文与 subscribe 的订阅参数相同，但不含 `type`：
+
+```json
+{"code":"主播身份码","ack":true,"ack_window":64,"resume_after":{"stream_id":"原流标识","seq":125}}
+```
+
+首次接入省略 `resume_after` 或设为 null。HTTP 与 WebSocket 共用身份码、ACK 窗口和续传校验。
+携带游标时只查找旧流，不得因旧流不可用而开启新场次。成功返回 HTTP 200：
+
+```json
+{"websocket_url":"wss://bridge.example/ws?ticket=opaque-ticket","expires_in_ms":30000}
+```
+
+`websocket_url` 是含短期不透明凭证的完整地址，不得包含主播身份码；日志不得记录完整 URL。
+`expires_in_ms` 是从服务端生成响应起的有效毫秒数，必须为正。示例客户端保守扣除整个 HTTP 请求耗时，
+并将升级期限限制在剩余有效期内。HTTPS 接入只接受 WSS 地址，不跟随 HTTP 重定向，响应正文最多 8 KiB。
+客户端只应配置可信的接入服务；返回的 WebSocket 可以位于不同主机。
+
+凭证应绑定授权、订阅参数、目标房间/流及有效期，服务端在升级时验证并登记订阅。
+客户端连接该地址后不再发送 subscribe，也不再发送身份码；收到 ready 才表示订阅成功。
+HTTP 接入到 WebSocket 建连之间的预留资源由服务端租约负责回收。
+
+失败使用非 2xx 状态及与 WebSocket 相同的 `error` 或 `resume_unavailable` JSON 正文。
+`error` 包含 code、message、可选 retry_after_ms；`resume_unavailable` 包含 reason、earliest_after、latest_seq。
+建议参数错误用 400、授权错误用 403、续传失败用 409、限流用 429、暂时繁忙用 503。
+示例客户端优先解释业务错误：server_busy、rate_limited、subscription_limit 可重试；续传失败及其他业务错误终止。
+无有效业务错误正文时，HTTP 429 和 5xx 重试，其他状态终止；有效 200 响应以外的成功状态视为协议错误。
+HTTP Retry-After 支持整数秒，与正文建议同时存在时取较大值。原有退避上限和抖动规则保持不变。
+
+每次重连都携带最新已处理游标重新 POST，不能复用旧凭证或自动清除游标。
+Room WebSocket 升级以 401 或 410 表示凭证无效/过期时，客户端重新接入；403 等其他终止性拒绝不重试。
+接入 POST、升级和发送分别最多等待 10 秒，Ctrl-C 可以取消接入请求及退避。
+
+### 应用层保活
+
+无法主动发送标准 WebSocket Ping 的服务端可发送：
+
+```json
+{"type":"ping","nonce":"本次探测标识"}
+```
+
+客户端立即原样应答：
+
+```json
+{"type":"pong","nonce":"本次探测标识"}
+```
+
+nonce 为不超过 256 UTF-8 字节的字符串。服务端每次使用新的标识，只接受与当前探测匹配的 pong。
+建议 ready 后每 20 秒探测、10 秒未匹配即断开；接入等待中也可以发送 ping。
+保活不推进业务游标、不占 ACK 窗口，不使用 status 消息代替。
+native 示例客户端支持两种保活，业务处理不阻塞应答；90 秒没有任何入站帧则重连，发送 ACK 不延长该期限。
+native server 继续使用标准控制帧，不主动发送应用层 ping，也不接受未经请求的应用层 pong。

@@ -165,6 +165,11 @@ export AUTH_CODE='主播身份码'
 cargo run --locked --bin downstream_client
 ```
 
+客户端也支持 HTTP 接入模式：将 `BRIDGE_URL` 设置为完整的 `http://` 或 `https://` 接入地址。
+它会 POST 身份码与续传参数，取得短期 WebSocket 地址，连接后等待 ready；每次重连重新申请凭证并保留已处理游标。
+支持应用层 ping/pong 与原有标准 WebSocket 保活。协议见 [HTTP 接入协议](docs/downstream-protocol.md#http-接入协议为-worker-适配预留)。
+当前 native server 尚未提供该 HTTP 接口，此模式用于后续 Worker 或其他实现相同协议的服务。
+
 客户端只需要身份码，无需平台 Access Key 或 `BILIBILI_APP_ID`，也不会自动读取 `.env`。
 可通过 `BRIDGE_URL` 修改地址，默认是 `ws://127.0.0.1:8080/ws`；例如：
 

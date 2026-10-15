@@ -6,7 +6,7 @@ use crate::delivery::{EventCursor, RecordedEvent, ResumeUnavailable};
 use crate::open_live::ws::LiveEvent;
 
 /// 客户端发送的订阅或累计确认消息。
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// 请求订阅，业务约束由 parse_subscribe 校验。
@@ -21,6 +21,11 @@ pub enum ClientMessage {
         /// 最后连续处理完成的位置；补发从其后开始。
         resume_after: Option<EventCursor>,
     },
+    /// 应答服务端应用层保活，原样返回 nonce。
+    Pong {
+        /// 当前探测标识。
+        nonce: String,
+    },
     /// 累计确认同一流内已连续处理的事件。
     Ack {
         /// 事件流标识，用于区分不同流的序号。
@@ -31,11 +36,12 @@ pub enum ClientMessage {
 }
 
 /// 经解析与校验的订阅参数。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Subscribe {
     /// 主播身份码。
     pub code: String,
     /// 是否启用累计确认与续传。
+    #[serde(default)]
     pub ack: bool,
     /// 最多允许的未确认事件数量。
     pub ack_window: Option<u64>,
@@ -54,27 +60,43 @@ pub fn parse_subscribe(text: &str) -> Result<Subscribe, &'static str> {
     else {
         return Err("首包必须为 subscribe");
     };
-    if code.trim().is_empty() {
-        return Err("身份码不能为空");
-    }
-    if resume_after.is_some() && !ack {
-        return Err("续传必须启用 ack");
-    }
-    if ack_window.is_some_and(|window| window == 0) || (ack_window.is_some() && !ack) {
-        return Err("ack_window 必须在 ACK 模式中为正整数");
-    }
-    Ok(Subscribe {
-        code: code.trim().to_owned(),
+    Subscribe {
+        code,
         ack,
         ack_window,
         resume_after,
-    })
+    }
+    .validate()
+}
+
+impl Subscribe {
+    /// HTTP 接入和 WebSocket 首包共享的业务校验；规范化身份码。
+    pub fn validate(mut self) -> Result<Self, &'static str> {
+        if self.code.trim().is_empty() {
+            return Err("身份码不能为空");
+        }
+        if self.resume_after.is_some() && !self.ack {
+            return Err("续传必须启用 ack");
+        }
+        if self.ack_window.is_some_and(|window| window == 0)
+            || (self.ack_window.is_some() && !self.ack)
+        {
+            return Err("ack_window 必须在 ACK 模式中为正整数");
+        }
+        self.code = self.code.trim().to_owned();
+        Ok(self)
+    }
 }
 
 /// 服务端发给下游客户端的 JSON 消息。
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage<'a> {
+    /// 应用层存活探测；客户端原样返回 pong，独立于业务 ACK。
+    Ping {
+        /// 当前探测标识。
+        nonce: &'a str,
+    },
     /// 上游连接状态变化。
     Status {
         /// 上游状态，如 connected 或 reconnecting。

@@ -232,3 +232,186 @@ async fn http_busy_response_retries_without_service_access_credentials() {
         assert_eq!(client.await.unwrap(),Ok(()));
     }).await.unwrap();
 }
+
+// 完整读取 POST 正文，避免 TCP 分包使接入测试偶发通过或失败。
+async fn http_reply(listener: &TcpListener, status: &str, body: Value) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut bytes = Vec::new();
+    let (header_end, length) = loop {
+        let mut buffer = [0; 1024];
+        let n = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(n, 0);
+        bytes.extend_from_slice(&buffer[..n]);
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+            assert!(headers.starts_with("POST /admit HTTP/1.1"));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            break (end + 4, length);
+        }
+    };
+    while bytes.len() < header_end + length {
+        let mut buffer = [0; 1024];
+        let n = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(n, 0);
+        bytes.extend_from_slice(&buffer[..n]);
+    }
+    let request = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+    let body = body.to_string();
+    let reply = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(reply.as_bytes()).await.unwrap();
+    request
+}
+
+#[tokio::test]
+async fn http_admission_reconnects_with_cursor_and_answers_application_ping() {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let settings = Settings {
+        url: format!("http://{}/admit", http.local_addr().unwrap()),
+        code: "example-code".into(),
+    };
+    let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+    timeout(Duration::from_secs(12), async {
+        for attempt in 0..2 {
+            let request = http_reply(&http, "200 OK", json!({"websocket_url":format!("ws://{}/ws?ticket={attempt}", ws.local_addr().unwrap()),"expires_in_ms":10000})).await;
+            assert_eq!(request["code"], "example-code");
+            assert_eq!(request["ack"], true);
+            assert!(request.get("type").is_none());
+            if attempt == 0 { assert!(request["resume_after"].is_null()); }
+            else { assert_eq!(request["resume_after"], json!({"stream_id":"stream-1","seq":1})); }
+            let (stream, _) = ws.accept().await.unwrap();
+            let mut peer = accept_async(stream).await.unwrap();
+            // ready 前也允许保活；第一条客户端消息必须是 pong，不能重复 subscribe。
+            send(&mut peer, json!({"type":"ping","nonce":"probe"})).await;
+            let Message::Text(pong) = peer.next().await.unwrap().unwrap() else { panic!("expected pong"); };
+            assert_eq!(serde_json::from_str::<Value>(&pong).unwrap(), json!({"type":"pong","nonce":"probe"}));
+            send(&mut peer, ready(attempt, attempt != 0)).await;
+            if attempt == 0 {
+                send(&mut peer,json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"DM","data":null})).await;
+                let Message::Text(ack) = peer.next().await.unwrap().unwrap() else { panic!("expected ack"); };
+                assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"], 1);
+                drop(peer);
+            } else {
+                send(&mut peer, json!({"type":"closed"})).await;
+            }
+        }
+        assert_eq!(client.await.unwrap(), Ok(()));
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn admission_errors_preserve_resume_and_classify_retry() {
+    for (status, body, retryable) in [
+        (
+            "429 Too Many Requests",
+            json!({"type":"error","code":"rate_limited","message":"busy","retry_after_ms":1234}),
+            true,
+        ),
+        ("503 Service Unavailable", json!({}), true),
+        (
+            "409 Conflict",
+            json!({"type":"resume_unavailable","reason":"cursor_expired","earliest_after":10,"latest_seq":20}),
+            false,
+        ),
+        (
+            "403 Forbidden",
+            json!({"type":"error","code":"attach_failed","message":"secret"}),
+            false,
+        ),
+        ("302 Found", json!({}), false),
+        (
+            "200 OK",
+            json!({"websocket_url":"https://example.com","expires_in_ms":1000}),
+            false,
+        ),
+        (
+            "200 OK",
+            json!({"websocket_url":"ws://example.com","expires_in_ms":0}),
+            false,
+        ),
+        (
+            "200 OK",
+            json!({"websocket_url":"ws://example.com","expires_in_ms":1000,"padding":"x".repeat(8192)}),
+            false,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = Settings {
+            url: format!("http://{}/admit", listener.local_addr().unwrap()),
+            code: "example-code".into(),
+        };
+        let after = EventCursor {
+            stream_id: "stream-1".into(),
+            seq: 7,
+        };
+        timeout(Duration::from_secs(3), async {
+            let (result, request) = tokio::join!(
+                admit(&settings, Some(after)),
+                http_reply(&listener, status, body)
+            );
+            assert_eq!(request["resume_after"]["seq"], 7);
+            assert!(result.is_err());
+            assert_eq!(matches!(result, Err(ConnectFailure::Retry(_))), retryable);
+            if let Err(ConnectFailure::Fatal(message)) = result {
+                assert!(!message.contains("secret"));
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn interrupt_cancels_pending_http_admission() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let settings = Settings {
+        url: format!("http://{}/admit", listener.local_addr().unwrap()),
+        code: "example-code".into(),
+    };
+    let (stop, stopped) = oneshot::channel();
+    let client = tokio::spawn(async move {
+        run_client(&settings, async {
+            stopped.await.unwrap();
+            Ok(())
+        })
+        .await
+    });
+    timeout(Duration::from_secs(2), async {
+        let (_stream, _) = listener.accept().await.unwrap();
+        stop.send(()).unwrap();
+        assert_eq!(client.await.unwrap(), Ok(()));
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn endpoint_validation_accepts_both_modes_without_embedded_credentials() {
+    for url in [
+        "http://localhost/admit",
+        "https://example.com/admit",
+        "ws://localhost/ws",
+        "wss://example.com/ws",
+    ] {
+        assert!(validate_endpoint(url).is_ok());
+    }
+    for url in [
+        "file:///tmp/x",
+        "https://user:password@example.com",
+        "wss://example.com/#fragment",
+        "invalid",
+    ] {
+        assert!(validate_endpoint(url).is_err());
+    }
+}
