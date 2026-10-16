@@ -39,6 +39,11 @@ BRIDGE_URL=http://127.0.0.1:8787/admit AUTH_CODE='主播身份码' \
 `.dev.vars` 是本地秘密，不入库；正式环境通过 Wrangler secret 配置三个同名值。
 配置平台凭据后，真实接入会调用 Bilibili start/end。
 
+接入等待或失败时查看 Worker 终端：`platform request started/completed` 标记 start 请求，
+`platform request failed` 包含路径、失败阶段、是否超时、HTTP 状态、平台业务错误码和耗时，
+不输出平台 message、请求正文或凭据。`fetch` 表示仍在等待响应头，`response_body` 表示读取响应正文，
+`platform_response` 表示解析或平台业务错误；平台请求最多等待 10 秒，客户端 HTTP 接入最多等待 30 秒。
+
 ```sh
 npm run check     # 构建、绑定及部署包检查，不发布
 # 配置好正式 secrets 后，才执行 npx wrangler deploy
@@ -109,5 +114,7 @@ cargo clippy --locked -p bridge-worker --target wasm32-unknown-unknown -- -D war
 
 Wrangler 配置固定 `no_nodejs_global_timers`（worker::Delay 要求数字定时器句柄）和
 `no_websocket_standard_binary_type`（SDK 读取 ArrayBuffer），升级 SDK/兼容日期时一起验证。
-测试 runtime 兼容日期为其 workerd 支持的 2026-10-06，正式配置为 2026-10-16。
+测试 runtime 与 Wrangler 配置统一使用兼容日期 `2026-10-06`，不超过锁定的 workerd 支持范围。
+升级兼容日期时应同时升级相关运行时依赖，并验证 `npm test` 与 `npm run dev` 均可启动；
+日期超过本地 workerd 上限会导致启动失败，`npm run check` 的 dry-run 不能替代运行时启动验证。
 自动 invocation 日志关闭以避免记录含 ticket 的 URL；应用日志不输出身份码、平台鉴权或凭证。

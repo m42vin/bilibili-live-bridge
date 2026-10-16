@@ -58,6 +58,8 @@ test(
       const chunks = [];
       for await (const c of req) chunks.push(c);
       const body = Buffer.concat(chunks).toString();
+      assert.equal(req.headers.accept, "application/json");
+      assert.equal(req.headers["content-type"], "application/json");
       assert.equal(
         req.headers["x-bili-content-md5"],
         createHash("md5").update(body).digest("hex"),
@@ -75,6 +77,18 @@ test(
       let data = null;
       if (req.url === "/v2/app/start") {
         starts++;
+        if (input.code === "platform-error-private") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              code: 7003,
+              message: "test-secret platform-error-private",
+            }),
+          );
+          return;
+        }
+        // 保持请求未响应，验证真实运行时的超时与日志，不用固定 sleep 猜测时序。
+        if (input.code === "platform-timeout-private") return;
         data = {
           game_info: { game_id: `game-${starts}` },
           websocket_info: {
@@ -125,6 +139,7 @@ test(
     };
 
     let mf;
+    const runtimeLogs = [];
     try {
       const child = spawn(
         "worker-build",
@@ -142,6 +157,10 @@ test(
       const text = (value) => ({ type: "text", value });
       mf = new Miniflare({
         telemetry: { enabled: false },
+        handleStructuredLogs: (entry) => {
+          runtimeLogs.push(entry.message);
+          server.emit("diagnostic-log");
+        },
         workers: [
           {
             config: {
@@ -343,6 +362,30 @@ test(
       assert.equal((await badNext()).type, "error");
       await waitForPlatform(() => ended.includes(rejectedGame));
       assert(ended.includes(rejectedGame));
+
+      const endedBeforeFailures = ended.length;
+      for (const code of ["platform-error-private", "platform-timeout-private"]) {
+        const failed = await admit({ code, ack: true });
+        assert.equal(failed.status, 502);
+        assert.equal((await failed.json()).code, "attach_failed");
+      }
+      assert.equal(ended.length, endedBeforeFailures);
+      // 日志由独立 stdout/stderr 通道交付，等待事实到达后再检查内容与脱敏。
+      const logDeadline = AbortSignal.timeout(5000);
+      while (!runtimeLogs.some((line) => line.includes("timed_out=true"))) {
+        await once(server, "diagnostic-log", { signal: logDeadline });
+      }
+      const diagnostics = runtimeLogs.join("\n");
+      assert(diagnostics.includes("platform_code=Some(7003)"));
+      assert(diagnostics.includes("stage=fetch timed_out=true"));
+      for (const secret of [
+        "test-secret",
+        "test-key",
+        "platform-error-private",
+        "platform-timeout-private",
+      ]) {
+        assert(!diagnostics.includes(secret));
+      }
     } finally {
       await mf?.dispose();
       for (const ws of sockets) ws.terminate();

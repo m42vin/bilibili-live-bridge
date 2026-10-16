@@ -193,7 +193,8 @@ BRIDGE_URL='ws://127.0.0.1:8080/ws' RUST_LOG=info,downstream_client=debug cargo 
 无效消息或其他 HTTP 4xx 握手拒绝时报错退出，不自动放弃游标重新开启场次。桥重启或日志过期后无法续传。
 示例只在进程内保留游标，需要跨客户端重启恢复时应将业务结果和游标一起持久化。
 Ctrl-C 可中断建连、事件等待和退避，关闭清理最多等待 2 秒。
-握手和单次发送最多等待 10 秒。完整 ACK、范围和错误语义见 [客户端协议](docs/downstream-protocol.md)。
+HTTP 接入最多等待 30 秒，为平台请求及对象间交接预留时间；WebSocket 握手和单次发送最多等待 10 秒。
+完整 ACK、范围和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
 ### 日志
 

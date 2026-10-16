@@ -24,6 +24,7 @@ pub(super) async fn execute(env: &Env, path: &str, body: &impl Serialize) -> Res
 
     let headers = Headers::new();
     for (key, value) in [
+        ("Accept", "application/json"),
         ("Content-Type", "application/json"),
         (
             "x-bili-accesskeyid",
@@ -47,15 +48,26 @@ pub(super) async fn execute(env: &Env, path: &str, body: &impl Serialize) -> Res
             .with_body(Some(body.into())),
     )?;
 
+    let started = now();
+    let mut stage = "fetch";
+    let mut http_status = None;
+    let mut platform_code = None;
+    if path == "/v2/app/start" {
+        console_log!("platform request started path={}", path);
+    }
     let controller = AbortController::default();
     let result = deadline(10_000, async {
         let mut response = Fetch::Request(req)
             .send_with_signal(&controller.signal())
             .await?;
+        http_status = Some(response.status_code());
+        stage = "http_status";
         if response.status_code() != 200 {
             return Err(error("platform HTTP error"));
         }
+        stage = "response_body";
         let bytes = read_body(response.stream()?, 1_048_576).await?;
+        stage = "platform_response";
         match model::success_value(&bytes) {
             Ok(value) => Ok(value),
             Err(ResponseError::Platform { code, .. })
@@ -64,12 +76,36 @@ pub(super) async fn execute(env: &Env, path: &str, body: &impl Serialize) -> Res
             {
                 Ok(Value::Null)
             }
+            Err(ResponseError::Platform { code, .. }) => {
+                platform_code = Some(code.raw());
+                Err(error("platform response error"))
+            }
             Err(_) => Err(error("platform response error")),
         }
     })
     .await;
     // 成功后响应已读完；超时或失败时同时终止尚未完成的底层请求。
     controller.abort();
+    if let Err(ref failure) = result {
+        let timed_out =
+            matches!(failure, Error::RustError(message) if message == "operation timed out");
+        // 仅输出固定阶段、数值状态和耗时；底层错误及平台 message 可能含敏感输入。
+        console_error!(
+            "platform request failed path={} stage={} timed_out={} http_status={:?} platform_code={:?} elapsed_ms={}",
+            path,
+            stage,
+            timed_out,
+            http_status,
+            platform_code,
+            now().saturating_sub(started)
+        );
+    } else if path == "/v2/app/start" {
+        console_log!(
+            "platform request completed path={} elapsed_ms={}",
+            path,
+            now().saturating_sub(started)
+        );
+    }
     result
 }
 

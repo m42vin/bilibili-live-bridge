@@ -25,6 +25,8 @@ use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+// 接入包含平台 start 和对象间交接，预留响应时间以免与平台的 10 秒超时竞争。
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const RETRY_INITIAL: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(10);
@@ -93,9 +95,15 @@ async fn connect(
 ) -> Result<Socket, ConnectFailure> {
     let (url, expires) = if settings.is_http() {
         let started = Instant::now();
-        let response = timeout(IO_TIMEOUT, admit(settings, after))
+        let response = timeout(ADMISSION_TIMEOUT, admit(settings, after))
             .await
-            .map_err(|_| ConnectFailure::Retry(None))??;
+            .map_err(|_| {
+                tracing::warn!(
+                    timeout_secs = ADMISSION_TIMEOUT.as_secs(),
+                    "HTTP 接入等待超时，尚未取得连接凭证"
+                );
+                ConnectFailure::Retry(None)
+            })??;
         let remaining =
             Duration::from_millis(response.expires_in_ms).saturating_sub(started.elapsed());
         if remaining.is_zero() {

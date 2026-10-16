@@ -277,6 +277,15 @@ async fn http_busy_response_retries_without_service_access_credentials() {
 
 // 完整读取 POST 正文，避免 TCP 分包使接入测试偶发通过或失败。
 async fn http_reply(listener: &TcpListener, status: &str, body: Value) -> Value {
+    http_reply_after(listener, status, body, async {}).await
+}
+
+async fn http_reply_after(
+    listener: &TcpListener,
+    status: &str,
+    body: Value,
+    before_reply: impl Future<Output = ()>,
+) -> Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut bytes = Vec::new();
@@ -306,6 +315,7 @@ async fn http_reply(listener: &TcpListener, status: &str, body: Value) -> Value 
         bytes.extend_from_slice(&buffer[..n]);
     }
     let request = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+    before_reply.await;
     let body = body.to_string();
     let reply = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -313,6 +323,56 @@ async fn http_reply(listener: &TcpListener, status: &str, body: Value) -> Value 
     );
     stream.write_all(reply.as_bytes()).await.unwrap();
     request
+}
+
+#[tokio::test]
+async fn admission_waits_for_platform_timeout_response_instead_of_retrying_at_ten_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let settings = Settings {
+        url: format!("http://{}/admit", listener.local_addr().unwrap()),
+        code: "example-code".into(),
+    };
+    let (received, arrival) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let client = tokio::spawn(async move { connect(&settings, None).await });
+    let server = tokio::spawn(async move {
+        http_reply_after(
+            &listener,
+            "502 Bad Gateway",
+            json!({"type":"error","code":"attach_failed","message":"private details"}),
+            async {
+                received.send(()).unwrap();
+                released.await.unwrap();
+            },
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(3), arrival)
+        .await
+        .unwrap()
+        .unwrap();
+    // 桩已收到完整请求后再推进时钟，固定复现平台超时晚于客户端原期限的顺序。
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !client.is_finished(),
+        "应等待平台失败响应，不能提前按网络故障重试"
+    );
+    tokio::time::resume();
+    release.send(()).unwrap();
+
+    timeout(Duration::from_secs(3), async {
+        assert_eq!(server.await.unwrap()["code"], "example-code");
+        let Err(ConnectFailure::Fatal(message)) = client.await.unwrap() else {
+            panic!("应保留 attach_failed 的终止语义");
+        };
+        assert!(message.contains("接入失败"));
+        assert!(!message.contains("private details"));
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
