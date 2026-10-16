@@ -7,6 +7,10 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bridge_core::open_live::model::{
+    self, BatchHeartbeatRequest, EndRequest, HeartbeatRequest, StartRequest,
+};
+pub use bridge_core::open_live::model::{Anchor, BatchHeartbeatResult, StartResult};
 use reqwest::Url;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
@@ -362,28 +366,28 @@ fn nonce() -> String {
     Uuid::new_v4().to_string()
 }
 
-#[cfg(test)]
-#[path = "api_test.rs"]
-mod api_test;
-
-use bridge_core::open_live::model::{
-    self, BatchHeartbeatRequest, EndRequest, HeartbeatRequest, StartRequest,
-};
-pub use bridge_core::open_live::model::{Anchor, BatchHeartbeatResult, StartResult};
 fn success_value(bytes: &[u8]) -> Result<Value, ApiError> {
     model::success_value(bytes).map_err(Into::into)
 }
+
 fn start_result_from_value(value: Value) -> Result<StartResult, ApiError> {
     model::start_result_from_value(value).map_err(Into::into)
 }
+
 fn batch_result_from_value(value: Value) -> Result<BatchHeartbeatResult, ApiError> {
     model::batch_result_from_value(value).map_err(Into::into)
 }
+
 fn normalize_game_ids(
     game_ids: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<String>, ApiError> {
     model::normalize_game_ids(game_ids).map_err(Into::into)
 }
+
 fn required_text(value: impl AsRef<str>, message: &'static str) -> Result<String, ApiError> {
     model::required_text(value, message).map_err(Into::into)
 }
+
+#[cfg(test)]
+#[path = "api_test.rs"]
+mod api_test;

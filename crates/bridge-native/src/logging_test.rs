@@ -1,12 +1,16 @@
+//! 局部日志捕获与过滤验证，供测试共享 dispatcher 和缓冲。
+
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static NOOP_DISPATCH: OnceLock<tracing::Dispatch> = OnceLock::new();
 
 #[derive(Clone, Default)]
+/// 线程间共享的测试日志缓冲，不安装全局 subscriber。
 pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
 impl CapturedLogs {
+    /// 读取当前捕获的 UTF-8 日志文本。
     pub(crate) fn output(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
@@ -23,6 +27,7 @@ impl Write for CapturedLogs {
     }
 }
 
+/// 按过滤规则创建局部 dispatcher 及独立日志缓冲。
 pub(crate) fn capture(directives: &str) -> (tracing::Dispatch, CapturedLogs) {
     // tracing-core 在只有一个 dispatcher 时按当前线程缓存 callsite 的 interest。
     // 并行测试可能先在未安装 subscriber 的线程触发同一位置；保留第二个 dispatcher，

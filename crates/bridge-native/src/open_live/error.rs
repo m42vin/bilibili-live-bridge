@@ -41,12 +41,14 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// 构造参数或响应校验错误，说明由调用方提供。
     pub(super) fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid {
             message: message.into(),
         }
     }
 
+    /// 保留 HTTP 传输错误及其发生阶段。
     pub(super) fn transport(message: &'static str, source: reqwest::Error) -> Self {
         Self::Transport {
             message,

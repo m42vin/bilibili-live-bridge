@@ -30,9 +30,9 @@ use crate::session::{
     DeliveryError, DeliverySubscription, Manager, RecvError, ResumeUnavailable, Subscription,
     UpstreamStatus,
 };
+use protocol::{ClientMessage, ServerMessage, Subscribe, parse_subscribe};
 
 mod protocol;
-use protocol::{ClientMessage, ServerMessage, Subscribe, parse_subscribe};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -112,6 +112,7 @@ struct Acks {
     #[cfg(test)]
     after_snapshot: Mutex<Option<AfterSnapshot>>,
 }
+
 impl Acks {
     fn new() -> Self {
         Self {
@@ -121,6 +122,7 @@ impl Acks {
             after_snapshot: Mutex::new(None),
         }
     }
+
     fn start(&self, stream_id: &str, base: u64) {
         *self.progress.lock().unwrap() = Some(Progress {
             stream_id: stream_id.into(),
@@ -128,6 +130,7 @@ impl Acks {
             sent: base,
         });
     }
+
     fn acknowledge(&self, id: &str, seq: u64) -> Result<(), &'static str> {
         let mut guard = self.progress.lock().unwrap();
         let progress = guard.as_mut().ok_or("当前连接未启用 ACK 或尚未 ready")?;
@@ -142,6 +145,7 @@ impl Acks {
         }
         Ok(())
     }
+
     fn snapshot(&self) -> Progress {
         let progress = self.progress.lock().unwrap().as_ref().unwrap().clone();
         #[cfg(test)]
@@ -150,6 +154,7 @@ impl Acks {
         }
         progress
     }
+
     fn reserve(&self, seq: u64) {
         self.progress.lock().unwrap().as_mut().unwrap().sent = seq;
     }
@@ -186,14 +191,27 @@ pub async fn serve(
             }
             incoming = listener.accept() => match incoming {
                 Ok((stream, peer)) => {
-                    let connection_permit=match budget.acquire(Resource::Connection) {Ok(permit)=>permit,Err(_)=>{reject_http(&stream);continue;}};
-                    let handshake_permit=match budget.acquire(Resource::Handshake) {Ok(permit)=>permit,Err(_)=>{reject_http(&stream);continue;}};
+                    let connection_permit = match budget.acquire(Resource::Connection) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            reject_http(&stream);
+                            continue;
+                        }
+                    };
+                    let handshake_permit = match budget.acquire(Resource::Handshake) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            reject_http(&stream);
+                            continue;
+                        }
+                    };
+
                     let manager = manager.clone();
                     let signal = stopping.subscribe();
                     let span = tracing::info_span!("downstream", connection_id = %uuid::Uuid::new_v4(), %peer);
                     connections.spawn(
                         async move {
-                            let _connection_permit=connection_permit;
+                            let _connection_permit = connection_permit;
                             connection(stream, manager, signal, handshake_permit).await;
                         }.instrument(span).with_current_subscriber()
                     );
@@ -224,7 +242,9 @@ async fn stopped(signal: &mut watch::Receiver<bool>) {
 
 fn reject_http(stream: &TcpStream) {
     // 非阻塞尽力响应；配额不足的路径不派生任务或增加等待队列。
-    let _=stream.try_write(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n");
+    let _ = stream.try_write(
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n",
+    );
 }
 
 async fn connection(
@@ -523,7 +543,9 @@ async fn forward<S: Sink<Message> + Unpin>(
             _ = stopped(shutdown) => return Exit::End,
             exit = peer_exit(peer) => return exit,
             _ = pong.changed() => {
-                if *pong.borrow_and_update() == expected_pong { deadline = None; }
+                if *pong.borrow_and_update() == expected_pong {
+                    deadline = None;
+                }
             }
             _ = until_deadline(deadline) => {
                 tracing::debug!("下游 Pong 超时");
@@ -550,14 +572,24 @@ async fn forward<S: Sink<Message> + Unpin>(
             incoming = subscription.recv() => {
                 // 状态分支可能刚轮询为 Pending，上游随后发布状态和事件；发送前再核对一次。
                 if status_open && status.has_changed().unwrap_or(false)
-                    && let Err(exit) = send_upstream_status(writer, &mut status, &mut status_open, peer, shutdown).await { return exit; }
+                    && let Err(exit) = send_upstream_status(
+                        writer, &mut status, &mut status_open, peer, shutdown,
+                    ).await
+                {
+                    return exit;
+                }
+
                 let message = match &incoming {
                     Ok(event) => ServerMessage::event(subscription.room_id(), event),
                     Err(RecvError::Lagged { skipped }) => ServerMessage::Lagged { skipped: *skipped },
                     Err(RecvError::Closed) => return Exit::End,
                 };
-                if let Err(exit) = send_json(writer, &message, peer, shutdown).await { return exit; }
-                if incoming.is_ok_and(|event| event.ends_push()) { return Exit::End; }
+                if let Err(exit) = send_json(writer, &message, peer, shutdown).await {
+                    return exit;
+                }
+                if incoming.is_ok_and(|event| event.ends_push()) {
+                    return Exit::End;
+                }
             }
         }
     }
@@ -641,33 +673,62 @@ async fn forward_delivery<S: Sink<Message> + Unpin>(
             biased;
             _ = stopped(shutdown) => return Exit::End,
             exit = peer_exit(peer) => return exit,
-            _ = pong.changed() => { if *pong.borrow_and_update() == expected_pong { deadline = None; } }
+            _ = pong.changed() => {
+                if *pong.borrow_and_update() == expected_pong {
+                    deadline = None;
+                }
+            }
             _ = until_deadline(deadline) => return Exit::Failed,
             _ = ticker.tick() => {
                 ping_id = ping_id.wrapping_add(1);
                 let payload = ping_id.to_be_bytes();
                 expected_pong = Some(payload);
                 pongs.expect(payload);
-                if let Err(exit) = send_frame(writer,Message::Ping(payload.to_vec().into()),peer,shutdown).await { return exit; }
+                if let Err(exit) = send_frame(
+                    writer, Message::Ping(payload.to_vec().into()), peer, shutdown,
+                ).await
+                {
+                    return exit;
+                }
                 deadline = Some(Instant::now() + IO_TIMEOUT);
             }
             changed = status.changed(), if status_open => {
-                if changed.is_err() { status_open = false; }
-                else if let Err(exit) = send_upstream_status(writer,&mut status,&mut status_open,peer,shutdown).await { return exit; }
+                if changed.is_err() {
+                    status_open = false;
+                } else if let Err(exit) = send_upstream_status(
+                    writer, &mut status, &mut status_open, peer, shutdown,
+                ).await
+                {
+                    return exit;
+                }
             }
             _ = ack_changed.changed(), if waiting_for_ack => {}
             // 可读取时 recv 自己等待日志变化；全局通知不能压住就绪事件或状态。
             _ = log_changed.changed(), if waiting_for_ack => {}
             incoming = subscription.recv(), if !waiting_for_ack => {
                 if status_open && status.has_changed().unwrap_or(false)
-                    && let Err(exit) = send_upstream_status(writer,&mut status,&mut status_open,peer,shutdown).await { return exit; }
+                    && let Err(exit) = send_upstream_status(
+                        writer, &mut status, &mut status_open, peer, shutdown,
+                    ).await
+                {
+                    return exit;
+                }
+
                 match incoming {
                     Err(detail) => return Exit::Resume(detail),
                     Ok(None) => drained = true,
                     Ok(Some(record)) => {
                         // 在开始写入前登记，ACK 可能在 flush 返回前到达。
                         acks.reserve(record.seq);
-                        if let Err(exit) = send_json(writer, &ServerMessage::recorded(subscription.room_id,&subscription.stream_id,&record), peer, shutdown).await { return exit; }
+                        if let Err(exit) = send_json(
+                            writer,
+                            &ServerMessage::recorded(subscription.room_id, &subscription.stream_id, &record),
+                            peer,
+                            shutdown,
+                        ).await
+                        {
+                            return exit;
+                        }
                     }
                 }
             }

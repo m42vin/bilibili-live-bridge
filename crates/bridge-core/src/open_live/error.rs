@@ -1,5 +1,7 @@
 //! 平台业务错误码与响应校验错误。
+
 use std::fmt;
+
 /// 响应解析、参数校验或平台业务失败，不包含 HTTP 传输错误。
 #[derive(Debug)]
 pub enum ResponseError {
@@ -23,18 +25,23 @@ pub enum ResponseError {
         request_id: Option<String>,
     },
 }
+
 impl ResponseError {
+    /// 构造参数或响应校验错误，说明由调用方提供。
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid {
             message: message.into(),
         }
     }
+
+    /// 将解析失败说明保存为响应解码错误。
     pub(crate) fn decode(error: impl fmt::Display) -> Self {
         Self::Decode {
             message: error.to_string(),
         }
     }
 }
+
 impl fmt::Display for ResponseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -53,6 +60,7 @@ impl fmt::Display for ResponseError {
         }
     }
 }
+
 impl std::error::Error for ResponseError {}
 
 /// 开放平台业务错误码，编号与统一鉴权文档一致。

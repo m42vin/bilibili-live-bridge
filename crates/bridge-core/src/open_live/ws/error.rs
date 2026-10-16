@@ -1,4 +1,5 @@
 //! 二进制包及事件 JSON 的解析错误。
+
 use std::fmt;
 
 /// 纯协议解析错误，不包含连接或传输错误。
@@ -20,18 +21,23 @@ pub enum ProtocolError {
         message: String,
     },
 }
+
 impl ProtocolError {
+    /// 构造二进制协议错误，说明由调用方提供。
     pub(crate) fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
             message: message.into(),
         }
     }
+
+    /// 构造业务 JSON 解码错误，说明由调用方提供。
     pub(crate) fn decode(message: impl Into<String>) -> Self {
         Self::Decode {
             message: message.into(),
         }
     }
 }
+
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -41,4 +47,5 @@ impl fmt::Display for ProtocolError {
         }
     }
 }
+
 impl std::error::Error for ProtocolError {}

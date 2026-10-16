@@ -3,6 +3,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use bridge_core::session::failure::UpstreamFailure;
+use bridge_core::session::recovery::UpstreamRecovery;
+pub use bridge_core::session::{ReconnectPolicy, UpstreamPolicy};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout_at};
 
@@ -10,11 +13,7 @@ use super::{Session, State, close_socket, until_idle};
 use crate::open_live::api::StartResult;
 use crate::open_live::ws::{LiveEvent, WsError};
 use crate::session::platform::LiveSocket;
-
 use crate::session::recovery::NativeMoment;
-use bridge_core::session::failure::UpstreamFailure;
-use bridge_core::session::recovery::UpstreamRecovery;
-pub use bridge_core::session::{ReconnectPolicy, UpstreamPolicy};
 
 /// 当前上游状态。状态流是可合并中间变化的最新快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +26,7 @@ pub enum UpstreamStatus {
     Closed,
 }
 
+/// 驱动会话上游及原场次恢复，退出时完成网络和会话清理。
 pub(super) async fn run(
     state: Arc<State>,
     session: Arc<Session>,
@@ -86,7 +86,12 @@ pub(super) async fn run(
             break;
         }
         if !recovery.disconnected(NativeMoment(Instant::now())) {
-            tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), reason = "reconnect_deadline", "上游恢复预算已耗尽");
+            tracing::warn!(
+                room_id = started.anchor().room_id,
+                game_id = %started.game_id(),
+                reason = "reconnect_deadline",
+                "上游恢复预算已耗尽",
+            );
             drop(socket.take());
             break;
         }
@@ -174,13 +179,24 @@ async fn restore(
                 return Some(socket);
             }
             Ok(Some(Err(error))) => {
-                tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), attempt, %error, "恢复官方长连接失败");
+                tracing::warn!(
+                    room_id = started.anchor().room_id,
+                    game_id = %started.game_id(),
+                    attempt,
+                    %error,
+                    "恢复官方长连接失败",
+                );
                 if !retryable(&error) {
                     return None;
                 }
             }
             _ => {
-                tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), reason = "reconnect_deadline", "上游恢复已终止");
+                tracing::warn!(
+                    room_id = started.anchor().room_id,
+                    game_id = %started.game_id(),
+                    reason = "reconnect_deadline",
+                    "上游恢复已终止",
+                );
                 return None;
             }
         }
@@ -205,6 +221,7 @@ fn retryable(error: &WsError) -> bool {
     };
     failure.retryable()
 }
+
 fn jitter() -> u32 {
     let random = uuid::Uuid::new_v4();
     80 + u32::from(u16::from_be_bytes([
@@ -223,7 +240,11 @@ async fn active<T>(session: &Session, future: impl Future<Output = T>) -> Option
             biased;
             _ = session.stop.cancelled() => return None,
             _ = idle.changed() => {},
-            _ = until_idle(deadline) => { if session.expire_idle() { return None; } },
+            _ = until_idle(deadline) => {
+                if session.expire_idle() {
+                    return None;
+                }
+            },
             result = &mut future => return Some(result),
         }
     }

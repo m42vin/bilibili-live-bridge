@@ -1,4 +1,5 @@
 //! 与部署平台无关的 HTTP 接入协议。接入成功仅授予连接资格，ready 才表示订阅成功。
+
 use serde::{Deserialize, Serialize};
 
 /// POST JSON 正文，不含 WebSocket 的 type 字段；使用 validate 校验。

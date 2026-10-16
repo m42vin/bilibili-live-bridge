@@ -1,4 +1,5 @@
 //! 资源准入策略与显式时间令牌桶；不依赖运行时、时钟或网络。
+
 use std::time::Duration;
 
 /// 一类令牌桶的速率与突发容量，单位为次/秒和次。
@@ -30,6 +31,7 @@ pub struct ResourcePolicy {
     /// 每条连接入站业务消息的速率限制，包含 ACK。
     pub client_message: RatePolicy,
 }
+
 impl Default for ResourcePolicy {
     fn default() -> Self {
         Self {
@@ -50,6 +52,7 @@ impl Default for ResourcePolicy {
         }
     }
 }
+
 impl ResourcePolicy {
     /// 校验正值、跨平台计数范围以及明确矛盾的并发上限。
     pub fn validate(self) -> Result<(), &'static str> {
@@ -77,6 +80,7 @@ impl ResourcePolicy {
         Ok(())
     }
 }
+
 impl RatePolicy {
     /// 校验速率和容量，避免固定精度计算及运行时转换溢出。
     pub fn validate(self) -> Result<(), &'static str> {
@@ -112,6 +116,7 @@ pub enum Resource {
     /// 连接业务消息频率。
     ClientMessage,
 }
+
 impl Resource {
     /// 固定日志标签，不包含身份码或其他凭据。
     pub const fn label(self) -> &'static str {
@@ -136,6 +141,7 @@ pub struct Rejection {
     /// 重试建议；不保证届时资源可用。
     pub retry_after_ms: Option<u64>,
 }
+
 impl Rejection {
     /// 稳定的客户端错误码。
     pub const fn code(self) -> &'static str {
@@ -146,11 +152,13 @@ impl Rejection {
         }
     }
 }
+
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.code(), self.resource.label())
     }
 }
+
 impl std::error::Error for Rejection {}
 
 /// 固定纳秒精度令牌桶；调用方提供同一单调时间原点的 elapsed。
@@ -160,6 +168,7 @@ pub struct TokenBucket {
     credit: u128,
     updated: Duration,
 }
+
 impl TokenBucket {
     /// 创建满桶；无内部时钟。
     pub fn new(policy: RatePolicy, now: Duration) -> Result<Self, &'static str> {
@@ -170,6 +179,7 @@ impl TokenBucket {
             updated: now,
         })
     }
+
     /// 消耗一个令牌，或返回最少还需等待的毫秒数。时间倒退不补充额度。
     pub fn take(&mut self, now: Duration) -> Result<(), u64> {
         if now > self.updated {
@@ -214,6 +224,7 @@ mod tests {
         }
         assert_eq!(b.take(Duration::MAX), Err(500));
     }
+
     #[test]
     fn validates_limits_and_conflicts() {
         assert!(ResourcePolicy::default().validate().is_ok());

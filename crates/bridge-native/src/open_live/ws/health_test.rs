@@ -34,10 +34,12 @@ impl Sink<Message> for ControlledSink {
             Poll::Pending
         }
     }
+
     fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), SocketError> {
         self.sent.lock().unwrap().push(message);
         Ok(())
     }
+
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), SocketError>> {
         if self.flush.load(Ordering::SeqCst) {
             Poll::Ready(Ok(()))
@@ -45,6 +47,7 @@ impl Sink<Message> for ControlledSink {
             Poll::Pending
         }
     }
+
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), SocketError>> {
         self.poll_flush(cx)
     }

@@ -1,7 +1,9 @@
 use super::*;
+
 fn platform(code: i64) -> ApiFailure {
     ApiFailure::Platform(ErrorCode::from_raw(code))
 }
+
 #[test]
 fn classifies_platform_errors_and_ambiguous_batch_expiration() {
     for code in [4003, 4004, 5000, 5001, 5002] {

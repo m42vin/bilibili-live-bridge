@@ -1,9 +1,10 @@
 //! 使用下游 WebSocket 桩验证示例，无需平台凭据。
 
-use super::*;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::accept_async;
+
+use super::*;
 
 type Peer = WebSocketStream<TcpStream>;
 
@@ -158,18 +159,32 @@ async fn event_before_ready_and_resume_failure_stop_the_client() {
 async fn duplicate_processed_event_is_acknowledged_and_sequence_gap_is_rejected() {
     let (listener, settings) = fixture().await;
     let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
-    timeout(Duration::from_secs(4),async {
-        let mut peer = subscriber(&listener,None).await;
-        send(&mut peer,ready(0,false)).await;
-        let event = json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"DM","data":null});
+    timeout(Duration::from_secs(4), async {
+        let mut peer = subscriber(&listener, None).await;
+        send(&mut peer, ready(0, false)).await;
+        let event = json!({
+            "type": "event", "room_id": 123, "stream_id": "stream-1",
+            "seq": 1, "cmd": "DM", "data": null,
+        });
         for _ in 0..2 {
-            send(&mut peer,event.clone()).await;
-            let Message::Text(text) = peer.next().await.unwrap().unwrap() else {panic!("应发送 ACK");};
-            assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["seq"],1);
+            send(&mut peer, event.clone()).await;
+            let Message::Text(text) = peer.next().await.unwrap().unwrap() else {
+                panic!("应发送 ACK");
+            };
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["seq"], 1);
         }
-        send(&mut peer,json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":3,"cmd":"DM","data":null})).await;
+        send(
+            &mut peer,
+            json!({
+                "type": "event", "room_id": 123, "stream_id": "stream-1",
+                "seq": 3, "cmd": "DM", "data": null,
+            }),
+        )
+        .await;
         assert!(client.await.unwrap().unwrap_err().contains("不连续"));
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -198,23 +213,42 @@ async fn temporary_resource_errors_retry_without_discarding_the_processed_cursor
         let (listener, settings) = fixture().await;
         let client =
             tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
-        timeout(Duration::from_secs(12),async {
-            let mut peer=subscriber(&listener,None).await;
-            send(&mut peer,ready(0,false)).await;
-            send(&mut peer,json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"TEST","data":null})).await;
-            let Message::Text(ack)=peer.next().await.unwrap().unwrap() else {panic!("应在重试前确认业务处理");};
-            assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"],1);
-            let mut reply=json!({"type":"error","code":code,"message":"busy"});
-            if let Some(ms)=advice {reply["retry_after_ms"]=json!(ms);}
-            send(&mut peer,reply).await;
-            // 应答关闭，使客户端不用等待清理超时；随后直接等待重连请求。
-            while let Some(Ok(message))=peer.next().await {
-                if matches!(message,Message::Close(_)) {let _=peer.flush().await;break;}
+        timeout(Duration::from_secs(12), async {
+            let mut peer = subscriber(&listener, None).await;
+            send(&mut peer, ready(0, false)).await;
+            send(
+                &mut peer,
+                json!({
+                    "type": "event", "room_id": 123, "stream_id": "stream-1",
+                    "seq": 1, "cmd": "TEST", "data": null,
+                }),
+            )
+            .await;
+            let Message::Text(ack) = peer.next().await.unwrap().unwrap() else {
+                panic!("应在重试前确认业务处理");
+            };
+            assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"], 1);
+
+            let mut reply = json!({"type": "error", "code": code, "message": "busy"});
+            if let Some(ms) = advice {
+                reply["retry_after_ms"] = json!(ms);
             }
-            let mut peer=subscriber(&listener,Some(1)).await;
-            send(&mut peer,ready(1,true)).await;send(&mut peer,json!({"type":"closed"})).await;
-            assert_eq!(client.await.unwrap(),Ok(()));
-        }).await.unwrap();
+            send(&mut peer, reply).await;
+            // 应答关闭，使客户端不用等待清理超时；随后直接等待重连请求。
+            while let Some(Ok(message)) = peer.next().await {
+                if matches!(message, Message::Close(_)) {
+                    let _ = peer.flush().await;
+                    break;
+                }
+            }
+
+            let mut peer = subscriber(&listener, Some(1)).await;
+            send(&mut peer, ready(1, true)).await;
+            send(&mut peer, json!({"type": "closed"})).await;
+            assert_eq!(client.await.unwrap(), Ok(()));
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -223,14 +257,22 @@ async fn http_busy_response_retries_without_service_access_credentials() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (listener, settings) = fixture().await;
     let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
-    timeout(Duration::from_secs(12),async {
-        let (mut stream,_)=listener.accept().await.unwrap();
-        let mut buffer=[0;4096];let _=stream.read(&mut buffer).await.unwrap();
-        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n").await.unwrap();drop(stream);
-        let mut peer=subscriber(&listener,None).await;
-        send(&mut peer,ready(0,false)).await;send(&mut peer,json!({"type":"closed"})).await;
-        assert_eq!(client.await.unwrap(),Ok(()));
-    }).await.unwrap();
+    timeout(Duration::from_secs(12), async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 4096];
+        let _ = stream.read(&mut buffer).await.unwrap();
+        stream.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n",
+        ).await.unwrap();
+        drop(stream);
+
+        let mut peer = subscriber(&listener, None).await;
+        send(&mut peer, ready(0, false)).await;
+        send(&mut peer, json!({"type": "closed"})).await;
+        assert_eq!(client.await.unwrap(), Ok(()));
+    })
+    .await
+    .unwrap();
 }
 
 // 完整读取 POST 正文，避免 TCP 分包使接入测试偶发通过或失败。
@@ -284,22 +326,46 @@ async fn http_admission_reconnects_with_cursor_and_answers_application_ping() {
     let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
     timeout(Duration::from_secs(12), async {
         for attempt in 0..2 {
-            let request = http_reply(&http, "200 OK", json!({"websocket_url":format!("ws://{}/ws?ticket={attempt}", ws.local_addr().unwrap()),"expires_in_ms":10000})).await;
+            let request = http_reply(&http, "200 OK", json!({
+                "websocket_url": format!("ws://{}/ws?ticket={attempt}", ws.local_addr().unwrap()),
+                "expires_in_ms": 10000,
+            })).await;
             assert_eq!(request["code"], "example-code");
             assert_eq!(request["ack"], true);
             assert!(request.get("type").is_none());
-            if attempt == 0 { assert!(request["resume_after"].is_null()); }
-            else { assert_eq!(request["resume_after"], json!({"stream_id":"stream-1","seq":1})); }
+            if attempt == 0 {
+                assert!(request["resume_after"].is_null());
+            } else {
+                assert_eq!(
+                    request["resume_after"],
+                    json!({"stream_id":"stream-1","seq":1})
+                );
+            }
+
             let (stream, _) = ws.accept().await.unwrap();
             let mut peer = accept_async(stream).await.unwrap();
             // ready 前也允许保活；第一条客户端消息必须是 pong，不能重复 subscribe。
             send(&mut peer, json!({"type":"ping","nonce":"probe"})).await;
-            let Message::Text(pong) = peer.next().await.unwrap().unwrap() else { panic!("expected pong"); };
-            assert_eq!(serde_json::from_str::<Value>(&pong).unwrap(), json!({"type":"pong","nonce":"probe"}));
+            let Message::Text(pong) = peer.next().await.unwrap().unwrap() else {
+                panic!("expected pong");
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&pong).unwrap(),
+                json!({"type":"pong","nonce":"probe"})
+            );
             send(&mut peer, ready(attempt, attempt != 0)).await;
             if attempt == 0 {
-                send(&mut peer,json!({"type":"event","room_id":123,"stream_id":"stream-1","seq":1,"cmd":"DM","data":null})).await;
-                let Message::Text(ack) = peer.next().await.unwrap().unwrap() else { panic!("expected ack"); };
+                send(
+                    &mut peer,
+                    json!({
+                        "type": "event", "room_id": 123, "stream_id": "stream-1",
+                        "seq": 1, "cmd": "DM", "data": null,
+                    }),
+                )
+                .await;
+                let Message::Text(ack) = peer.next().await.unwrap().unwrap() else {
+                    panic!("expected ack");
+                };
                 assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"], 1);
                 drop(peer);
             } else {
@@ -307,7 +373,9 @@ async fn http_admission_reconnects_with_cursor_and_answers_application_ping() {
             }
         }
         assert_eq!(client.await.unwrap(), Ok(()));
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

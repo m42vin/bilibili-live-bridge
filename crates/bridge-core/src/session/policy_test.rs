@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::failure::FailureKind;
+
 fn retry_delay(policy: HeartbeatPolicy, failures: u32, jitter: u32) -> Duration {
     policy.retry_delay(failures, jitter)
 }
@@ -102,6 +103,7 @@ fn validates_relations_without_a_runtime_clock() {
         .is_ok()
     );
 }
+
 #[test]
 fn diagnostics_are_advisory_and_report_all_risks() {
     use HeartbeatDiagnostic::*;
@@ -131,6 +133,7 @@ fn diagnostics_are_advisory_and_report_all_risks() {
         vec![InsufficientRecoveryMargin]
     );
 }
+
 #[test]
 fn access_limits_and_reconnect_keep_distinct_delay_rules() {
     let hb = HeartbeatPolicy::default();

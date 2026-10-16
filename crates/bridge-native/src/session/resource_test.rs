@@ -1,4 +1,5 @@
 //! 小预算与受控平台桩验证 Manager 的所有入口；不依赖外部网络。
+
 use super::*;
 use crate::resource::{RatePolicy, Rejection, Resource, ResourceBudget, ResourcePolicy};
 use crate::session::{DeliveryError, EventCursor};
@@ -18,17 +19,20 @@ fn limits() -> ResourcePolicy {
         ..Default::default()
     }
 }
+
 fn limited(mock: &Arc<Mock>, policy: ResourcePolicy) -> Manager {
     grace_manager(mock)
         .with_resource_budget(ResourceBudget::new(policy).unwrap())
         .unwrap()
 }
+
 fn refused(error: SessionError, expected: Resource) {
     assert!(
         matches!(error,SessionError::Resource(Rejection {resource,..}) if resource==expected),
         "{error:?}"
     );
 }
+
 async fn occupied(manager: &Manager, index: usize, n: usize) {
     timeout(Duration::from_secs(2), async {
         while manager.resource_budget().snapshot().occupied[index] != n {

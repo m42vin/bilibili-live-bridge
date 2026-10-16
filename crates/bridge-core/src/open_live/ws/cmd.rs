@@ -125,7 +125,7 @@ pub struct UserProfile {
     pub uface: String,
 }
 
-/// `LIVE_OPEN_PLATFORM_DM`
+/// 本房间弹幕，对应 `LIVE_OPEN_PLATFORM_DM`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Danmaku {
     /// 用户昵称。
@@ -187,7 +187,7 @@ pub struct Danmaku {
     pub is_admin: i64,
 }
 
-/// `LIVE_OPEN_PLATFORM_DM_MIRROR`
+/// 跨房弹幕，对应 `LIVE_OPEN_PLATFORM_DM_MIRROR`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DanmakuMirror {
     /// 弹幕发送时间，秒级时间戳。
@@ -210,7 +210,7 @@ pub struct DanmakuMirror {
     pub dm_type: i64,
 }
 
-/// `LIVE_OPEN_PLATFORM_SEND_GIFT`
+/// 送礼事件，对应 `LIVE_OPEN_PLATFORM_SEND_GIFT`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Gift {
     /// 房间号。演播厅模式是演播厅房间，否则是收礼房间。
@@ -312,7 +312,7 @@ pub struct BlindGift {
     pub status: bool,
 }
 
-/// `LIVE_OPEN_PLATFORM_SUPER_CHAT`
+/// 付费留言，对应 `LIVE_OPEN_PLATFORM_SUPER_CHAT`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SuperChat {
     /// 直播间 ID。
@@ -368,7 +368,7 @@ pub struct SuperChat {
     pub msg_id: String,
 }
 
-/// `LIVE_OPEN_PLATFORM_SUPER_CHAT_DEL`
+/// 付费留言下线，对应 `LIVE_OPEN_PLATFORM_SUPER_CHAT_DEL`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SuperChatDelete {
     /// 直播间 ID。
@@ -382,7 +382,7 @@ pub struct SuperChatDelete {
     pub msg_id: String,
 }
 
-/// `LIVE_OPEN_PLATFORM_GUARD`
+/// 上舰事件，对应 `LIVE_OPEN_PLATFORM_GUARD`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Guard {
     /// 上舰用户。
@@ -420,7 +420,7 @@ pub struct Guard {
     pub timestamp: i64,
 }
 
-/// `LIVE_OPEN_PLATFORM_LIKE`
+/// 点赞聚合事件，对应 `LIVE_OPEN_PLATFORM_LIKE`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Like {
     /// 用户昵称。
@@ -464,7 +464,7 @@ pub struct Like {
     pub msg_id: String,
 }
 
-/// `LIVE_OPEN_PLATFORM_LIVE_ROOM_ENTER`
+/// 观众进入房间，对应 `LIVE_OPEN_PLATFORM_LIVE_ROOM_ENTER`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoomEnter {
     /// 发生的直播间。
@@ -510,7 +510,7 @@ pub struct LiveBoundary {
     pub title: String,
 }
 
-/// `LIVE_OPEN_PLATFORM_INTERACTION_END`
+/// 互动推送结束事件，对应 `LIVE_OPEN_PLATFORM_INTERACTION_END`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InteractionEnd {
     /// 停止推送的场次 ID。

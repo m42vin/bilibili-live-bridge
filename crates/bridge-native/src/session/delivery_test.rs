@@ -1,6 +1,20 @@
+use serde_json::json;
+
 use super::*;
 use crate::open_live::ws::LiveEvent;
-use serde_json::json;
+
+impl EventLog {
+    /// 为日志和发送交错测试创建不持有活动会话的读取器。
+    pub(crate) fn test_reader(
+        self: &Arc<Self>,
+        id: &str,
+        code: &str,
+        after: Option<u64>,
+        guard: Option<Subscription>,
+    ) -> Result<DeliverySubscription, ResumeUnavailable> {
+        self.reader_checked(id, code, after, guard, false)
+    }
+}
 
 fn event(value: serde_json::Value) -> LiveEvent {
     LiveEvent::Unknown {
@@ -8,6 +22,7 @@ fn event(value: serde_json::Value) -> LiveEvent {
         data: value,
     }
 }
+
 fn register(log: &Arc<EventLog>, id: &str) {
     log.register(
         id,

@@ -1,6 +1,8 @@
+use serde_json::{Value, json};
+
 use super::*;
 use crate::open_live::ws::Danmaku;
-use serde_json::{Value, json};
+
 fn subscription_code(text: &str) -> Result<String, &'static str> {
     parse_subscribe(text).map(|request| request.code)
 }

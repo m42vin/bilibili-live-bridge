@@ -1,12 +1,15 @@
 use super::*;
+
 fn t(seconds: u64) -> Duration {
     Duration::from_secs(seconds)
 }
+
 fn starting(grace: u64) -> SessionLifecycle {
     SessionLifecycle::starting(ManagerOptions {
         idle_grace: t(grace),
     })
 }
+
 fn subscribed(grace: u64) -> SessionLifecycle {
     let mut state = starting(grace);
     assert!(state.ready());

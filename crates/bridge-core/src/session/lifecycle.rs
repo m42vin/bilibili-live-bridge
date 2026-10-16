@@ -2,8 +2,10 @@
 //!
 //! 调用方在同一串行边界内执行状态转换及发布通知，显式提供单调时间。
 //! 房间索引、目标会话引用、错误正文、广播通道及网络清理由运行时持有。
-use super::recovery::Moment;
+
 use std::time::Duration;
+
+use super::recovery::Moment;
 
 /// 会话生命周期选项。
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,6 +63,7 @@ pub struct SessionLifecycle<T: Moment = Duration> {
     closing: bool,
     finished: bool,
 }
+
 impl<T: Moment> SessionLifecycle<T> {
     /// 创建尚未接入的会话；尚无订阅时不会自动启用闲置计时器。
     pub fn starting(options: ManagerOptions) -> Self {
@@ -74,32 +77,39 @@ impl<T: Moment> SessionLifecycle<T> {
             finished: false,
         }
     }
+
     /// 当前接入阶段。
     pub fn phase(&self) -> AdmissionPhase {
         self.phase
     }
+
     /// 活动订阅数量。
     pub fn subscriber_count(&self) -> usize {
         self.subscribers
     }
+
     /// 当前闲置截止时间。
     pub fn idle_deadline(&self) -> Option<T> {
         self.idle_deadline
     }
+
     /// 是否已禁止新订阅；调用方应先处理到期的闲置计时器。
     pub fn is_closing(&self) -> bool {
         self.closing
     }
+
     /// 是否已完成本地清理；不代表平台确认 end 成功。
     pub fn is_finished(&self) -> bool {
         self.finished
     }
+
     /// 当前会话是否可作为复用目标；调用方先处理闲置到期。
     pub fn is_joinable(&self) -> bool {
         !self.finished
             && !self.closing
             && matches!(self.phase, AdmissionPhase::Starting | AdmissionPhase::Ready)
     }
+
     /// 同码接入的决定；调用方先处理闲置到期并在索引锁内使用结果。
     pub fn claim(&self) -> ClaimDecision {
         if self.is_joinable() {
@@ -110,6 +120,7 @@ impl<T: Moment> SessionLifecycle<T> {
             ClaimDecision::WaitForCleanup
         }
     }
+
     /// 发布就绪阶段。关闭可能已同时开始，此时仍不能增加订阅。
     pub fn ready(&mut self) -> bool {
         if self.phase != AdmissionPhase::Starting || self.finished {
@@ -118,6 +129,7 @@ impl<T: Moment> SessionLifecycle<T> {
         self.phase = AdmissionPhase::Ready;
         true
     }
+
     /// 增加一个订阅并取消闲置截止时间。等于截止时间时拒绝接入。
     /// 调用方在失败后检查关闭标记并发出停止信号。
     pub fn subscribe(&mut self, now: T) -> bool {
@@ -132,6 +144,7 @@ impl<T: Moment> SessionLifecycle<T> {
         self.idle_deadline = None;
         true
     }
+
     /// 登记一个正在等待此会话的接入者，用于后台初始化完成时的闲置判断。
     pub fn begin_attach(&mut self, now: T) -> bool {
         self.expire_idle(now);
@@ -145,15 +158,18 @@ impl<T: Moment> SessionLifecycle<T> {
         self.idle_deadline = None;
         true
     }
+
     /// 释放等待者；最后一个等待者离开就绪且无订阅的会话时启用闲置清理。
     pub fn end_attach(&mut self, now: T) -> IdleAction<T> {
         self.pending_attaches = self.pending_attaches.saturating_sub(1);
         self.idle_if_unused(now)
     }
+
     /// 接入等待者数量。
     pub fn pending_attaches(&self) -> usize {
         self.pending_attaches
     }
+
     /// 就绪且没有订阅或等待者时，调度关闭；已有闲置期限不重置。
     pub fn idle_if_unused(&mut self, now: T) -> IdleAction<T> {
         if self.phase != AdmissionPhase::Ready
@@ -176,6 +192,7 @@ impl<T: Moment> SessionLifecycle<T> {
         self.idle_deadline = Some(deadline);
         IdleAction::Schedule(deadline)
     }
+
     /// 释放一个订阅；只有最后一次有效释放启用宽限期。
     pub fn release(&mut self, now: T) -> IdleAction<T> {
         if self.subscribers == 0 {
@@ -199,6 +216,7 @@ impl<T: Moment> SessionLifecycle<T> {
             false
         }
     }
+
     /// 开始主动关闭，立即拒绝后续订阅，但不标记清理完成。
     /// 返回是否首次进入关闭中；运行时的取消和注销操作仍应可重复调用。
     pub fn begin_close(&mut self) -> bool {
@@ -206,18 +224,22 @@ impl<T: Moment> SessionLifecycle<T> {
         self.closing = true;
         first
     }
+
     /// 发布接入失败；运行时随后清理通知及资源，再调用 complete_cleanup。
     pub fn fail(&mut self) -> bool {
         self.terminal(AdmissionPhase::Failed)
     }
+
     /// 发布重定向；运行时必须先处理重复场次，保存目标引用并完成清理。
     pub fn redirect(&mut self) -> bool {
         self.terminal(AdmissionPhase::Redirected)
     }
+
     /// 发布已运行会话结束；网络结束调用已尝试，不要求成功。
     pub fn close(&mut self) -> bool {
         self.terminal(AdmissionPhase::Closed)
     }
+
     fn terminal(&mut self, phase: AdmissionPhase) -> bool {
         if self.finished
             || matches!(
@@ -231,6 +253,7 @@ impl<T: Moment> SessionLifecycle<T> {
         self.closing = true;
         true
     }
+
     /// 本地收尾完成后标记结束；就绪或接入中的会话不能直接跳过终止阶段。
     /// 返回是否首次完成，用于避免重复通知。
     pub fn complete_cleanup(&mut self) -> bool {
@@ -255,6 +278,7 @@ pub struct AdmissionOwner {
     game_id: Option<String>,
     committed: bool,
 }
+
 impl AdmissionOwner {
     /// start 成功后登记场次；网络响应之前无法确定远端是否已开启。
     pub fn acquired(&mut self, game_id: String) {
@@ -262,19 +286,23 @@ impl AdmissionOwner {
             self.game_id = Some(game_id);
         }
     }
+
     /// 仍需由接入者负责关闭的场次 ID。
     pub fn game_id(&self) -> Option<&str> {
         self.game_id.as_deref()
     }
+
     /// end 已返回后释放场次责任；接入本身可能尚未结束。
     pub fn release_game(&mut self) {
         self.game_id = None;
     }
+
     /// 接入成功转交运行任务，或失败/重定向已处理，撤销取消清理责任。
     pub fn commit(&mut self) {
         self.game_id = None;
         self.committed = true;
     }
+
     /// 取消未提交的接入，只返回一次清理需求。运行时决定如何发布失败并尝试 end。
     pub fn cancel(&mut self) -> Option<CancelledAdmission> {
         if self.committed {

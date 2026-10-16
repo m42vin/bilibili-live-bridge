@@ -1,8 +1,11 @@
 //! 应用 API 的请求、响应模型与纯解析校验。
-use super::error::{ErrorCode, ResponseError};
+
+use std::{collections::HashSet, fmt};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, fmt};
+
+use super::error::{ErrorCode, ResponseError};
 
 /// 单次批量心跳上限。
 pub const MAX_BATCH_HEARTBEAT: usize = 200;

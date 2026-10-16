@@ -53,25 +53,25 @@ pub const ENV_EVENT_LOG_MAX_STREAMS: &str = "BRIDGE_EVENT_LOG_MAX_STREAMS";
 /// 每条下游连接未确认事件数上限。
 pub const ENV_ACK_WINDOW: &str = "BRIDGE_ACK_WINDOW";
 
-/// 共享资源或入站频率限制。
+/// 下游连接任务总数上限，包含握手和等待订阅。
 pub const ENV_MAX_CONNECTIONS: &str = "BRIDGE_MAX_CONNECTIONS";
-/// 共享资源或入站频率限制。
+/// 同时执行 HTTP 升级的数量上限。
 pub const ENV_MAX_HANDSHAKES: &str = "BRIDGE_MAX_HANDSHAKES";
-/// 共享资源或入站频率限制。
+/// 正在等待 Manager 接入结果的请求数上限。
 pub const ENV_MAX_PENDING_ATTACHES: &str = "BRIDGE_MAX_PENDING_ATTACHES";
-/// 共享资源或入站频率限制。
+/// 开场、建连、鉴权及失败清理的任务数上限。
 pub const ENV_MAX_STARTING_SESSIONS: &str = "BRIDGE_MAX_STARTING_SESSIONS";
-/// 共享资源或入站频率限制。
+/// 建立中、活动及清理中的场次数上限。
 pub const ENV_MAX_SESSIONS: &str = "BRIDGE_MAX_SESSIONS";
-/// 共享资源或入站频率限制。
+/// 每个房间的活动订阅数量上限，包含进程内订阅。
 pub const ENV_MAX_SUBSCRIBERS_PER_ROOM: &str = "BRIDGE_MAX_SUBSCRIBERS_PER_ROOM";
-/// 共享资源或入站频率限制。
+/// 实际平台 start 请求的令牌补充速率，单位为次/秒。
 pub const ENV_START_RATE_PER_SEC: &str = "BRIDGE_START_RATE_PER_SEC";
-/// 共享资源或入站频率限制。
+/// 实际平台 start 请求的突发容量，单位为次。
 pub const ENV_START_BURST: &str = "BRIDGE_START_BURST";
-/// 共享资源或入站频率限制。
+/// 每条连接业务消息的令牌补充速率，单位为条/秒。
 pub const ENV_CLIENT_MESSAGE_RATE_PER_SEC: &str = "BRIDGE_CLIENT_MESSAGE_RATE_PER_SEC";
-/// 共享资源或入站频率限制。
+/// 每条连接业务消息的突发容量，单位为条。
 pub const ENV_CLIENT_MESSAGE_BURST: &str = "BRIDGE_CLIENT_MESSAGE_BURST";
 
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
@@ -343,16 +343,19 @@ impl Config {
     pub const fn heartbeat_policy(&self) -> HeartbeatPolicy {
         self.heartbeat_policy
     }
+
     /// 官方连接健康检查及原场次恢复策略。
     #[must_use]
     pub const fn upstream_policy(&self) -> UpstreamPolicy {
         self.upstream_policy
     }
+
     /// 有界内存日志和下游 ACK 窗口策略。
     #[must_use]
     pub const fn delivery_policy(&self) -> DeliveryPolicy {
         self.delivery_policy
     }
+
     /// server 与进程内接入共享的资源限制。
     pub const fn resource_policy(&self) -> ResourcePolicy {
         self.resource_policy

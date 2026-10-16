@@ -3,9 +3,11 @@ use super::*;
 fn t(seconds: u64) -> Duration {
     Duration::from_secs(seconds)
 }
+
 fn heartbeat() -> HeartbeatRecovery {
     HeartbeatRecovery::new(HeartbeatPolicy::default(), t(20), t(0))
 }
+
 fn retryable() -> HeartbeatOutcome {
     HeartbeatOutcome::Failure(FailureKind::Retryable)
 }

@@ -8,16 +8,41 @@ use tokio::time::timeout;
 use tracing::instrument::WithSubscriber;
 
 use super::super::platform::{BoxFuture, LiveSocket, Platform};
-use super::{Manager, ManagerOptions, RecvError};
+use super::{HeartbeatPolicy, Manager, ManagerOptions, RecvError, UpstreamPolicy};
 use crate::open_live::api::{Anchor, BatchHeartbeatResult, StartResult};
 use crate::open_live::error::{ApiError, ErrorCode};
 use crate::open_live::ws::{Danmaku, InteractionEnd, LiveEvent, WsError};
+use crate::resource::ResourceBudget;
 use crate::session::SessionError;
 
 #[path = "heartbeat_recovery_test.rs"]
 mod heartbeat_recovery_test;
 #[path = "upstream_recovery_test.rs"]
 mod upstream_recovery_test;
+
+impl Manager {
+    /// 用模拟平台和宽松预算创建管理器，隔离真实网络与资源限额。
+    pub(in crate::session) fn from_platform(
+        platform: Arc<dyn Platform>,
+        app_heartbeat: Duration,
+        event_capacity: usize,
+    ) -> Self {
+        assert!(event_capacity > 0, "事件缓冲至少为 1");
+        Self::from_parts(
+            platform,
+            app_heartbeat,
+            event_capacity,
+            ManagerOptions::default(),
+            HeartbeatPolicy::default(),
+            UpstreamPolicy {
+                reconnect: None,
+                ..UpstreamPolicy::default()
+            },
+        )
+        .with_resource_budget(ResourceBudget::for_tests())
+        .unwrap()
+    }
+}
 
 const QUIET: Duration = Duration::from_secs(3600);
 const CODE: &str = "super-secret-code";

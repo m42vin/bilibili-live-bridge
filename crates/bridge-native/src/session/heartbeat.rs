@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+pub use bridge_core::session::HeartbeatPolicy;
+use bridge_core::session::failure::{self, ApiFailure, FailureKind};
+use bridge_core::session::recovery::{HeartbeatDecision, HeartbeatOutcome};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 
 use super::{Session, State, Stop, lock, until_idle};
@@ -11,10 +14,6 @@ use crate::open_live::api::{BatchHeartbeatResult, MAX_BATCH_HEARTBEAT, REQUEST_T
 use crate::open_live::error::ApiError;
 use crate::session::platform::BoxFuture;
 use crate::session::recovery::NativeMoment;
-use bridge_core::session::recovery::{HeartbeatDecision, HeartbeatOutcome};
-
-pub use bridge_core::session::HeartbeatPolicy;
-use bridge_core::session::failure::{self, ApiFailure, FailureKind};
 
 fn classify(error: &ApiError, batch_size: usize) -> FailureKind {
     let failure = match error {
@@ -26,6 +25,7 @@ fn classify(error: &ApiError, batch_size: usize) -> FailureKind {
     };
     failure::classify(failure, batch_size)
 }
+
 fn jitter_percent() -> u32 {
     let random = uuid::Uuid::new_v4();
     let bytes = random.as_bytes();
@@ -292,6 +292,7 @@ impl Drop for Finished {
     }
 }
 
+/// 调度批量项目心跳及有限恢复；停止时取消在途请求并通知收尾。
 pub(super) async fn run_heartbeats(state: Weak<State>, stop: Stop, every: Duration) {
     let _finished = Finished(state.clone());
     // 直接从第一轮正常截止时间开始，避免初始立即 tick 与唤醒注册发生竞争。
@@ -352,47 +353,6 @@ pub(super) async fn run_heartbeats(state: Weak<State>, stop: Stop, every: Durati
             }
             _ = &mut wake => {}
         }
-    }
-}
-
-/// 测试用立即采样；生产请求只能由 run_heartbeats 的单请求调度器启动。
-#[cfg(test)]
-pub(super) async fn pump(state: &State) {
-    let pending: Vec<PendingBeat> = {
-        let mut beats = lock(&state.beats);
-        beats
-            .iter_mut()
-            .filter(|(_, slot)| !slot.in_flight)
-            .map(|(game_id, slot)| {
-                slot.in_flight = true;
-                slot.normal_due = None;
-                PendingBeat {
-                    game_id: game_id.clone(),
-                    session: slot.session.clone(),
-                }
-            })
-            .collect()
-    };
-    for chunk in pending.chunks(MAX_BATCH_HEARTBEAT) {
-        let pending: Vec<_> = {
-            let beats = lock(&state.beats);
-            chunk
-                .iter()
-                .filter(|beat| {
-                    beats
-                        .get(&beat.game_id)
-                        .is_some_and(|slot| Weak::ptr_eq(&slot.session, &beat.session))
-                })
-                .cloned()
-                .collect()
-        };
-        if pending.is_empty() {
-            continue;
-        }
-        let mut request = request(state, pending);
-        let outcome = request.future.as_mut().await;
-        expire_recoveries(state);
-        finish_request(state, &request.pending, outcome);
     }
 }
 

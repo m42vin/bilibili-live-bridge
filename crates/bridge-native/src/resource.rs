@@ -1,9 +1,11 @@
 //! 原生共享资源预算、所有权名额和运行时计数。拒绝不排队，不消耗心跳或清理额度。
-use bridge_core::resource::TokenBucket;
-pub use bridge_core::resource::{RatePolicy, Rejection, Resource, ResourcePolicy};
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use bridge_core::resource::TokenBucket;
+pub use bridge_core::resource::{RatePolicy, Rejection, Resource, ResourcePolicy};
 use tokio::time::Instant;
 
 /// 当前占用与累计计数；拒绝数组按 Resource 的枚举顺序索引。
@@ -18,21 +20,26 @@ pub struct ResourceSnapshot {
     /// 按资源类别累计的拒绝数量。
     pub rejected: [u64; 8],
 }
+
 struct State {
     stats: ResourceSnapshot,
     start: TokenBucket,
     rooms: HashMap<i64, usize>,
 }
+
 struct Inner {
     policy: ResourcePolicy,
     origin: Instant,
     state: Mutex<State>,
+    // 冻结消息计费时钟必须影响实际采样，故保留仅测试编译的覆盖值。
     #[cfg(test)]
     message_elapsed: Mutex<Option<Duration>>,
 }
+
 /// 同一 server、Manager 克隆和进程内接入共用的资源预算。
 #[derive(Clone)]
 pub struct ResourceBudget(Arc<Inner>);
+
 impl ResourceBudget {
     /// 创建预算，校验纯策略；所有名额均快速尝试获取，不排队。
     pub fn new(policy: ResourcePolicy) -> Result<Self, &'static str> {
@@ -49,14 +56,18 @@ impl ResourceBudget {
             }),
         })))
     }
+
     /// 当前策略。
     pub fn policy(&self) -> ResourcePolicy {
         self.0.policy
     }
+
     /// 获取当前占用和累计计数的快照。
     pub fn snapshot(&self) -> ResourceSnapshot {
         self.0.state.lock().unwrap().stats.clone()
     }
+
+    /// 立即尝试取得并发资源名额；拒绝时不排队。
     pub(crate) fn acquire(&self, resource: Resource) -> Result<Permit, Rejection> {
         let limit = match resource {
             Resource::Connection => self.0.policy.max_connections,
@@ -86,6 +97,8 @@ impl ResourceBudget {
             resource,
         })
     }
+
+    /// 取得房间订阅名额，由返回的守卫负责释放。
     pub(crate) fn subscribe(&self, room: i64) -> Result<RoomPermit, Rejection> {
         let mut state = self.0.state.lock().unwrap();
         if state.rooms.get(&room).copied().unwrap_or(0) >= self.0.policy.max_subscribers_per_room {
@@ -104,6 +117,8 @@ impl ResourceBudget {
             room,
         })
     }
+
+    /// 消耗一次实际 start 调用的频率额度，并更新统计。
     pub(crate) fn start(&self) -> Result<(), Rejection> {
         let mut state = self.0.state.lock().unwrap();
         if let Err(ms) = state.start.take(self.0.origin.elapsed()) {
@@ -121,6 +136,8 @@ impl ResourceBudget {
         );
         Ok(())
     }
+
+    /// 记录资源拒绝，并附带可选的毫秒重试建议。
     pub(crate) fn reject(&self, resource: Resource, retry_after_ms: Option<u64>) -> Rejection {
         let rejection = Rejection {
             resource,
@@ -129,6 +146,8 @@ impl ResourceBudget {
         record(&mut self.0.state.lock().unwrap().stats, rejection);
         rejection
     }
+
+    /// 为单条连接创建独立的业务消息令牌桶。
     pub(crate) fn messages(&self) -> MessageBudget {
         MessageBudget {
             budget: self.clone(),
@@ -137,28 +156,8 @@ impl ResourceBudget {
                 .expect("策略已校验"),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn freeze_message_clock(&self) {
-        *self.0.message_elapsed.lock().unwrap() = Some(Duration::ZERO);
-    }
-    #[cfg(test)]
-    pub(crate) fn for_tests() -> Self {
-        Self::new(ResourcePolicy {
-            max_connections: 8192,
-            max_handshakes: 8192,
-            max_pending_attaches: 8192,
-            max_starting_sessions: 8192,
-            max_sessions: 8192,
-            max_subscribers_per_room: 8192,
-            start: RatePolicy {
-                per_sec: 100_000,
-                burst: 100_000,
-            },
-            ..Default::default()
-        })
-        .unwrap()
-    }
 }
+
 fn record(stats: &mut ResourceSnapshot, rejection: Rejection) {
     let n = &mut stats.rejected[rejection.resource as usize];
     *n = n.saturating_add(1);
@@ -170,10 +169,13 @@ fn record(stats: &mut ResourceSnapshot, rejection: Rejection) {
         "资源准入被拒绝"
     );
 }
+
+/// 持有一份并发资源名额，析构时归还原预算。
 pub(crate) struct Permit {
     budget: ResourceBudget,
     resource: Resource,
 }
+
 impl Drop for Permit {
     fn drop(&mut self) {
         let mut state = self.budget.0.state.lock().unwrap();
@@ -185,12 +187,16 @@ impl Drop for Permit {
         );
     }
 }
+
+/// 单条连接的业务消息频率预算，拒绝计入共享统计。
 pub(crate) struct MessageBudget {
     budget: ResourceBudget,
     origin: Instant,
     bucket: TokenBucket,
 }
+
 impl MessageBudget {
+    /// 消耗一条业务消息的令牌；不足时返回重试建议。
     pub(crate) fn take(&mut self) -> Result<(), Rejection> {
         let now = self.origin.elapsed();
         #[cfg(test)]
@@ -201,10 +207,12 @@ impl MessageBudget {
     }
 }
 
+/// 持有一个房间订阅名额，析构时释放订阅计数。
 pub(crate) struct RoomPermit {
     budget: ResourceBudget,
     room: i64,
 }
+
 impl Drop for RoomPermit {
     fn drop(&mut self) {
         let mut state = self.budget.0.state.lock().unwrap();
@@ -221,6 +229,32 @@ impl Drop for RoomPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ResourceBudget {
+        /// 为非资源专项测试创建宽松预算，避免无关额度遮挡断言。
+        pub(crate) fn for_tests() -> Self {
+            Self::new(ResourcePolicy {
+                max_connections: 8192,
+                max_handshakes: 8192,
+                max_pending_attaches: 8192,
+                max_starting_sessions: 8192,
+                max_sessions: 8192,
+                max_subscribers_per_room: 8192,
+                start: RatePolicy {
+                    per_sec: 100_000,
+                    burst: 100_000,
+                },
+                ..Default::default()
+            })
+            .unwrap()
+        }
+
+        /// 冻结消息计费时钟，避免网络调度延迟补充测试令牌。
+        pub(crate) fn freeze_message_clock(&self) {
+            *self.0.message_elapsed.lock().unwrap() = Some(Duration::ZERO);
+        }
+    }
+
     #[test]
     fn guards_and_shared_clones_release_once_and_track_rejections() {
         let budget = ResourceBudget::new(ResourcePolicy {
@@ -244,6 +278,7 @@ mod tests {
         assert_eq!(budget.snapshot().occupied[0], 0);
         assert_eq!(budget.snapshot().rejected[Resource::Connection as usize], 1);
     }
+
     #[tokio::test(start_paused = true)]
     async fn actual_start_quota_and_message_quota_replenish_without_affecting_control_frames() {
         let budget = ResourceBudget::new(ResourcePolicy {

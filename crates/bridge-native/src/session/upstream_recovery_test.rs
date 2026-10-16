@@ -1,6 +1,7 @@
+use tokio::time::{Instant, advance};
+
 use super::super::{ReconnectPolicy, UpstreamPolicy, UpstreamStatus};
 use super::*;
-use tokio::time::{Instant, advance};
 
 async fn settle() {
     for _ in 0..20 {

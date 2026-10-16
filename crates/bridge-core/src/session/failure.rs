@@ -1,4 +1,5 @@
 //! 从运行时无关的失败摘要判断恢复方式。
+
 use crate::open_live::error::ErrorCode;
 
 /// HTTP 请求失败的最小摘要；原始错误由运行时保留用于日志。
@@ -15,6 +16,7 @@ pub enum ApiFailure {
     /// 平台业务错误码。
     Platform(ErrorCode),
 }
+
 /// 官方连接失败的最小摘要。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamFailure {
@@ -29,6 +31,7 @@ pub enum UpstreamFailure {
     /// 事件解码失败。
     Decode,
 }
+
 impl UpstreamFailure {
     /// 仅传输和候选地址连接失败允许恢复原场次。
     pub fn retryable(self) -> bool {

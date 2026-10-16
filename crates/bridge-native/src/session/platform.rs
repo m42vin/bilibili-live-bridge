@@ -18,6 +18,7 @@ pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(super) trait Platform: Send + Sync + 'static {
     /// 用身份码开启场次，返回房间号与官方连接信息。
     fn start<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<StartResult, ApiError>>;
+
     /// 发送一批项目心跳；成功结果仍可能包含失败场次。
     fn batch_heartbeat<'a>(
         &'a self,
@@ -25,6 +26,7 @@ pub(super) trait Platform: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<BatchHeartbeatResult, ApiError>>;
     /// 结束已知场次，管理器决定如何记录清理错误。
     fn end<'a>(&'a self, game_id: &'a str) -> BoxFuture<'a, Result<(), ApiError>>;
+
     /// 建立并鉴权长连接；失败后由管理器清理已开启场次。
     fn connect<'a>(
         &'a self,
@@ -47,8 +49,10 @@ pub(super) trait LiveSocket: Send {
     fn endpoint(&self) -> Option<&str> {
         None
     }
+
     /// 等待事件并驱动连接心跳；None 表示上游已关闭。
     fn recv(&mut self) -> BoxFuture<'_, Result<Option<LiveEvent>, WsError>>;
+
     /// 关闭连接，不代替平台的场次结束操作。
     fn close(&mut self) -> BoxFuture<'_, Result<(), WsError>>;
 }
@@ -61,6 +65,7 @@ pub(super) struct LivePlatform {
 }
 
 impl LivePlatform {
+    /// 用已校验的时长和健康策略包装原生平台客户端。
     pub(super) fn new(api: Client, websocket_heartbeat: Duration, health: HealthPolicy) -> Self {
         Self {
             api,
@@ -150,6 +155,7 @@ impl LiveSocket for WsSocket {
     fn endpoint(&self) -> Option<&str> {
         Some(self.0.endpoint())
     }
+
     fn recv(&mut self) -> BoxFuture<'_, Result<Option<LiveEvent>, WsError>> {
         Box::pin(self.0.recv())
     }

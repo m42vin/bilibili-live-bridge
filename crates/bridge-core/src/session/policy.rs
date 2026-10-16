@@ -1,4 +1,5 @@
 //! 与运行时无关的健康、心跳和重连策略。
+
 use std::time::Duration;
 
 /// 官方长连接的发送与有效入站活动期限。
@@ -157,6 +158,7 @@ pub enum HeartbeatDiagnostic {
     /// 初始退避超过上限，计算时仍按上限封顶。
     InitialDelayExceedsMaximum,
 }
+
 impl HeartbeatPolicy {
     /// 返回所有风险；请求超时由运行时提供。
     pub fn diagnostics(
@@ -176,6 +178,7 @@ impl HeartbeatPolicy {
         }
         result
     }
+
     /// 指数退避，最终封顶且至少为 1 纳秒。
     /// 调用方应先校验策略，并提供 80–120 的抖动百分比；失败次数 0 按首次失败处理。
     pub fn retry_delay(self, failures: u32, jitter_percent: u32) -> Duration {
@@ -186,6 +189,7 @@ impl HeartbeatPolicy {
             jitter_percent,
         )
     }
+
     /// 访问限制至少等待一个正常心跳周期；此下限可以超过普通退避上限。
     pub fn retry_delay_for(
         self,
@@ -202,6 +206,7 @@ impl HeartbeatPolicy {
         }
     }
 }
+
 impl ReconnectPolicy {
     /// 指数退避，不会生成随机数。
     /// 调用方应先通过 UpstreamPolicy 校验策略，并提供 80–120 的抖动百分比。
@@ -214,6 +219,7 @@ impl ReconnectPolicy {
         )
     }
 }
+
 fn retry_delay(
     initial: Duration,
     maximum: Duration,

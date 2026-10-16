@@ -410,12 +410,15 @@ async fn sends_timeout_without_retrying_a_cancelled_sink() {
         fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
+
         fn start_send(self: Pin<&mut Self>, _: Message) -> io::Result<()> {
             panic!("not ready")
         }
+
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+
         fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -487,14 +490,17 @@ impl Sink<Message> for RecordingSink {
     fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+
     fn start_send(self: Pin<&mut Self>, message: Message) -> io::Result<()> {
         self.0
             .send(message)
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
+
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -564,6 +570,7 @@ impl Fixture {
     async fn with_delivery(app_heartbeat: Duration, delivery_policy: DeliveryPolicy) -> Self {
         Self::with_budget(app_heartbeat, delivery_policy, ResourceBudget::for_tests()).await
     }
+
     async fn with_resources(policy: ResourcePolicy) -> Self {
         Self::with_budget(
             Duration::from_secs(20),
@@ -572,6 +579,7 @@ impl Fixture {
         )
         .await
     }
+
     async fn with_budget(
         app_heartbeat: Duration,
         delivery_policy: DeliveryPolicy,
@@ -1123,23 +1131,28 @@ struct StopAfterSend {
     output: mpsc::UnboundedSender<Message>,
     stop: watch::Sender<bool>,
 }
+
 impl Sink<Message> for StopAfterSend {
     type Error = io::Error;
     fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+
     fn start_send(self: Pin<&mut Self>, message: Message) -> io::Result<()> {
         self.output.send(message).unwrap();
         self.stop.send_replace(true);
         Ok(())
     }
+
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
+
 fn delivery_log_fixture(
     policy: DeliveryPolicy,
 ) -> (Arc<crate::session::EventLog>, watch::Sender<UpstreamStatus>) {
@@ -1149,12 +1162,14 @@ fn delivery_log_fixture(
         .unwrap();
     (log, status)
 }
+
 fn sized_event(n: usize) -> LiveEvent {
     LiveEvent::Unknown {
         cmd: "TEST".into(),
         data: json!({"n":n,"text":"x".repeat(100)}),
     }
 }
+
 fn stop_after_send_sink() -> (
     StopAfterSend,
     mpsc::UnboundedReceiver<Message>,

@@ -1,7 +1,9 @@
 //! 与存储实现无关的交付模型。
+
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use std::fmt;
 
 /// 客户端最后连续处理完成的事件位置。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -28,6 +30,7 @@ impl fmt::Display for ResumeUnavailable {
         write!(f, "无法续传：{}", self.reason)
     }
 }
+
 impl std::error::Error for ResumeUnavailable {}
 
 /// 已序列化、可共享的事件记录。

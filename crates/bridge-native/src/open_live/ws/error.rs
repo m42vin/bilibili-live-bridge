@@ -37,18 +37,21 @@ pub enum WsError {
 }
 
 impl WsError {
+    /// 构造长连接参数错误，说明由调用方提供。
     pub(super) fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid {
             message: message.into(),
         }
     }
 
+    /// 保存候选地址未能完成握手或鉴权的说明。
     pub(super) fn connect(message: impl Into<String>) -> Self {
         Self::Connect {
             message: message.into(),
         }
     }
 
+    /// 保留长连接传输错误及其发生阶段。
     pub(super) fn transport(
         message: &'static str,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -59,6 +62,7 @@ impl WsError {
         }
     }
 
+    /// 构造长链协议错误，说明由调用方提供。
     pub(super) fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
             message: message.into(),

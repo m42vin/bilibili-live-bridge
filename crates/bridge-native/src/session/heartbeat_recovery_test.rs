@@ -1,9 +1,10 @@
-use super::*;
-use crate::session::recovery::NativeMoment;
-use crate::session::{HeartbeatPolicy, Subscription};
 use bridge_core::session::failure::FailureKind;
 use bridge_core::session::recovery::{HeartbeatOutcome, HeartbeatRecovery};
 use tokio::time::Instant;
+
+use super::*;
+use crate::session::recovery::NativeMoment;
+use crate::session::{HeartbeatPolicy, Subscription};
 
 fn platform_error(code: i64) -> ApiError {
     ApiError::Platform {

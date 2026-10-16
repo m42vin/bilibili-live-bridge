@@ -184,6 +184,7 @@ impl<'a> ServerMessage<'a> {
             data: &record.data,
         }
     }
+
     /// 将直播事件封装成实时模式消息。
     pub fn event(room_id: i64, event: &'a LiveEvent) -> Self {
         Self::Event {

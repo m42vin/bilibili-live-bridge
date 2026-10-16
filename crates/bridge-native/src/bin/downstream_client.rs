@@ -15,12 +15,11 @@ use bridge_core::downstream::admission::{
     AdmissionFailure, AdmissionRequest, AdmissionResponse, is_retryable_code,
 };
 use bridge_core::downstream::protocol::ClientMessage;
-use tokio::sync::{mpsc, watch};
-
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -352,6 +351,7 @@ fn retry_delay(base: Duration, suggestion: Option<u64>, jitter_percent: u32) -> 
     let base = base.min(Duration::from_secs(24 * 60 * 60));
     base.saturating_add(base.mul_f64(f64::from(jitter_percent.min(20)) / 100.0))
 }
+
 fn jitter() -> u32 {
     u32::from(uuid::Uuid::new_v4().as_bytes()[0]) % 21
 }
@@ -422,8 +422,11 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
     if let Some(subscribe) = subscribe {
         let sent = tokio::select! {
             biased;
-            result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
-            result = timeout(IO_TIMEOUT,socket.send(Message::text(subscribe.to_string()))) => result,
+            result = shutdown.as_mut() => {
+                interrupted(result)?;
+                return Ok(Outcome::Stopped);
+            }
+            result = timeout(IO_TIMEOUT, socket.send(Message::text(subscribe.to_string()))) => result,
         };
         if !matches!(sent, Ok(Ok(()))) {
             return Ok(Outcome::Retry {
@@ -431,25 +434,36 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
             });
         }
     }
+
     let mut last_incoming = Instant::now();
     let mut received: Option<EventCursor> = None;
     loop {
         let incoming = tokio::select! {
             biased;
-            result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
+            result = shutdown.as_mut() => {
+                interrupted(result)?;
+                return Ok(Outcome::Stopped);
+            }
             changed = processed.changed() => {
-                if changed.is_err() { return Err("事件处理任务意外结束".into()); }
+                if changed.is_err() {
+                    return Err("事件处理任务意外结束".into());
+                }
                 let ack = processed.borrow_and_update().clone().unwrap();
                 let message = json!({"type":"ack","stream_id":ack.stream_id,"seq":ack.seq});
                 let sent = tokio::select! {
                     biased;
-                    result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
-                    result = timeout(IO_TIMEOUT,socket.send(Message::text(message.to_string()))) => result,
+                    result = shutdown.as_mut() => {
+                        interrupted(result)?;
+                        return Ok(Outcome::Stopped);
+                    }
+                    result = timeout(IO_TIMEOUT, socket.send(Message::text(message.to_string()))) => result,
                 };
-                if !matches!(sent,Ok(Ok(()))) { return Ok(Outcome::Retry {retry_after_ms:None}); }
+                if !matches!(sent, Ok(Ok(()))) {
+                    return Ok(Outcome::Retry { retry_after_ms: None });
+                }
                 continue;
             }
-            result = tokio::time::timeout_at(last_incoming + IDLE_TIMEOUT,socket.next()) => result,
+            result = tokio::time::timeout_at(last_incoming + IDLE_TIMEOUT, socket.next()) => result,
         };
         if matches!(&incoming, Ok(Some(Ok(_)))) {
             last_incoming = Instant::now();
@@ -466,7 +480,10 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                         let pong = serde_json::to_string(&ClientMessage::Pong { nonce }).unwrap();
                         let sent = tokio::select! {
                             biased;
-                            result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
+                            result = shutdown.as_mut() => {
+                                interrupted(result)?;
+                                return Ok(Outcome::Stopped);
+                            }
                             result = timeout(IO_TIMEOUT, socket.send(Message::text(pong))) => result,
                         };
                         if !matches!(sent, Ok(Ok(()))) {
@@ -495,7 +512,7 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                         *cursor.lock().unwrap() = Some(base.clone());
                         received = Some(base);
                         *ready_at = Some(Instant::now());
-                        tracing::info!(room_id,%game_id,resumed,ack_window,"身份码订阅成功");
+                        tracing::info!(room_id, %game_id, resumed, ack_window, "身份码订阅成功");
                     }
                     ServerMessage::Event {
                         room_id,
@@ -545,14 +562,14 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                     ServerMessage::Status { state } => match state.as_str() {
                         "reconnecting" => tracing::warn!("上游正在恢复，保持下游订阅并等待"),
                         "connected" => tracing::info!("上游已恢复，继续接收事件"),
-                        _ => tracing::debug!(%state,"忽略未知上游状态"),
+                        _ => tracing::debug!(%state, "忽略未知上游状态"),
                     },
                     ServerMessage::ResumeUnavailable {
                         reason,
                         earliest_after,
                         latest_seq,
                     } => {
-                        tracing::error!(%reason,?earliest_after,?latest_seq,"续传不可用，不能完整恢复");
+                        tracing::error!(%reason, ?earliest_after, ?latest_seq, "续传不可用，不能完整恢复");
                         return Err("续传不可用，检查日志后决定是否重新从实时位置订阅".into());
                     }
                     ServerMessage::Error {
@@ -560,10 +577,10 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                         retry_after_ms,
                     } => {
                         if is_retryable_code(&code) {
-                            tracing::warn!(%code,?retry_after_ms,"暂时拒绝接入，保留游标重试");
+                            tracing::warn!(%code, ?retry_after_ms, "暂时拒绝接入，保留游标重试");
                             return Ok(Outcome::Retry { retry_after_ms });
                         }
-                        tracing::error!(%code,"桥接服务报告接入错误");
+                        tracing::error!(%code, "桥接服务报告接入错误");
                         return Err("接入失败，请检查身份码和服务端日志".into());
                     }
                     ServerMessage::Closed => {
@@ -577,8 +594,11 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                 // 自动 Pong 已排队，flush 驱动它；业务处理在另一个任务，不阻塞这里。
                 let flushed = tokio::select! {
                     biased;
-                    result = shutdown.as_mut() => { interrupted(result)?; return Ok(Outcome::Stopped); }
-                    result = timeout(IO_TIMEOUT,socket.flush()) => result,
+                    result = shutdown.as_mut() => {
+                        interrupted(result)?;
+                        return Ok(Outcome::Stopped);
+                    }
+                    result = timeout(IO_TIMEOUT, socket.flush()) => result,
                 };
                 if !matches!(flushed, Ok(Ok(()))) {
                     return Ok(Outcome::Retry {

@@ -6,6 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+pub use bridge_core::session::lifecycle::ManagerOptions;
+use bridge_core::session::lifecycle::{
+    AdmissionOwner, ClaimDecision, IdleAction, SessionLifecycle,
+};
+use bridge_core::session::recovery::HeartbeatRecovery;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::time::{Instant, sleep_until};
 use tracing::Instrument;
@@ -19,19 +24,14 @@ use crate::config::Config;
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
 use crate::resource::{Permit, Resource, ResourceBudget, RoomPermit};
-pub use bridge_core::session::lifecycle::ManagerOptions;
-use bridge_core::session::lifecycle::{
-    AdmissionOwner, ClaimDecision, IdleAction, SessionLifecycle,
-};
-use bridge_core::session::recovery::HeartbeatRecovery;
+pub use heartbeat::HeartbeatPolicy;
+use heartbeat::run_heartbeats;
+pub use upstream::{ReconnectPolicy, UpstreamPolicy, UpstreamStatus};
 
 #[path = "heartbeat.rs"]
 mod heartbeat;
-pub use heartbeat::HeartbeatPolicy;
 #[path = "upstream.rs"]
 mod upstream;
-use heartbeat::run_heartbeats;
-pub use upstream::{ReconnectPolicy, UpstreamPolicy, UpstreamStatus};
 
 /// 每个生产会话的广播缓冲容量；慢订阅者溢出后跳过旧事件，不拖住其他订阅者。
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -287,6 +287,7 @@ impl Manager {
         state.budget = budget;
         Ok(self)
     }
+
     /// 同一个 Manager、其克隆和 server 使用的资源预算。
     pub fn resource_budget(&self) -> ResourceBudget {
         self.state.budget.clone()
@@ -410,33 +411,6 @@ impl Manager {
                 heartbeat_done: Notify::new(),
             }),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_platform(
-        platform: Arc<dyn Platform>,
-        app_heartbeat: Duration,
-        event_capacity: usize,
-    ) -> Self {
-        assert!(event_capacity > 0, "事件缓冲至少为 1");
-        Self::from_parts(
-            platform,
-            app_heartbeat,
-            event_capacity,
-            ManagerOptions::default(),
-            HeartbeatPolicy::default(),
-            UpstreamPolicy {
-                reconnect: None,
-                ..UpstreamPolicy::default()
-            },
-        )
-        .with_resource_budget(ResourceBudget::for_tests())
-        .unwrap()
-    }
-
-    #[cfg(test)]
-    pub(super) async fn beat_once(&self) {
-        heartbeat::pump(&self.state).await;
     }
 }
 
@@ -1103,7 +1077,9 @@ struct SessionPermits {
     session: Option<Permit>,
     starting: Option<Permit>,
 }
+
 struct Waiter(Arc<Session>);
+
 impl Drop for Waiter {
     fn drop(&mut self) {
         self.0.release_waiter();
@@ -1291,6 +1267,7 @@ impl Session {
         self.idle.send_replace(None);
         Some(Waiter(Arc::clone(self)))
     }
+
     fn release_waiter(&self) {
         let mut life = lock(&self.lifecycle);
         self.apply_idle(life.end_attach(NativeMoment(Instant::now())));
@@ -1298,6 +1275,7 @@ impl Session {
             self.no_waiters.notify_waiters();
         }
     }
+
     fn apply_idle(&self, action: IdleAction<NativeMoment>) {
         match action {
             IdleAction::Unchanged => {}
@@ -1310,6 +1288,7 @@ impl Session {
             }
         }
     }
+
     async fn until_no_waiters(&self) {
         loop {
             let notified = self.no_waiters.notified();
@@ -1497,6 +1476,7 @@ fn normalize_code(code: &str) -> Result<&str, SessionError> {
     Ok(code)
 }
 
+/// 取得内部状态锁；中毒时保留状态并继续执行清理。
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }

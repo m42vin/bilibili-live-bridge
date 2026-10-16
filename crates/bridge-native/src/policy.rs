@@ -1,9 +1,13 @@
 //! 策略的原生时钟检查和诊断输出；业务规则由 core 决定。
-use crate::open_live::api::REQUEST_TIMEOUT;
-use bridge_core::session::{HealthPolicy, HeartbeatDiagnostic, HeartbeatPolicy, UpstreamPolicy};
+
 use std::time::Duration;
+
+use bridge_core::session::{HealthPolicy, HeartbeatDiagnostic, HeartbeatPolicy, UpstreamPolicy};
 use tokio::time::Instant;
 
+use crate::open_live::api::REQUEST_TIMEOUT;
+
+/// 校验健康策略和心跳间隔，并检查原生时钟能否表示其期限。
 pub(crate) fn validate_health(
     policy: HealthPolicy,
     heartbeat: Duration,
@@ -16,6 +20,8 @@ pub(crate) fn validate_health(
     }
     Ok(())
 }
+
+/// 校验项目心跳策略，并检查原生时钟能否表示其期限。
 pub(crate) fn validate_heartbeat(policy: HeartbeatPolicy) -> Result<(), &'static str> {
     policy.validate()?;
     for duration in [
@@ -29,6 +35,8 @@ pub(crate) fn validate_heartbeat(policy: HeartbeatPolicy) -> Result<(), &'static
     }
     Ok(())
 }
+
+/// 校验上游健康与恢复策略，并检查原生时钟范围。
 pub(crate) fn validate_upstream(
     policy: UpstreamPolicy,
     heartbeat: Duration,
@@ -48,6 +56,8 @@ pub(crate) fn validate_upstream(
     }
     Ok(())
 }
+
+/// 记录项目心跳时间组合的风险提示，不修改配置。
 pub(crate) fn warn_heartbeat(policy: HeartbeatPolicy, every: Duration) {
     let diagnostics = policy.diagnostics(every, REQUEST_TIMEOUT);
     if diagnostics.contains(&HeartbeatDiagnostic::FailureTimeoutExceedsRecommended) {

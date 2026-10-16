@@ -1,5 +1,53 @@
+use super::super::Manager;
 use super::*;
 use crate::open_live::error::ErrorCode;
+
+impl Manager {
+    /// 立即采样心跳，复用生产请求与反馈处理路径。
+    pub(in crate::session) async fn beat_once(&self) {
+        pump(&self.state).await;
+    }
+}
+
+/// 测试用立即采样；生产请求只能由 run_heartbeats 的单请求调度器启动。
+async fn pump(state: &State) {
+    let pending: Vec<PendingBeat> = {
+        let mut beats = lock(&state.beats);
+        beats
+            .iter_mut()
+            .filter(|(_, slot)| !slot.in_flight)
+            .map(|(game_id, slot)| {
+                slot.in_flight = true;
+                slot.normal_due = None;
+                PendingBeat {
+                    game_id: game_id.clone(),
+                    session: slot.session.clone(),
+                }
+            })
+            .collect()
+    };
+    for chunk in pending.chunks(MAX_BATCH_HEARTBEAT) {
+        let pending: Vec<_> = {
+            let beats = lock(&state.beats);
+            chunk
+                .iter()
+                .filter(|beat| {
+                    beats
+                        .get(&beat.game_id)
+                        .is_some_and(|slot| Weak::ptr_eq(&slot.session, &beat.session))
+                })
+                .cloned()
+                .collect()
+        };
+        if pending.is_empty() {
+            continue;
+        }
+        let mut request = request(state, pending);
+        let outcome = request.future.as_mut().await;
+        expire_recoveries(state);
+        finish_request(state, &request.pending, outcome);
+    }
+}
 
 fn platform(code: i64) -> ApiError {
     ApiError::Platform {

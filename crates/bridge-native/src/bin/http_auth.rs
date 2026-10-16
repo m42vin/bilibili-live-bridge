@@ -19,9 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[tracing::instrument(name = "http_auth", skip_all, err(Display))]
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
-
     let client = Client::from_config(&config)?;
-
     let auth_code = std::env::var("AUTH_CODE")?;
 
     let start_result = client.start(&auth_code).await?;

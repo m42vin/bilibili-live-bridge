@@ -15,6 +15,7 @@ mod delivery;
 mod error;
 mod manager;
 mod platform;
+mod recovery;
 
 #[cfg(test)]
 pub(crate) use delivery::EventLog;
@@ -28,5 +29,3 @@ pub use manager::{
     HeartbeatPolicy, Manager, ManagerOptions, ReconnectPolicy, RecvError, Subscription,
     UpstreamPolicy, UpstreamStatus,
 };
-
-mod recovery;

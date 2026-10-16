@@ -38,12 +38,14 @@ pub enum SessionError {
 }
 
 impl SessionError {
+    /// 构造会话参数错误，说明由调用方提供。
     pub(super) fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid {
             message: message.into(),
         }
     }
 
+    /// 保存开场失败的说明和可选平台业务码。
     pub(super) fn from_start(error: ApiError) -> Self {
         Self::Start {
             code: error.platform_code(),
@@ -51,6 +53,7 @@ impl SessionError {
         }
     }
 
+    /// 保存建连失败，并附带场次结束失败的说明。
     pub(super) fn from_connect(error: WsError, end: Result<(), ApiError>) -> Self {
         let end_message = match end {
             Ok(()) => None,

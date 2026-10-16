@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use bridge_core::delivery::{EventCursor, RecordedEvent, ResumeUnavailable};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -37,6 +38,7 @@ impl Default for DeliveryPolicy {
 }
 
 impl DeliveryPolicy {
+    /// 校验日志容量、ACK 窗口及原生时钟可表示的保留期限。
     pub(crate) fn validate(self) -> Result<(), &'static str> {
         if self.retention.is_zero()
             || Instant::now().checked_add(self.retention).is_none()
@@ -58,6 +60,7 @@ pub enum DeliveryError {
     /// 日志、身份码归属或游标不可用；不会开启新场次。
     Resume(ResumeUnavailable),
 }
+
 impl fmt::Display for DeliveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -66,6 +69,7 @@ impl fmt::Display for DeliveryError {
         }
     }
 }
+
 impl std::error::Error for DeliveryError {}
 
 struct Entry {
@@ -73,6 +77,7 @@ struct Entry {
     at: Instant,
     bytes: usize,
 }
+
 struct Stream {
     room_id: i64,
     game_id: String,
@@ -82,19 +87,23 @@ struct Stream {
     tail: u64,
     ended: Option<Instant>,
 }
+
 #[derive(Default)]
 struct State {
     streams: HashMap<String, Stream>,
     bytes: usize,
 }
 
+/// 管理全部事件流的有界日志，提供续传读取及变化通知。
 pub(crate) struct EventLog {
+    /// 所有事件流共享的保留、容量与 ACK 窗口策略。
     pub(crate) policy: DeliveryPolicy,
     state: Mutex<State>,
     changed: watch::Sender<u64>,
 }
 
 impl EventLog {
+    /// 创建共享事件日志；调用方应先校验策略。
     pub(crate) fn new(policy: DeliveryPolicy) -> Arc<Self> {
         Arc::new(Self {
             policy,
@@ -103,6 +112,7 @@ impl EventLog {
         })
     }
 
+    /// 注册活动流；容量已满时优先淘汰结束流，否则拒绝。
     pub(crate) fn register(
         &self,
         id: &str,
@@ -144,6 +154,7 @@ impl EventLog {
         Ok(())
     }
 
+    /// 登记流的身份码归属，最多保留最近使用的 128 个摘要。
     pub(crate) fn add_code(&self, id: &str, code: &str) {
         if let Some(stream) = super::manager::lock(&self.state).streams.get_mut(id) {
             let code = fingerprint(code);
@@ -157,6 +168,7 @@ impl EventLog {
         }
     }
 
+    /// 返回流的最大记录序号；流不存在时返回零。
     pub(crate) fn tail(&self, id: &str) -> u64 {
         super::manager::lock(&self.state)
             .streams
@@ -164,6 +176,7 @@ impl EventLog {
             .map_or(0, |s| s.tail)
     }
 
+    /// 分配序号并追加事件，超出共享预算时淘汰最早记录。
     pub(crate) fn append(&self, id: &str, event: &LiveEvent) -> Result<(), serde_json::Error> {
         let data = event.data_json()?;
         let cmd = event.cmd().to_owned();
@@ -218,6 +231,7 @@ impl EventLog {
         Ok(())
     }
 
+    /// 标记流结束并唤醒读取器，保留日志供尾部回放。
     pub(crate) fn finish(&self, id: &str) {
         if let Some(stream) = super::manager::lock(&self.state).streams.get_mut(id) {
             stream.ended = Some(Instant::now());
@@ -252,6 +266,7 @@ impl EventLog {
         }
     }
 
+    /// 按身份码和游标创建读取器；活动流必须持有会话订阅。
     pub(crate) fn reader(
         self: &Arc<Self>,
         id: &str,
@@ -260,17 +275,6 @@ impl EventLog {
         guard: Option<Subscription>,
     ) -> Result<DeliverySubscription, ResumeUnavailable> {
         self.reader_checked(id, code, after, guard, true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_reader(
-        self: &Arc<Self>,
-        id: &str,
-        code: &str,
-        after: Option<u64>,
-        guard: Option<Subscription>,
-    ) -> Result<DeliverySubscription, ResumeUnavailable> {
-        self.reader_checked(id, code, after, guard, false)
     }
 
     fn reader_checked(
@@ -324,6 +328,7 @@ fn remove_stream(state: &mut State, id: &str) {
         state.bytes -= stream.events.iter().map(|e| e.bytes).sum::<usize>();
     }
 }
+
 fn unavailable() -> ResumeUnavailable {
     ResumeUnavailable {
         reason: "stream_unavailable",
@@ -331,6 +336,7 @@ fn unavailable() -> ResumeUnavailable {
         latest_seq: None,
     }
 }
+
 fn validate(stream: &Stream, after: u64) -> Result<(), ResumeUnavailable> {
     let earliest = stream
         .events
@@ -368,17 +374,21 @@ pub struct DeliverySubscription {
 }
 
 impl DeliverySubscription {
+    /// 订阅全部流的日志变化通知，读取事实仍需检查日志。
     pub(crate) fn changes(&self) -> watch::Receiver<u64> {
         self.log.changed.subscribe()
     }
+
     /// 本管理器配置的 ACK 窗口大小。
     pub fn ack_window(&self) -> u64 {
         self.log.policy.ack_window
     }
+
     /// 独立于事件的上游状态快照。
     pub fn watch_status(&self) -> watch::Receiver<UpstreamStatus> {
         self.status.clone()
     }
+
     /// 验证最后确认位置仍可续传。可用于 ACK 窗口暂停时检查日志淘汰。
     pub fn validate_after(&self, seq: u64) -> Result<(), ResumeUnavailable> {
         let mut state = super::manager::lock(&self.log.state);
@@ -388,6 +398,7 @@ impl DeliverySubscription {
             seq,
         )
     }
+
     /// 读取下一条事件；结束且尾部读完返回 None，缺口返回错误而不跳过。
     ///
     /// # Errors
@@ -420,5 +431,3 @@ impl DeliverySubscription {
 #[cfg(test)]
 #[path = "delivery_test.rs"]
 mod tests;
-
-pub use bridge_core::delivery::{EventCursor, RecordedEvent, ResumeUnavailable};
