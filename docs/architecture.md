@@ -7,7 +7,7 @@
 
 ## Crate 边界
 
-依赖方向为 `bridge-native → bridge-core`。核心仅处理显式输入，不读取环境变量、不生成随机数、不访问时钟或网络。
+依赖方向为 `bridge-native → bridge-core ← bridge-worker`。核心仅处理显式输入，不读取环境变量、不生成随机数、不访问时钟或网络。
 
 `bridge-core::open_live` 包含签名、API 请求与响应模型、错误码、官方包解析及事件模型；`bridge-core::downstream::protocol` 定义下游消息；`bridge-core::delivery` 定义游标、事件记录与续传失败信息。
 
@@ -32,11 +32,21 @@ native 保留批量心跳组批、正常周期优先、单请求在途及场次�
 
 房间与身份码索引、管理器 shutdown、实际 HTTP / WebSocket 操作、取消守卫派生任务和通知仍由 native 执行。锁内决定，释放锁后等待网络；不会把网络调用持有到生命周期锁中。跨码合并仍先等待重复场次的 end 尝试返回，再发布重定向；shutdown 等待这些清理完成。
 
-这些状态不是跨进程持久化快照：时间基准、重启恢复和请求幂等需要未来 Workers 适配另行处理。日志保留策略与内存日志仍留在 native。
+这些状态不是跨进程持久化快照。Worker 当前采用独立的简化调度，持久化场次清理责任，对象重建不恢复事件流；尚未接入 native 的完整恢复策略。两个运行时各自维护有界内存日志。
+
+## Workers 运行时
+
+`bridge-worker` 的入口把 HTTP 接入分配到按身份码摘要命名的 Admission DO；取得房间号后移交给按项目与房间命名的 Room DO。
+Room 签发一次性短期凭证，下游直接连接 Room；上游鉴权完成后发送 ready。
+Admission 的 pending 记录与 Room 的 session 记录保存场次清理责任，alarm 负责回收未使用接入和闲置场次。
+Room 的内存日志支持当前实例内 ACK 续传；对象重建清理旧场次，明确拒绝旧游标。
+此阶段不包含自动上游重连和项目级全局配额，完整边界及验证见 [Worker 指南](../crates/bridge-worker/README.md)。
+
+下文的 Manager、Tokio 调度、进程共享预算和优雅退出描述适用于 native 运行时。
 
 ## 模块边界
 
-项目是包含 `bridge-core` 与 `bridge-native` 的 Cargo workspace。原生库入口是 [src/lib.rs](../crates/bridge-native/src/lib.rs)，可执行入口位于 [src/bin](../crates/bridge-native/src/bin/)。
+项目是包含 `bridge-core`、`bridge-native` 与 `bridge-worker` 的 Cargo workspace。原生库入口是 [src/lib.rs](../crates/bridge-native/src/lib.rs)，可执行入口位于 [src/bin](../crates/bridge-native/src/bin/)。
 
 | 模块 | 职责 | 主要入口 |
 | --- | --- | --- |

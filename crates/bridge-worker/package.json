@@ -1,0 +1,16 @@
+{
+  "name": "bridge-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "worker-build --release",
+    "dev": "wrangler dev",
+    "check": "wrangler deploy --dry-run",
+    "test": "node --test tests/integration.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0",
+    "miniflare": "5.20261006.1-alpha",
+    "ws": "8.21.0"
+  }
+}

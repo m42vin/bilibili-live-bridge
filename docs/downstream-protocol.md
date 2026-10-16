@@ -215,7 +215,7 @@ Ctrl-C 或 Unix SIGTERM 停止接入、通知下游关闭，并等待共享开�
 ## HTTP 接入协议（为 Worker 适配预留）
 
 core 定义 `downstream::admission`，native 的 `downstream_client` 已支持此协议。
-当前 native `server` 仍只提供原有 `/ws`，尚未实现 HTTP 接入服务或 Room DO。
+当前 native `server` 仍只提供原有 `/ws`；`bridge-worker` 提供 HTTP 接入服务与 Room DO，详见 [Worker 指南](../crates/bridge-worker/README.md)。
 
 客户端向配置的完整 HTTP(S) 接入地址发送 POST，Content-Type 为 application/json。
 正文与 subscribe 的订阅参数相同，但不含 `type`：

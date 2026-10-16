@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bilibili-live-bridge",
+  "main": "build/index.js",
+  "compatibility_date": "2026-10-16",
+  "compatibility_flags": ["no_websocket_standard_binary_type", "no_nodejs_global_timers"],
+  "build": { "command": "worker-build --release" },
+  "durable_objects": { "bindings": [
+    { "name": "ADMISSIONS", "class_name": "Admission" },
+    { "name": "ROOMS", "class_name": "Room" }
+  ] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Admission", "Room"] }],
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } }
+}

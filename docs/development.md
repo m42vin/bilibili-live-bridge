@@ -2,6 +2,8 @@
 
 本文面向修改和验证项目的开发者。运行配置和示例程序见 [README](../README.md)，模块边界与会话约束见 [架构说明](architecture.md)，接口细节以源码 rustdoc 为准。
 
+新增和实质修改代码遵循 [编码规范](coding-convention.md)，存量代码随改随补。
+
 ## 环境与首次验证
 
 使用 Rust stable 与 Cargo，项目采用 Rust 2024 edition。仓库当前未声明最低支持的 Rust 版本，也未固定工具链；首次开发先确认本机工具链能构建锁定的依赖。
@@ -207,3 +209,22 @@ cargo test --locked health_test
 cargo test --locked upstream_recovery
 cargo clippy --locked --all-targets -- -D warnings
 ```
+
+## Workers 适配验证
+
+新增 `bridge-worker` 时不改变原生服务的 Tokio 运行时。修改 Worker 后除 workspace 测试外，还需执行：
+
+```sh
+cargo check --locked -p bridge-worker --target wasm32-unknown-unknown
+cargo clippy --locked -p bridge-worker --target wasm32-unknown-unknown -- -D warnings
+cd crates/bridge-worker
+npm ci
+npm test
+npm run check
+```
+
+安装与配置见 [Worker 指南](../crates/bridge-worker/README.md)。`npm test` 在 workerd 中加载生成的 WASM，
+通过本地桩测试场次接入、双心跳、ACK 续传、闲置回收、DO 重建与鉴权拒绝，无需平台凭据。
+`npm run check` 是 Wrangler dry-run，不会发布。真实 Cloudflare 出口与 Bilibili 的联通性需部署后另行验证。
+
+Worker 日志与 ACK 窗口的单元测试位于 `delivery_test.rs`；运行时集成测试通过平台桩通知等待心跳与清理完成，并使用超时限制等待，不依赖固定 sleep 推断完成状态。

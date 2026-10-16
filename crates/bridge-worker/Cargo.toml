@@ -1,0 +1,19 @@
+[package]
+name = "bridge-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bridge-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "=0.8.7"
+futures-util = { workspace = true, features = ["async-await"] }
