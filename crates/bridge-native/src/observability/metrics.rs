@@ -27,7 +27,7 @@ const OUTCOMES: [&str; 9] = [
     "protocol",
     "cancelled",
 ];
-const FAULTS: [&str; 15] = [
+const FAULTS: [&str; 16] = [
     "upstream_eof",
     "upstream_invalid",
     "upstream_transport",
@@ -43,8 +43,9 @@ const FAULTS: [&str; 15] = [
     "shutdown_timeout",
     "heartbeat_recovery_exhausted",
     "upstream_recovery_exhausted",
+    "downstream_oversized",
 ];
-const RESOURCES: [&str; 8] = [
+const RESOURCES: [&str; 10] = [
     "connection",
     "handshake",
     "pending_attach",
@@ -53,6 +54,8 @@ const RESOURCES: [&str; 8] = [
     "start_rate",
     "subscriber",
     "client_message",
+    "sending_bytes",
+    "failed_code",
 ];
 
 /// 被观测的平台操作，枚举顺序对应固定指标标签。
@@ -102,7 +105,7 @@ impl Outcome {
             ApiError::Invalid { .. } => Self::Invalid,
             ApiError::Transport { source, .. } if source.is_timeout() => Self::Timeout,
             ApiError::Transport { .. } => Self::Transport,
-            ApiError::Decode { .. } => Self::Decode,
+            ApiError::Decode { .. } | ApiError::ResponseTooLarge { .. } => Self::Decode,
             ApiError::Status { .. } => Self::Http,
             ApiError::Platform { .. } => Self::Platform,
         }
@@ -152,6 +155,8 @@ pub(crate) enum Fault {
     HeartbeatRecoveryExhausted,
     /// 原场次上游恢复预算耗尽。
     UpstreamRecoveryExhausted,
+    /// 下游 JSON 超出单连接编码上限，未跳过对应事件。
+    DownstreamOversized,
 }
 
 impl Fault {
@@ -176,7 +181,7 @@ struct OperationStats {
 #[derive(Default)]
 struct Stats {
     operations: [OperationStats; 6],
-    faults: [u64; 15],
+    faults: [u64; 16],
 }
 
 /// 固定大小的观测状态，与 Manager 克隆共享，独立管理器互不影响。
@@ -240,6 +245,46 @@ impl Counters {
         }
         family(&mut text, "bridge_resource_limit", "gauge");
         let limits = snapshot.limits;
+        for (name, kind, value) in [
+            (
+                "bridge_sending_bytes",
+                "gauge",
+                snapshot.resources.sending_bytes as u64,
+            ),
+            (
+                "bridge_send_limit_bytes",
+                "gauge",
+                limits.max_send_bytes as u64,
+            ),
+            (
+                "bridge_connection_send_limit_bytes",
+                "gauge",
+                limits.max_connection_send_bytes as u64,
+            ),
+            (
+                "bridge_replay_bytes_per_second",
+                "gauge",
+                limits.replay.per_sec,
+            ),
+            ("bridge_replay_burst_bytes", "gauge", limits.replay.burst),
+            (
+                "bridge_failed_code_entries",
+                "gauge",
+                snapshot.resources.failed_code_entries as u64,
+            ),
+            (
+                "bridge_failed_code_limit",
+                "gauge",
+                limits.max_failed_codes as u64,
+            ),
+            (
+                "bridge_failed_code_cooldown_seconds",
+                "gauge",
+                limits.failed_code_cooldown.as_secs(),
+            ),
+        ] {
+            scalar(&mut text, name, kind, value);
+        }
         for (name, value) in RESOURCES.iter().zip([
             limits.max_connections,
             limits.max_handshakes,

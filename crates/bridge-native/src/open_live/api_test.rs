@@ -286,6 +286,94 @@ fn stub(body: &'static str) -> (String, Receiver<String>) {
     stub_response(response)
 }
 
+#[tokio::test]
+async fn response_limit_handles_known_chunked_and_unknown_lengths_at_the_boundary() {
+    let body = format!("{{\"code\":0}}{}", " ".repeat(54));
+    assert_eq!(body.len(), 64);
+    for framing in ["length", "chunked", "eof"] {
+        for oversized in [false, true] {
+            let body = if oversized {
+                format!("{body} ")
+            } else {
+                body.clone()
+            };
+            let response = match framing {
+                "length" => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+                "chunked" => format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    20,
+                    &body[..20],
+                    body.len() - 20,
+                    &body[20..]
+                ),
+                _ => format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}"),
+            };
+            let (origin, _request) = stub_response(response);
+            let client = Client::with_origin("key", "secret", 1, &origin)
+                .unwrap()
+                .with_response_limit(64)
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), client.end("game"))
+                .await
+                .unwrap();
+            if oversized {
+                assert!(
+                    matches!(result, Err(ApiError::ResponseTooLarge { limit: 64 })),
+                    "{framing}: {result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn advertised_oversized_response_is_rejected_without_waiting_for_the_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Client::with_origin(
+        "key",
+        "secret",
+        1,
+        &format!("http://{}", listener.local_addr().unwrap()),
+    )
+    .unwrap()
+    .with_response_limit(64)
+    .unwrap();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = wait.await;
+    });
+    let result = tokio::time::timeout(Duration::from_secs(2), client.end("game")).await;
+    release.send(()).unwrap();
+    server.await.unwrap();
+    assert!(matches!(
+        result.unwrap(),
+        Err(ApiError::ResponseTooLarge { limit: 64 })
+    ));
+    assert!(
+        Client::new("key", "secret", 1)
+            .unwrap()
+            .with_response_limit(0)
+            .is_err()
+    );
+}
+
 fn stub_response(response: impl Into<String>) -> (String, Receiver<String>) {
     let response = response.into();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

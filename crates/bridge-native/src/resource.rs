@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bridge_core::resource::TokenBucket;
 pub use bridge_core::resource::{RatePolicy, Rejection, Resource, ResourcePolicy};
+use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 /// 当前占用与累计计数；拒绝数组按 Resource 的枚举顺序索引。
@@ -18,13 +19,18 @@ pub struct ResourceSnapshot {
     /// 当前仍持有活动会话守卫的订阅总数。
     pub subscribers: usize,
     /// 按资源类别累计的拒绝数量。
-    pub rejected: [u64; 8],
+    pub rejected: [u64; 10],
+    /// 正在序列化或等待 flush 的 JSON 预留字节。
+    pub sending_bytes: usize,
+    /// 冷却缓存实际条目数，包含在途预留及惰性清理前的过期条目。
+    pub failed_code_entries: usize,
 }
 
 struct State {
     stats: ResourceSnapshot,
     start: TokenBucket,
     rooms: HashMap<i64, usize>,
+    failed_codes: HashMap<[u8; 32], Option<Instant>>,
 }
 
 struct Inner {
@@ -44,6 +50,12 @@ impl ResourceBudget {
     /// 创建预算，校验纯策略；所有名额均快速尝试获取，不排队。
     pub fn new(policy: ResourcePolicy) -> Result<Self, &'static str> {
         policy.validate()?;
+        if Instant::now()
+            .checked_add(policy.failed_code_cooldown)
+            .is_none()
+        {
+            return Err("失败身份码冷却超出时钟范围");
+        }
         Ok(Self(Arc::new(Inner {
             policy,
             origin: Instant::now(),
@@ -53,6 +65,7 @@ impl ResourceBudget {
                 stats: ResourceSnapshot::default(),
                 start: TokenBucket::new(policy.start, Duration::ZERO)?,
                 rooms: HashMap::new(),
+                failed_codes: HashMap::new(),
             }),
         })))
     }
@@ -64,7 +77,10 @@ impl ResourceBudget {
 
     /// 获取当前占用和累计计数的快照。
     pub fn snapshot(&self) -> ResourceSnapshot {
-        self.0.state.lock().unwrap().stats.clone()
+        let state = self.0.state.lock().unwrap();
+        let mut stats = state.stats.clone();
+        stats.failed_code_entries = state.failed_codes.len();
+        stats
     }
 
     /// 立即尝试取得并发资源名额；拒绝时不排队。
@@ -119,8 +135,40 @@ impl ResourceBudget {
     }
 
     /// 消耗一次实际 start 调用的频率额度，并更新统计。
-    pub(crate) fn start(&self) -> Result<(), Rejection> {
+    pub(crate) fn start_code(&self, code: &str) -> Result<StartAttempt, Rejection> {
+        let key: [u8; 32] = Sha256::digest(code.as_bytes()).into();
         let mut state = self.0.state.lock().unwrap();
+        let now = Instant::now();
+        state
+            .failed_codes
+            .retain(|_, until| until.is_none_or(|until| until > now));
+        if let Some(until) = state.failed_codes.get(&key) {
+            let rejection = Rejection {
+                resource: if until.is_some() {
+                    Resource::FailedCode
+                } else {
+                    Resource::StartingSession
+                },
+                retry_after_ms: Some(until.map_or(1000, |until| remaining_ms(until, now))),
+            };
+            record(&mut state.stats, rejection);
+            return Err(rejection);
+        }
+        if state.failed_codes.len() >= self.0.policy.max_failed_codes {
+            let retry = state
+                .failed_codes
+                .values()
+                .flatten()
+                .map(|until| remaining_ms(*until, now))
+                .min()
+                .unwrap_or(1000);
+            let rejection = Rejection {
+                resource: Resource::FailedCode,
+                retry_after_ms: Some(retry),
+            };
+            record(&mut state.stats, rejection);
+            return Err(rejection);
+        }
         if let Err(ms) = state.start.take(self.0.origin.elapsed()) {
             let rejection = Rejection {
                 resource: Resource::StartRate,
@@ -130,11 +178,41 @@ impl ResourceBudget {
             return Err(rejection);
         }
         state.stats.start_calls = state.stats.start_calls.saturating_add(1);
+        state.failed_codes.insert(key, None);
         tracing::debug!(
             start_calls = state.stats.start_calls,
             "平台 start 额度已消耗"
         );
-        Ok(())
+        Ok(StartAttempt {
+            budget: self.clone(),
+            key,
+            pending: true,
+        })
+    }
+
+    /// 序列化前预留单连接完整上限；完成后按实际长度缩减，额度不足立即拒绝。
+    pub(crate) fn reserve_send(&self) -> Result<SendPermit, Rejection> {
+        let bytes = self.0.policy.max_connection_send_bytes;
+        let mut state = self.0.state.lock().unwrap();
+        if bytes
+            > self
+                .0
+                .policy
+                .max_send_bytes
+                .saturating_sub(state.stats.sending_bytes)
+        {
+            let rejection = Rejection {
+                resource: Resource::SendingBytes,
+                retry_after_ms: Some(1000),
+            };
+            record(&mut state.stats, rejection);
+            return Err(rejection);
+        }
+        state.stats.sending_bytes += bytes;
+        Ok(SendPermit {
+            budget: self.clone(),
+            bytes,
+        })
     }
 
     /// 记录资源拒绝，并附带可选的毫秒重试建议。
@@ -155,6 +233,71 @@ impl ResourceBudget {
             bucket: TokenBucket::new(self.0.policy.client_message, Duration::ZERO)
                 .expect("策略已校验"),
         }
+    }
+}
+
+fn remaining_ms(until: Instant, now: Instant) -> u64 {
+    until
+        .saturating_duration_since(now)
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(u64::MAX as u128) as u64
+}
+
+/// 一次实际 start 的缓存预留，只有明确失败才启用冷却。
+pub(crate) struct StartAttempt {
+    budget: ResourceBudget,
+    key: [u8; 32],
+    pending: bool,
+}
+
+impl StartAttempt {
+    /// 从收到失败结果时起冷却；已有会话复用与续传不会调用此方法。
+    pub(crate) fn failed(mut self) {
+        let mut state = self.budget.0.state.lock().unwrap();
+        state.failed_codes.insert(
+            self.key,
+            Some(Instant::now() + self.budget.0.policy.failed_code_cooldown),
+        );
+        // 失败条目由缓存期限管理；旧守卫不能在到期后删除同码的新预留。
+        self.pending = false;
+    }
+}
+
+impl Drop for StartAttempt {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        let mut state = self.budget.0.state.lock().unwrap();
+        if state
+            .failed_codes
+            .get(&self.key)
+            .is_some_and(Option::is_none)
+        {
+            state.failed_codes.remove(&self.key);
+        }
+    }
+}
+
+/// 在途 JSON 字节的所有权守卫，flush 完成或写端销毁后归还额度。
+pub(crate) struct SendPermit {
+    budget: ResourceBudget,
+    bytes: usize,
+}
+
+impl SendPermit {
+    /// 序列化结束后归还未使用的预留字节；不允许扩大预留。
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes, "序列化输出不能超过预留上限");
+        self.budget.0.state.lock().unwrap().stats.sending_bytes -= self.bytes - bytes;
+        self.bytes = bytes;
+    }
+}
+
+impl Drop for SendPermit {
+    fn drop(&mut self) {
+        self.budget.0.state.lock().unwrap().stats.sending_bytes -= self.bytes;
     }
 }
 
@@ -231,6 +374,10 @@ mod tests {
     use super::*;
 
     impl ResourceBudget {
+        /// 单独验证 start 速率，不保留任何失败身份码缓存。
+        fn start(&self) -> Result<(), Rejection> {
+            self.start_code("test-code").map(drop)
+        }
         /// 为非资源专项测试创建宽松预算，避免无关额度遮挡断言。
         pub(crate) fn for_tests() -> Self {
             Self::new(ResourcePolicy {
@@ -240,6 +387,7 @@ mod tests {
                 max_starting_sessions: 8192,
                 max_sessions: 8192,
                 max_subscribers_per_room: 8192,
+                failed_code_cooldown: Duration::from_nanos(1),
                 start: RatePolicy {
                     per_sec: 100_000,
                     burst: 100_000,

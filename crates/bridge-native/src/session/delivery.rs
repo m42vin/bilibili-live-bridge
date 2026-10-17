@@ -324,6 +324,7 @@ impl EventLog {
             room_id: stream.room_id,
             game_id: stream.game_id.clone(),
             base_seq: base,
+            replay_until: stream.tail,
             next: base + 1,
             log: Arc::clone(self),
             changed,
@@ -389,6 +390,7 @@ pub struct DeliverySubscription {
     pub game_id: String,
     /// 本次接入的已处理起点；ready 应将此值返回客户端。
     pub base_seq: u64,
+    replay_until: u64,
     next: u64,
     log: Arc<EventLog>,
     changed: watch::Receiver<u64>,
@@ -397,6 +399,10 @@ pub struct DeliverySubscription {
 }
 
 impl DeliverySubscription {
+    /// 读取器创建时的日志尾部；不随新事件推进，用于区分历史回放和实时交付。
+    pub(crate) fn replay_until(&self) -> u64 {
+        self.replay_until
+    }
     /// 订阅全部流的日志变化通知，读取事实仍需检查日志。
     pub(crate) fn changes(&self) -> watch::Receiver<u64> {
         self.log.changed.subscribe()

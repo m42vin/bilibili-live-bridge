@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-/// 一类令牌桶的速率与突发容量，单位为次/秒和次。
+/// 一类令牌桶的速率与突发容量，单位由调用方规定为次数或字节。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RatePolicy {
     /// 每秒补充的令牌数量。
@@ -11,7 +11,7 @@ pub struct RatePolicy {
     pub burst: u64,
 }
 
-/// 第一阶段共享资源限制；工程默认值不代表平台官方额度。
+/// 共享资源、发送与开场冷却限制；工程默认值不代表平台官方额度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourcePolicy {
     /// 下游连接任务总数，包含握手及等待订阅。
@@ -30,6 +30,16 @@ pub struct ResourcePolicy {
     pub max_subscribers_per_room: usize,
     /// 每条连接入站业务消息的速率限制，包含 ACK。
     pub client_message: RatePolicy,
+    /// 全部下游连接共享的序列化及待 flush JSON 字节上限。
+    pub max_send_bytes: usize,
+    /// 单连接单条序列化 JSON 字节上限，不包含 WebSocket 帧头。
+    pub max_connection_send_bytes: usize,
+    /// 每连接历史回放的字节速率及突发容量。
+    pub replay: RatePolicy,
+    /// 实际 start 失败后，同码再次 start 的冷却时间。
+    pub failed_code_cooldown: Duration,
+    /// 冷却缓存的总条目上限，包含正在 start 的预留条目。
+    pub max_failed_codes: usize,
 }
 
 impl Default for ResourcePolicy {
@@ -49,6 +59,14 @@ impl Default for ResourcePolicy {
                 per_sec: 1000,
                 burst: 2000,
             },
+            max_send_bytes: 32 << 20,
+            max_connection_send_bytes: 1 << 20,
+            replay: RatePolicy {
+                per_sec: 1 << 20,
+                burst: 1 << 20,
+            },
+            failed_code_cooldown: Duration::from_secs(30),
+            max_failed_codes: 1024,
         }
     }
 }
@@ -63,12 +81,15 @@ impl ResourcePolicy {
             self.max_starting_sessions,
             self.max_sessions,
             self.max_subscribers_per_room,
+            self.max_send_bytes,
+            self.max_connection_send_bytes,
+            self.max_failed_codes,
         ] {
             if n == 0 || n as u128 > u32::MAX as u128 {
                 return Err("资源上限必须为 1..=u32::MAX 的整数");
             }
         }
-        for rate in [self.start, self.client_message] {
+        for rate in [self.start, self.client_message, self.replay] {
             rate.validate()?;
         }
         if self.max_handshakes > self.max_connections {
@@ -76,6 +97,17 @@ impl ResourcePolicy {
         }
         if self.max_starting_sessions > self.max_sessions {
             return Err("开场上限不能超过会话上限");
+        }
+        if self.max_connection_send_bytes > self.max_send_bytes {
+            return Err("单连接发送字节上限不能超过共享发送上限");
+        }
+        if self.replay.burst < self.max_connection_send_bytes as u64 {
+            return Err("回放突发字节不能小于单连接发送字节上限");
+        }
+        if self.failed_code_cooldown.is_zero()
+            || self.failed_code_cooldown.as_secs() > u32::MAX as u64
+        {
+            return Err("失败身份码冷却必须为有效正时长");
         }
         Ok(())
     }
@@ -115,6 +147,10 @@ pub enum Resource {
     Subscriber,
     /// 连接业务消息频率。
     ClientMessage,
+    /// 下游序列化及待发送字节。
+    SendingBytes,
+    /// start 失败冷却及其有界缓存。
+    FailedCode,
 }
 
 impl Resource {
@@ -129,6 +165,8 @@ impl Resource {
             Self::StartRate => "start_rate",
             Self::Subscriber => "subscriber",
             Self::ClientMessage => "client_message",
+            Self::SendingBytes => "sending_bytes",
+            Self::FailedCode => "failed_code",
         }
     }
 }
@@ -146,7 +184,7 @@ impl Rejection {
     /// 稳定的客户端错误码。
     pub const fn code(self) -> &'static str {
         match self.resource {
-            Resource::StartRate | Resource::ClientMessage => "rate_limited",
+            Resource::StartRate | Resource::ClientMessage | Resource::FailedCode => "rate_limited",
             Resource::Subscriber => "subscription_limit",
             _ => "server_busy",
         }
@@ -182,6 +220,14 @@ impl TokenBucket {
 
     /// 消耗一个令牌，或返回最少还需等待的毫秒数。时间倒退不补充额度。
     pub fn take(&mut self, now: Duration) -> Result<(), u64> {
+        self.take_amount(1, now)
+    }
+
+    /// 按显式时间一次计费多个令牌；超过突发容量时返回 u64::MAX，不消耗额度。
+    pub fn take_amount(&mut self, amount: u64, now: Duration) -> Result<(), u64> {
+        if amount > self.policy.burst {
+            return Err(u64::MAX);
+        }
         if now > self.updated {
             let added = (now - self.updated)
                 .as_nanos()
@@ -192,11 +238,12 @@ impl TokenBucket {
                 .min(self.policy.burst as u128 * 1_000_000_000);
             self.updated = now;
         }
-        if self.credit >= 1_000_000_000 {
-            self.credit -= 1_000_000_000;
+        let required = u128::from(amount) * 1_000_000_000;
+        if self.credit >= required {
+            self.credit -= required;
             return Ok(());
         }
-        let nanos = (1_000_000_000 - self.credit).div_ceil(self.policy.per_sec as u128);
+        let nanos = (required - self.credit).div_ceil(self.policy.per_sec as u128);
         Err(nanos.div_ceil(1_000_000).min(u64::MAX as u128) as u64)
     }
 }
@@ -251,5 +298,24 @@ mod tests {
         ] {
             assert!(p.validate().is_err());
         }
+    }
+
+    #[test]
+    fn byte_charges_are_atomic_fractional_and_reject_impossible_bursts() {
+        let mut bucket = TokenBucket::new(
+            RatePolicy {
+                per_sec: 10,
+                burst: 20,
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+        bucket.take_amount(15, Duration::ZERO).unwrap();
+        assert_eq!(bucket.take_amount(21, Duration::ZERO), Err(u64::MAX));
+        assert_eq!(bucket.take_amount(10, Duration::ZERO), Err(500));
+        assert_eq!(bucket.take_amount(10, Duration::from_millis(499)), Err(1));
+        bucket.take_amount(10, Duration::from_millis(500)).unwrap();
+        bucket.take_amount(0, Duration::ZERO).unwrap();
+        assert_eq!(bucket.take_amount(1, Duration::ZERO), Err(100));
     }
 }

@@ -82,6 +82,13 @@ cargo run --locked --bin multi_client
 | `BILIBILI_APP_ID` | 是 | 无 | 项目 ID，必须是大于 0 的 `i64` 整数 |
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
 | `BRIDGE_ADMIN_LISTEN` | 否 | `127.0.0.1:9090` | 独立管理 HTTP 地址，提供 `/livez`、`/readyz`、`/metrics`；空白值使用默认地址 |
+| `BRIDGE_MAX_PLATFORM_RESPONSE_BYTES` | 否 | `1048576` | 平台成功 HTTP 响应正文的最大读取字节数，支持无长度与分块响应 |
+| `BRIDGE_MAX_SEND_BYTES` | 否 | `33554432` | 全部连接共享的 JSON 序列化及待 flush 字节预算 |
+| `BRIDGE_MAX_CONNECTION_SEND_BYTES` | 否 | `1048576` | 每连接单条 JSON 字节上限，不能超过共享发送预算或回放突发字节 |
+| `BRIDGE_REPLAY_BYTES_PER_SEC` | 否 | `1048576` | 每连接历史回放每秒补充的字节额度 |
+| `BRIDGE_REPLAY_BURST_BYTES` | 否 | `1048576` | 每连接回放突发字节，必须不小于单连接发送上限 |
+| `BRIDGE_FAILED_CODE_COOLDOWN_SECS` | 否 | `30` | 实际 start 失败后，同身份码再次 start 的冷却时间，正整数秒 |
+| `BRIDGE_FAILED_CODE_CACHE_SIZE` | 否 | `1024` | 失败身份码摘要及在途 start 预留的总条目上限 |
 | `BRIDGE_SHUTDOWN_TIMEOUT_SECS` | 否 | `30` | server 停止接入后等待维护通知、连接关闭与场次清理的总预算，正整数秒，须在时钟可表示范围内 |
 | `BRIDGE_MAX_CONNECTIONS` | 否 | `512` | 全部下游连接，含握手和等待订阅 |
 | `BRIDGE_MAX_HANDSHAKES` | 否 | `32` | 正在执行下游 HTTP→WS 升级的连接 |
@@ -158,9 +165,9 @@ curl http://127.0.0.1:9090/metrics
 TLS 仍由反向代理负责，业务代理只需转发 `/ws`；管理地址按运维网络配置。
 指标定义、固定标签、资源口径与告警示例见 [运维观测](docs/operations.md)。
 
-### 第一阶段资源保护
+### 资源保护
 
-上述资源默认值用于工程试运行，不代表平台官方配额。全部值须在 `1..=u32::MAX` 内，
+上述资源默认值用于工程试运行，不代表平台官方配额。计数、字节、速率及冷却秒数须在 `1..=u32::MAX` 内，
 握手上限不能超过连接上限，开场上限不能超过会话上限。遇到资源不足立即拒绝，不排无界队列。
 server 创建一份 `ResourceBudget` 注入 Manager；连接、Manager 克隆和进程内接入共享它。
 库构造器也默认启用同一组限制；可在克隆或接入前通过 `with_resource_budget` 注入自定义预算。
@@ -177,7 +184,23 @@ server 创建一份 `ResourceBudget` 注入 Manager；连接、Manager 克隆和
 结构化日志以固定资源名记录取得、释放和拒绝，不包含身份码。
 
 公网入口的代理、TLS、用户认证和按 IP 配额均不在此阶段；客户端只需主播身份码。
-发送字节预算、历史回放限速和失败身份码冷却留待后续实现。
+平台成功响应默认最多读取 1 MiB，先检查可知长度，再逐块累计；超限返回 `ApiError::ResponseTooLarge`，不解析截断正文。
+`Client::new` 使用默认上限，`Client::from_config` 使用配置，库调用方可通过 `with_response_limit` 设置。
+响应超限在项目心跳中按解码类暂时错误进入原有恢复预算；start 失败没有可用场次 ID 时不能调用 end，也不自动重试。
+
+下游在序列化前预留单连接完整上限，编码完成后按实际长度缩减，并保持到 flush 完成。
+发送取消或超时后，额度保留到写端销毁；共享额度不足立即返回可重试的 server_busy，不排队。
+单条 JSON 超限返回终止性 `message_too_large` 并用 1009 关闭，保持原游标，不跳过事件。
+Ping/Pong、关闭帧及有界终止通知使用独立小消息路径，资源不足时仍能尽力通知；预算不代表进程 RSS 或 TLS/内核缓冲上限。
+
+ACK 模式将日志读取器建立时的尾部固定为历史边界，历史事件按完整 JSON 字节使用每连接令牌桶限速，
+之后产生的实时事件不计入回放额度。等待令牌不占发送字节，最多保留一条共享日志记录，
+仍响应 ACK、心跳、上游状态和维护退出；记录过期或淘汰时明确续传失败，不越过缺口。
+
+仅实际 start 失败启用同码冷却，时间从失败结果起算，重复拒绝不刷新期限，也不消耗新的 start 额度。
+缓存只保存规范化身份码的 SHA-256 摘要，包含在途预留，满时拒绝新 start，不淘汰未过期条目。
+已有会话复用、已知游标续传、资源拒绝、正常关闭及 start 成功后的建连失败不启用冷却。
+冷却不保存远端场次清理责任，也不提供跨进程保护。
 
 ### 下游客户端示例
 

@@ -20,7 +20,7 @@ fn classify(error: &ApiError, batch_size: usize) -> FailureKind {
     let failure = match error {
         ApiError::Invalid { .. } => ApiFailure::Invalid,
         ApiError::Transport { .. } => ApiFailure::Transport,
-        ApiError::Decode { .. } => ApiFailure::Decode,
+        ApiError::Decode { .. } | ApiError::ResponseTooLarge { .. } => ApiFailure::Decode,
         ApiError::Status { status } => ApiFailure::HttpStatus(*status),
         ApiError::Platform { code, .. } => ApiFailure::Platform(*code),
     };

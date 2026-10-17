@@ -22,6 +22,20 @@ pub const ENV_APP_ID: &str = "BILIBILI_APP_ID";
 pub const ENV_LISTEN: &str = "BRIDGE_LISTEN";
 /// 管理 HTTP 监听地址，独立于业务连接名额，默认仅回环可访问。
 pub const ENV_ADMIN_LISTEN: &str = "BRIDGE_ADMIN_LISTEN";
+/// 平台成功 HTTP 响应的最大读取字节数。
+pub const ENV_MAX_PLATFORM_RESPONSE_BYTES: &str = "BRIDGE_MAX_PLATFORM_RESPONSE_BYTES";
+/// 全部连接共享的序列化及待 flush JSON 预算，单位字节。
+pub const ENV_MAX_SEND_BYTES: &str = "BRIDGE_MAX_SEND_BYTES";
+/// 每条连接的单条 JSON 字节上限。
+pub const ENV_MAX_CONNECTION_SEND_BYTES: &str = "BRIDGE_MAX_CONNECTION_SEND_BYTES";
+/// 每条连接历史回放的补充字节数/秒。
+pub const ENV_REPLAY_BYTES_PER_SEC: &str = "BRIDGE_REPLAY_BYTES_PER_SEC";
+/// 历史回放字节令牌桶的突发容量。
+pub const ENV_REPLAY_BURST_BYTES: &str = "BRIDGE_REPLAY_BURST_BYTES";
+/// 实际 start 失败后的同码冷却时间，单位秒。
+pub const ENV_FAILED_CODE_COOLDOWN_SECS: &str = "BRIDGE_FAILED_CODE_COOLDOWN_SECS";
+/// 失败身份码摘要缓存容量，包含在途 start 预留。
+pub const ENV_FAILED_CODE_CACHE_SIZE: &str = "BRIDGE_FAILED_CODE_CACHE_SIZE";
 /// server 停止接入后的退出总预算，单位秒，必须为正。
 pub const ENV_SHUTDOWN_TIMEOUT_SECS: &str = "BRIDGE_SHUTDOWN_TIMEOUT_SECS";
 /// 官方 WebSocket 心跳间隔，单位秒。
@@ -95,6 +109,7 @@ pub struct Config {
     app_id: i64,
     listen: SocketAddr,
     admin_listen: SocketAddr,
+    max_platform_response_bytes: usize,
     shutdown_timeout: Duration,
     websocket_heartbeat: Duration,
     app_heartbeat: Duration,
@@ -119,6 +134,10 @@ impl Config {
     /// 项目心跳时间组合不安全时由管理器警告，配置值保持原样。
     /// 上游发送/活动期限默认 5/60 秒，恢复预算默认 120 秒（0 禁用），退避 2000/10000 毫秒。
     /// 活动期限必须大于长连接心跳间隔加发送期限，初始退避不得超过上限。
+    /// 平台响应默认限制 1 MiB；共享发送/单连接 JSON 默认限制 32/1 MiB，回放默认 1 MiB/秒及 1 MiB 突发。
+    /// 发送上限满足单连接 <= 共享且 <= 回放突发；实际 start 失败默认冷却 30 秒，摘要缓存最多 1024 条。
+    /// 对应 BRIDGE_MAX_PLATFORM_RESPONSE_BYTES、BRIDGE_MAX_SEND_BYTES、BRIDGE_MAX_CONNECTION_SEND_BYTES、
+    /// BRIDGE_REPLAY_BYTES_PER_SEC、BRIDGE_REPLAY_BURST_BYTES、BRIDGE_FAILED_CODE_COOLDOWN_SECS、BRIDGE_FAILED_CODE_CACHE_SIZE。
     /// 读取的文本去掉首尾空白；空白的可选变量使用默认值。
     ///
     /// # Errors
@@ -151,6 +170,11 @@ impl Config {
             crate::downstream::DEFAULT_SHUTDOWN_TIMEOUT,
             Duration::from_secs,
         )?;
+        let max_platform_response_bytes = resource_number(
+            &read,
+            ENV_MAX_PLATFORM_RESPONSE_BYTES,
+            crate::open_live::api::DEFAULT_MAX_RESPONSE_BYTES as u64,
+        )? as usize;
         let websocket_heartbeat = match optional(&read, ENV_WEBSOCKET_HEARTBEAT_SECS)? {
             Some(value) => parse_interval(
                 &value,
@@ -298,12 +322,46 @@ impl Config {
                     defaults.client_message.burst,
                 )?,
             },
+            max_send_bytes: resource_number(
+                &read,
+                ENV_MAX_SEND_BYTES,
+                defaults.max_send_bytes as u64,
+            )? as usize,
+            max_connection_send_bytes: resource_number(
+                &read,
+                ENV_MAX_CONNECTION_SEND_BYTES,
+                defaults.max_connection_send_bytes as u64,
+            )? as usize,
+            replay: RatePolicy {
+                per_sec: resource_number(&read, ENV_REPLAY_BYTES_PER_SEC, defaults.replay.per_sec)?,
+                burst: resource_number(&read, ENV_REPLAY_BURST_BYTES, defaults.replay.burst)?,
+            },
+            failed_code_cooldown: policy_duration(
+                &read,
+                ENV_FAILED_CODE_COOLDOWN_SECS,
+                defaults.failed_code_cooldown,
+                Duration::from_secs,
+            )?,
+            max_failed_codes: resource_number(
+                &read,
+                ENV_FAILED_CODE_CACHE_SIZE,
+                defaults.max_failed_codes as u64,
+            )? as usize,
         };
         resource_policy
             .validate()
             .map_err(|message| ConfigError::Invalid {
                 var: if resource_policy.max_handshakes > resource_policy.max_connections {
                     ENV_MAX_HANDSHAKES
+                } else if resource_policy.max_connection_send_bytes > resource_policy.max_send_bytes
+                {
+                    ENV_MAX_CONNECTION_SEND_BYTES
+                } else if resource_policy.replay.burst
+                    < resource_policy.max_connection_send_bytes as u64
+                {
+                    ENV_REPLAY_BURST_BYTES
+                } else if resource_policy.failed_code_cooldown.as_secs() > u32::MAX as u64 {
+                    ENV_FAILED_CODE_COOLDOWN_SECS
                 } else {
                     ENV_MAX_STARTING_SESSIONS
                 },
@@ -316,6 +374,7 @@ impl Config {
             app_id,
             listen,
             admin_listen,
+            max_platform_response_bytes,
             shutdown_timeout,
             websocket_heartbeat,
             app_heartbeat,
@@ -354,6 +413,12 @@ impl Config {
     #[must_use]
     pub const fn admin_listen(&self) -> SocketAddr {
         self.admin_listen
+    }
+
+    /// 平台成功 HTTP 响应的最大实际读取字节数。
+    #[must_use]
+    pub const fn max_platform_response_bytes(&self) -> usize {
+        self.max_platform_response_bytes
     }
 
     /// server 停止接入后等待维护通知、下游关闭和场次清理的总预算。
@@ -407,6 +472,10 @@ impl fmt::Debug for Config {
             .field("app_id", &self.app_id)
             .field("listen", &self.listen)
             .field("admin_listen", &self.admin_listen)
+            .field(
+                "max_platform_response_bytes",
+                &self.max_platform_response_bytes,
+            )
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("websocket_heartbeat", &self.websocket_heartbeat)
             .field("app_heartbeat", &self.app_heartbeat)

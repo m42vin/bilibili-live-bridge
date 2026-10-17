@@ -111,6 +111,18 @@ RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 资源测试使用小预算和受控 start / connect / end 桩验证生命周期；测试构造器显式注入宽松预算，
 避免既有批量心跳测试被试运行额度遮挡。资源功能测试另行注入真实小额度，并核对拒绝前平台调用量。
 令牌桶用显式时间或暂停时钟；WS 消息限速测试冻结仅测试编译的消息时钟，网络调度延迟不会补充令牌。
+
+资源加固测试覆盖固定长度、chunked、无长度响应的精确边界，以及仅发送过大响应头时立即拒绝。
+下游输出测试用阻塞 Sink 固定 flush 取消，确认字节额度保留到 sink 销毁；真实 WebSocket 桩验证预算拒绝、
+1009 超限与原游标再次接入，不跳过序号。暂停时钟驱动回放字节补充、Ping、状态、ACK、退出及等待期间的日志淘汰。
+冷却测试使用小容量和显式时间，验证重复拒绝不刷新期限、不再 start，缓存满不能循环换码绕过，复用与续传不受影响。
+
+```sh
+cargo test --locked -p bridge-native response_limit
+cargo test --locked -p bridge-native replay_
+cargo test --locked -p bridge-native sending_bytes
+cargo test --locked -p bridge-native failed_code
+```
 客户端重试测试等待实际重新握手并检查 resume_after，不用固定 sleep 猜测重试时刻。
 
 维护退出测试用 start/end 桩的 gate 固定清理交错，验证 ready 前、活动订阅及 ACK 窗口满时的

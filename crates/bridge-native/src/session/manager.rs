@@ -696,21 +696,26 @@ impl State {
             session.fail(error.clone());
             return Err(error);
         }
-        if let Err(rejection) = self.budget.start() {
-            let error = SessionError::Resource(rejection);
-            leader.owner.commit();
-            session.fail(error.clone());
-            return Err(error);
-        }
+        let attempt = match self.budget.start_code(code) {
+            Ok(attempt) => attempt,
+            Err(rejection) => {
+                let error = SessionError::Resource(rejection);
+                leader.owner.commit();
+                session.fail(error.clone());
+                return Err(error);
+            }
+        };
         let started = match self.platform.start(code).await {
             Ok(started) => started,
             Err(error) => {
+                attempt.failed();
                 let error = SessionError::from_start(error);
                 leader.owner.commit();
                 session.fail(error.clone());
                 return Err(error);
             }
         };
+        drop(attempt);
         leader.owner.acquired(started.game_id().to_owned());
         session.set_game_id(started.game_id().to_owned());
         tracing::debug!(

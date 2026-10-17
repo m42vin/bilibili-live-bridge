@@ -20,6 +20,71 @@ fn limits() -> ResourcePolicy {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn failed_code_cooldown_is_bounded_does_not_refresh_and_never_starts_on_resume() {
+    let mock = Mock::new();
+    mock.push_start(Err(ApiError::Platform {
+        code: ErrorCode::IdentityCode,
+        message: "private".into(),
+        request_id: None,
+    }));
+    mock.push_ok("good", 7);
+    mock.push_connect_ok();
+    let manager = limited(
+        &mock,
+        ResourcePolicy {
+            max_failed_codes: 1,
+            failed_code_cooldown: Duration::from_secs(5),
+            ..limits()
+        },
+    );
+    assert!(matches!(
+        manager.attach(" bad ").await,
+        Err(SessionError::Start { .. })
+    ));
+    let first = manager.attach("bad").await.unwrap_err();
+    assert!(matches!(
+        first,
+        SessionError::Resource(Rejection {
+            resource: Resource::FailedCode,
+            retry_after_ms: Some(5000)
+        })
+    ));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        manager.attach("bad").await,
+        Err(SessionError::Resource(Rejection {
+            resource: Resource::FailedCode,
+            retry_after_ms: Some(3000)
+        }))
+    ));
+    refused(
+        manager.attach("other-code").await.unwrap_err(),
+        Resource::FailedCode,
+    );
+    let cursor = EventCursor {
+        stream_id: "missing".into(),
+        seq: 0,
+    };
+    assert!(matches!(
+        manager.attach_delivery("bad", Some(&cursor)).await,
+        Err(DeliveryError::Resume(_))
+    ));
+    assert_eq!(mock.start_codes(), ["bad"]);
+    assert!(mock.ends().is_empty());
+    assert_eq!(manager.resource_budget().snapshot().failed_code_entries, 1);
+    assert_eq!(manager.resource_budget().snapshot().start_calls, 1);
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let sub = manager.attach("other-code").await.unwrap();
+    let reused = manager.attach("other-code").await.unwrap();
+    assert_eq!(mock.start_codes(), ["bad", "other-code"]);
+    assert_eq!(manager.resource_budget().snapshot().failed_code_entries, 0);
+    let _ = manager.shutdown().await;
+    drop((sub, reused));
+    assert_eq!(mock.ends(), ["good"]);
+}
+
 fn limited(mock: &Arc<Mock>, policy: ResourcePolicy) -> Manager {
     grace_manager(mock)
         .with_resource_budget(ResourceBudget::new(policy).unwrap())

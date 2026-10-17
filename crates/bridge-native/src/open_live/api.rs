@@ -27,6 +27,8 @@ pub const API_ORIGIN: &str = "https://live-open.biliapi.com";
 pub use bridge_core::open_live::model::MAX_BATCH_HEARTBEAT;
 /// 请求总超时；会话恢复预算与这个上限保持一致。
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 默认平台成功响应正文上限，按实际读取字节计费。
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 const START_PATH: &str = "/v2/app/start";
 const END_PATH: &str = "/v2/app/end";
@@ -37,6 +39,7 @@ const BATCH_HEARTBEAT_PATH: &str = "/v2/app/batchHeartbeat";
 ///
 /// 用 [`Client::from_config`] 或 [`Client::new`] 创建。`Clone` 共享同一个 HTTP 连接池。
 /// 请求总超时为 10 秒、连接超时为 5 秒，不跟随重定向，也不使用系统代理。
+/// 成功响应正文默认最多读取 1 MiB，可通过 [`Client::with_response_limit`] 调整。
 /// 此类型不启动心跳任务，不会在析构时关闭已开启的场次。
 #[derive(Clone)]
 pub struct Client {
@@ -45,6 +48,7 @@ pub struct Client {
     access_key_secret: String,
     app_id: i64,
     origin: String,
+    max_response_bytes: usize,
 }
 
 impl Client {
@@ -74,7 +78,20 @@ impl Client {
             config.access_key_id(),
             config.access_key_secret(),
             config.app_id(),
-        )
+        )?
+        .with_response_limit(config.max_platform_response_bytes())
+    }
+
+    /// 设置成功 HTTP 响应正文的读取上限，默认 1 MiB。
+    ///
+    /// # Errors
+    /// 上限不在 1..=u32::MAX 内时返回 Invalid。
+    pub fn with_response_limit(mut self, limit: usize) -> Result<Self, ApiError> {
+        if limit == 0 || limit as u128 > u32::MAX as u128 {
+            return Err(ApiError::invalid("平台响应字节上限必须在 1..=u32::MAX 内"));
+        }
+        self.max_response_bytes = limit;
+        Ok(self)
     }
 
     /// 指定开放平台源站。集成测试用来指向本地桩。
@@ -109,6 +126,7 @@ impl Client {
             access_key_secret,
             app_id,
             origin,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         })
     }
 
@@ -245,7 +263,7 @@ impl Client {
         );
         let headers = signed_headers(&self.access_key_id, &signed)?;
         let url = format!("{}{path}", self.origin);
-        let response = self
+        let mut response = self
             .http
             .post(&url)
             .headers(headers)
@@ -260,10 +278,27 @@ impl Client {
                 status: status.as_u16(),
             });
         }
-        let bytes = response
-            .bytes()
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_response_bytes as u64)
+        {
+            return Err(ApiError::ResponseTooLarge {
+                limit: self.max_response_bytes,
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|source| ApiError::transport("读取开放平台响应失败", source))?;
+            .map_err(|source| ApiError::transport("读取开放平台响应失败", source))?
+        {
+            if chunk.len() > self.max_response_bytes.saturating_sub(bytes.len()) {
+                return Err(ApiError::ResponseTooLarge {
+                    limit: self.max_response_bytes,
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         success_value(&bytes)
     }
 }

@@ -38,7 +38,12 @@ server 在两个监听器都成功绑定后才启动服务，管理地址绑定�
 | `bridge_ready` | gauge | 与 ready 探针相同的接入状态，1 为可接入，0 为关闭中 |
 | `bridge_resource_occupied{resource}` | gauge | 连接、握手、待接入、开场及会话名额的当前占用 |
 | `bridge_resource_limit{resource}` | gauge | 上述五类名额的配置上限 |
-| `bridge_resource_rejections_total{resource}` | counter | 八类资源拒绝累计次数 |
+| `bridge_resource_rejections_total{resource}` | counter | 十类资源拒绝累计次数 |
+| `bridge_sending_bytes` | gauge | 序列化及待 flush JSON 字节预留，取消后保留到写端销毁 |
+| `bridge_send_limit_bytes` / `bridge_connection_send_limit_bytes` | gauge | 共享发送及单连接单消息上限 |
+| `bridge_replay_bytes_per_second` / `bridge_replay_burst_bytes` | gauge | 每连接历史回放字节速率与突发配置 |
+| `bridge_failed_code_entries` / `bridge_failed_code_limit` | gauge | 失败摘要缓存实际条目数与总上限，条目包含在途预留和惰性清理前的过期记录 |
+| `bridge_failed_code_cooldown_seconds` | gauge | start 失败后的同码冷却配置 |
 | `bridge_subscribers` | gauge | 当前持有活动会话守卫的订阅数，含进程内调用方 |
 | `bridge_start_requests_total` | counter | 已消耗额度的实际 start 调用数，包含失败请求 |
 | `bridge_upstream_sessions{state}` | gauge | 已就绪且未开始关闭的上游，分别为 connected、reconnecting |
@@ -51,7 +56,7 @@ server 在两个监听器都成功绑定后才启动服务，管理地址绑定�
 | `bridge_platform_operation_duration_seconds{operation}` | summary | 平台操作已等待的秒数，导出 `_count`、`_sum`，不导出分位数 |
 | `bridge_failures_total{kind}` | counter | 关键运行时故障事件，固定类别见下表 |
 
-`resource` 标签固定为 connection、handshake、pending_attach、starting_session、session、start_rate、subscriber、client_message。
+`resource` 标签固定为 connection、handshake、pending_attach、starting_session、session、start_rate、subscriber、client_message、sending_bytes、failed_code。
 前五项提供占用与并发上限，后几项的速率或每房额度仍通过 README 配置表管理。
 日志字节不包含传输缓冲、广播、临时序列化和全部元数据，不代表进程 RSS 上限。
 日志按原有访问路径惰性清理过期内容，指标采集不会触发淘汰，因此可能仍包含尚未清理的过期记录。
@@ -62,6 +67,7 @@ server 在两个监听器都成功绑定后才启动服务，管理地址绑定�
 connect/reconnect 包含整个候选连接与鉴权过程；batch_heartbeat 按一次批量请求计数，不按场次数计数。
 批量响应成功但部分场次失效时，操作仍是 success，另增加 heartbeat_failed_game 故障计数。
 取消包括停机、闲置、请求已无有效场次和外层恢复截止时间，不等同于故障；不能把所有非 success 都当作网络错误。
+成功响应正文超限的 ResponseTooLarge 归入 decode，保留本地响应大小限制与平台业务错误的区别。
 HTTP 客户端报告的超时记为 timeout；外层调度器或关闭期限取消的操作记为 cancelled，并在对应超时故障中呈现。
 
 | `bridge_failures_total` 的 kind | 计数边界 |
@@ -77,6 +83,7 @@ HTTP 客户端报告的超时记为 timeout；外层调度器或关闭期限取�
 | resume_unavailable | 下游因不能完整续传而结束，按连接终止计数，不统计重复内部校验 |
 | shutdown_timeout | 服务退出总预算耗尽 |
 | heartbeat_recovery_exhausted / upstream_recovery_exhausted | 对应恢复预算耗尽，终止场次；不包含主动维护取消 |
+| downstream_oversized | 单条 JSON 超过发送上限，明确返回 message_too_large，不跳过事件或自动清除游标 |
 
 故障计数与操作结果可以描述同一次异常的不同边界，不能直接相加作为“总失败数”。
 end 操作的非成功结果用于观察清理失败；退出预算内完成仍不保证平台确认 end 成功。

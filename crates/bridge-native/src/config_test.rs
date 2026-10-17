@@ -421,3 +421,74 @@ fn management_listen_is_independent_and_validated() {
         })
     ));
 }
+
+#[test]
+fn hardening_settings_load_defaults_custom_values_and_reject_invalid_combinations() {
+    let config = load(&required_vars()).unwrap();
+    assert_eq!(config.max_platform_response_bytes(), 1 << 20);
+    assert_eq!(config.resource_policy().max_send_bytes, 32 << 20);
+    assert_eq!(config.resource_policy().max_connection_send_bytes, 1 << 20);
+    assert_eq!(
+        config.resource_policy().replay,
+        RatePolicy {
+            per_sec: 1 << 20,
+            burst: 1 << 20
+        }
+    );
+    assert_eq!(
+        config.resource_policy().failed_code_cooldown,
+        Duration::from_secs(30)
+    );
+    assert_eq!(config.resource_policy().max_failed_codes, 1024);
+    let mut vars = required_vars();
+    vars.extend([
+        (ENV_MAX_PLATFORM_RESPONSE_BYTES, "64"),
+        (ENV_MAX_SEND_BYTES, "4096"),
+        (ENV_MAX_CONNECTION_SEND_BYTES, "512"),
+        (ENV_REPLAY_BYTES_PER_SEC, "100"),
+        (ENV_REPLAY_BURST_BYTES, "512"),
+        (ENV_FAILED_CODE_COOLDOWN_SECS, "5"),
+        (ENV_FAILED_CODE_CACHE_SIZE, "2"),
+    ]);
+    let config = load(&vars).unwrap();
+    assert_eq!(config.max_platform_response_bytes(), 64);
+    let policy = config.resource_policy();
+    assert_eq!(policy.max_send_bytes, 4096);
+    assert_eq!(policy.max_connection_send_bytes, 512);
+    assert_eq!(
+        policy.replay,
+        RatePolicy {
+            per_sec: 100,
+            burst: 512
+        }
+    );
+    assert_eq!(policy.failed_code_cooldown, Duration::from_secs(5));
+    assert_eq!(policy.max_failed_codes, 2);
+
+    for key in [
+        ENV_MAX_PLATFORM_RESPONSE_BYTES,
+        ENV_MAX_SEND_BYTES,
+        ENV_MAX_CONNECTION_SEND_BYTES,
+        ENV_REPLAY_BYTES_PER_SEC,
+        ENV_REPLAY_BURST_BYTES,
+        ENV_FAILED_CODE_COOLDOWN_SECS,
+        ENV_FAILED_CODE_CACHE_SIZE,
+    ] {
+        for value in ["0", "-1", "bad", "4294967296"] {
+            let mut vars = required_vars();
+            vars.push((key, value));
+            assert!(
+                matches!(load(&vars), Err(ConfigError::Invalid { .. })),
+                "{key}={value}"
+            );
+        }
+        let mut vars = required_vars();
+        vars.push((key, " "));
+        assert!(load(&vars).is_ok(), "空白值应使用默认值：{key}");
+    }
+    for (key, value) in [(ENV_MAX_SEND_BYTES, "512"), (ENV_REPLAY_BURST_BYTES, "512")] {
+        let mut vars = required_vars();
+        vars.push((key, value));
+        assert!(load(&vars).is_err(), "跨项上限不能自相矛盾");
+    }
+}

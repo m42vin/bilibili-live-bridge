@@ -83,6 +83,16 @@ flowchart LR
 
 ## 共享准入预算
 
+资源策略还约束共享发送字节、单连接 JSON 上限、历史回放字节令牌及失败身份码缓存。
+下游 [output.rs](../crates/bridge-native/src/downstream/output.rs) 在序列化前预留单连接完整上限，
+通过有界 Writer 编码，结束后缩减到实际字节。Output 的 sink 先销毁，再释放尚未 flush 的字节守卫，
+不能在超时取消后提前归还额度并复用原写端。小控制帧与终止通知走独立路径；共享不足拒绝，单条超限明确关闭，不推进 ACK。
+
+ResourceBudget 按 SHA-256 摘要保存有界 start 缓存，预留条目为在途，明确 start 失败后记录冷却期限。
+条目检查、容量预留和 start 令牌计费在同一预算锁内完成，不跨 await 持锁；资源拒绝不会重复收费。
+成功或取消释放在途条目，失败条目按单调时钟惰性过期；容量满时拒绝新开场，不淘汰有效保护。
+Manager 在复用、续传和关闭路径上不经过 start 缓存，开场后的所有权移交与 end 清理顺序不变。
+
 core 的 resource 模块定义 ResourcePolicy、固定类别拒绝原因和显式 Duration 时间输入的令牌桶，
 不读取环境、时钟或网络，不依赖 Tokio。native 的 ResourceBudget 持有计数、实际时间和 RAII 名额。
 server 创建预算并通过 with_resource_budget 注入 Manager；Manager 克隆和所有接入 API 共用它。
@@ -99,7 +109,7 @@ Session 持有建立和会话名额，成功鉴权并发布 Ready 时释放开�
 覆盖网络、进程内和活动续传；只读结束日志不保留上游场次或活动订阅名额。
 历史日志与会话预算独立。心跳、恢复原场次和结束操作不获取这些新接入额度。
 
-ResourceBudget::snapshot 暴露五类占用、订阅数量、start 调用量与八类拒绝计数；
+ResourceBudget::snapshot 暴露五类并发占用、发送字节预留、冷却缓存条目、订阅数量、start 调用量与十类拒绝计数；
 tracing 用固定资源名输出变化和拒绝，不把身份码作为标签或日志内容。
 
 ## 会话接入与复用
@@ -146,6 +156,10 @@ core 的 `AdmissionPhase` 保存纯接入阶段；native 的 `Phase` 使用 watc
 未取得 game_id 时无法确定远端是否开启；正常客户端取消不会截断正在执行的 start。
 
 ## 两类心跳
+
+平台 HTTP 成功响应先检查已知长度，再按 chunk 累计到配置上限（默认 1 MiB）。
+长度缺失或分块响应同样受限；超限返回 ResponseTooLarge，不尝试解析部分正文。
+项目心跳将超限作为解码类可恢复失败，仍受原截止时间约束；start 未取得可用场次 ID 时不能推测远端结果或发起 end。
 
 | 心跳 | 负责人 | 驱动方式 |
 | --- | --- | --- |
@@ -232,6 +246,11 @@ Phase::Ready 在恢复期间仍表示可以订阅；独立 watch 通道发布 Co
 - 原实时模式没有持久化或重放。`downstream::protocol` 为 `LiveEvent` 提供独立序列化适配器，定义 `type / room_id / cmd / data` 消息；不改变官方事件枚举本身。
 
 ## 有界日志、确认模式与续传
+
+DeliverySubscription 在建立时保存固定 replay_until，读取顺序与对外游标不变。
+下游对不超过该边界的记录按完整 JSON 字节计费；每连接只保留一条待发送记录及有限令牌状态，
+不在回放令牌等待期间占发送字节。等待分支与 ACK、Ping/Pong、上游状态、日志变更和维护退出并发驱动，
+发送前继续检查日志保留范围，不因已持有 Arc 而恢复被淘汰的历史。取得额度及编码成功后才登记发送上界。
 
 [delivery.rs](../crates/bridge-native/src/session/delivery.rs) 为一个 Manager 的所有会话维护共享内存日志。
 上游任务在解析事件后先序列化记录，再广播；即使没有订阅者也会记录。

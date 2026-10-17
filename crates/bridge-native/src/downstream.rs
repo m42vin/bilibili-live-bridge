@@ -11,6 +11,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bridge_core::resource::TokenBucket;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,12 +29,14 @@ use tracing::instrument::WithSubscriber;
 use crate::observability::Fault;
 use crate::resource::{Permit, Rejection, Resource, ResourceBudget};
 use crate::session::{
-    DeliveryError, DeliverySubscription, Manager, RecvError, ResumeUnavailable, Subscription,
-    UpstreamStatus,
+    DeliveryError, DeliverySubscription, Manager, RecordedEvent, RecvError, ResumeUnavailable,
+    Subscription, UpstreamStatus,
 };
 use protocol::{ClientMessage, ServerMessage, Subscribe, parse_subscribe};
 
+mod output;
 mod protocol;
+use output::{Output, Prepared, encoded_len};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -45,7 +48,7 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTART_RETRY_AFTER_MS: u64 = 1000;
 
 type Socket = WebSocketStream<TcpStream>;
-type Writer = SplitSink<Socket, Message>;
+type Writer = Output<SplitSink<Socket, Message>>;
 type Reader = SplitStream<Socket>;
 
 #[derive(Clone, Copy)]
@@ -60,6 +63,7 @@ enum PeerState {
 enum Exit {
     End,
     Restart,
+    Oversized,
     Invalid(&'static str),
     AttachFailed,
     Resource(Rejection),
@@ -344,7 +348,8 @@ async fn connection(
     };
     drop(handshake_permit);
     tracing::info!("下游 WebSocket 已连接");
-    let (mut writer, reader) = socket.split();
+    let (sink, reader) = socket.split();
+    let mut writer = Output::new(sink, manager.resource_budget());
     let (first_tx, first_rx) = oneshot::channel();
     let (peer_tx, mut peer) = watch::channel(PeerState::Connected);
     let pongs = Arc::new(Pongs::new());
@@ -383,6 +388,7 @@ async fn connection(
                 }
                 Exit::Invalid(_) => manager.counters().fault(Fault::DownstreamInvalid),
                 Exit::Resume(_) => manager.counters().fault(Fault::ResumeUnavailable),
+                Exit::Oversized => manager.counters().fault(Fault::DownstreamOversized),
                 _ => {}
             }
             finish(&mut writer, &mut peer, exit).await;
@@ -595,7 +601,7 @@ async fn receive_code(
 }
 
 async fn forward<S: Sink<Message> + Unpin>(
-    writer: &mut S,
+    writer: &mut Output<S>,
     subscription: &mut Subscription,
     peer: &mut watch::Receiver<PeerState>,
     pongs: &Pongs,
@@ -682,7 +688,7 @@ async fn forward<S: Sink<Message> + Unpin>(
 }
 
 async fn send_upstream_status<S: Sink<Message> + Unpin>(
-    writer: &mut S,
+    writer: &mut Output<S>,
     status: &mut watch::Receiver<UpstreamStatus>,
     status_open: &mut bool,
     peer: &mut watch::Receiver<PeerState>,
@@ -702,7 +708,7 @@ async fn send_upstream_status<S: Sink<Message> + Unpin>(
 }
 
 async fn forward_delivery<S: Sink<Message> + Unpin>(
-    writer: &mut S,
+    writer: &mut Output<S>,
     subscription: &mut DeliverySubscription,
     peer: &mut watch::Receiver<PeerState>,
     pongs: &Pongs,
@@ -735,6 +741,12 @@ async fn forward_delivery<S: Sink<Message> + Unpin>(
     let mut expected_pong = None;
     let mut ping_id = 0_u64;
     let mut drained = false;
+    let replay_until = subscription.replay_until();
+    let replay_origin = Instant::now();
+    let mut replay =
+        TokenBucket::new(writer.budget.policy().replay, Duration::ZERO).expect("发送策略已校验");
+    let mut pending_record: Option<(Arc<RecordedEvent>, usize)> = None;
+    let mut replay_at = None;
     loop {
         let progress = acks.snapshot();
         // 已确认完成的结束流不再依赖历史或流元数据的保留期限。
@@ -789,9 +801,39 @@ async fn forward_delivery<S: Sink<Message> + Unpin>(
                 }
             }
             _ = ack_changed.changed(), if waiting_for_ack => {}
+            _ = async { if let Some(at) = replay_at { sleep_until(at).await; } }, if !waiting_for_ack && pending_record.is_some() => {
+                let (record, bytes) = pending_record.take().expect("等待发送时存在日志记录");
+                // 状态可能在 select 轮询之后才发布；实际发送前仍保持状态先于事件。
+                if status_open && status.has_changed().unwrap_or(false) {
+                    pending_record = Some((record, bytes));
+                    if let Err(exit) = send_upstream_status(writer, &mut status, &mut status_open, peer, shutdown).await {
+                        return exit;
+                    }
+                    // 状态发送可能等待 I/O，回到循环重新检查 ACK 和日志保留范围。
+                    continue;
+                }
+                if record.seq <= replay_until
+                    && let Err(wait_ms) = replay.take_amount(bytes as u64, replay_origin.elapsed())
+                {
+                    replay_at = Some(Instant::now() + Duration::from_millis(wait_ms));
+                    pending_record = Some((record, bytes));
+                    continue;
+                }
+                replay_at = None;
+                let message = ServerMessage::recorded(subscription.room_id, &subscription.stream_id, &record);
+                let prepared = match writer.prepare(&message) {
+                    Ok(prepared) => prepared,
+                    Err(exit) => return exit,
+                };
+                // 已取得发送字节且编码成功，开始写入之前才登记，允许 flush 期间收到 ACK。
+                acks.reserve(record.seq);
+                if let Err(exit) = send_prepared(writer, prepared, peer, shutdown).await {
+                    return exit;
+                }
+            }
             // 可读取时 recv 自己等待日志变化；全局通知不能压住就绪事件或状态。
-            _ = log_changed.changed(), if waiting_for_ack => {}
-            incoming = subscription.recv(), if !waiting_for_ack => {
+            _ = log_changed.changed(), if waiting_for_ack || pending_record.is_some() => {}
+            incoming = subscription.recv(), if !waiting_for_ack && pending_record.is_none() => {
                 if status_open && status.has_changed().unwrap_or(false)
                     && let Err(exit) = send_upstream_status(
                         writer, &mut status, &mut status_open, peer, shutdown,
@@ -804,17 +846,12 @@ async fn forward_delivery<S: Sink<Message> + Unpin>(
                     Err(detail) => return Exit::Resume(detail),
                     Ok(None) => drained = true,
                     Ok(Some(record)) => {
-                        // 在开始写入前登记，ACK 可能在 flush 返回前到达。
-                        acks.reserve(record.seq);
-                        if let Err(exit) = send_json(
-                            writer,
-                            &ServerMessage::recorded(subscription.room_id, &subscription.stream_id, &record),
-                            peer,
-                            shutdown,
-                        ).await
-                        {
-                            return exit;
-                        }
+                        let message = ServerMessage::recorded(subscription.room_id, &subscription.stream_id, &record);
+                        let bytes = match encoded_len(&message, writer.budget.policy().max_connection_send_bytes) {
+                            Ok(bytes) => bytes,
+                            Err(exit) => return exit,
+                        };
+                        pending_record = Some((record, bytes));
                     }
                 }
             }
@@ -830,17 +867,31 @@ async fn until_deadline(deadline: Option<Instant>) {
 }
 
 async fn send_json<S: Sink<Message> + Unpin>(
-    writer: &mut S,
+    writer: &mut Output<S>,
     message: &ServerMessage<'_>,
     peer: &mut watch::Receiver<PeerState>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), Exit> {
-    let text = serde_json::to_string(message).map_err(|_| Exit::Failed)?;
-    send_frame(writer, Message::text(text), peer, shutdown).await
+    let prepared = writer.prepare(message)?;
+    send_prepared(writer, prepared, peer, shutdown).await
+}
+
+async fn send_prepared<S: Sink<Message> + Unpin>(
+    writer: &mut Output<S>,
+    prepared: Prepared,
+    peer: &mut watch::Receiver<PeerState>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), Exit> {
+    writer.hold(prepared.permit);
+    let result = send_frame(writer, prepared.message, peer, shutdown).await;
+    if result.is_ok() {
+        writer.flushed();
+    }
+    result
 }
 
 async fn send_frame<S: Sink<Message> + Unpin>(
-    writer: &mut S,
+    writer: &mut Output<S>,
     message: Message,
     peer: &mut watch::Receiver<PeerState>,
     shutdown: &mut watch::Receiver<bool>,
@@ -849,7 +900,7 @@ async fn send_frame<S: Sink<Message> + Unpin>(
         biased;
         _ = stopped(shutdown) => Err(Exit::Failed),
         _ = peer_closed(peer) => Err(Exit::Disconnected),
-        result = timeout(IO_TIMEOUT, writer.send(message)) => match result {
+        result = timeout(IO_TIMEOUT, writer.sink.send(message)) => match result {
             Ok(Ok(())) => Ok(()),
             _ => {
                 tracing::debug!("下游发送失败或超时");
@@ -864,10 +915,18 @@ async fn finish(writer: &mut Writer, peer: &mut watch::Receiver<PeerState>, exit
         return;
     }
     if matches!(*peer.borrow(), PeerState::Closed) || exit == Exit::Disconnected {
-        let _ = timeout(IO_TIMEOUT, writer.flush()).await;
+        let _ = timeout(IO_TIMEOUT, writer.sink.flush()).await;
         return;
     }
     let (message, code) = match &exit {
+        Exit::Oversized => (
+            ServerMessage::Error {
+                code: "message_too_large",
+                message: "消息超过单连接发送字节上限，未跳过事件",
+                retry_after_ms: None,
+            },
+            CloseCode::from(1009),
+        ),
         Exit::End => (ServerMessage::Closed, CloseCode::Normal),
         Exit::Restart => (
             ServerMessage::ServiceRestarting {
@@ -909,7 +968,7 @@ async fn finish(writer: &mut Writer, peer: &mut watch::Receiver<PeerState>, exit
         return;
     };
     if !matches!(
-        timeout(IO_TIMEOUT, writer.send(Message::text(text))).await,
+        timeout(IO_TIMEOUT, writer.sink.send(Message::text(text))).await,
         Ok(Ok(()))
     ) {
         return;
@@ -918,7 +977,10 @@ async fn finish(writer: &mut Writer, peer: &mut watch::Receiver<PeerState>, exit
         code,
         reason: "".into(),
     }));
-    if matches!(timeout(IO_TIMEOUT, writer.send(close)).await, Ok(Ok(()))) {
+    if matches!(
+        timeout(IO_TIMEOUT, writer.sink.send(close)).await,
+        Ok(Ok(()))
+    ) {
         let _ = timeout(IO_TIMEOUT, peer_closed(peer)).await;
     }
 }

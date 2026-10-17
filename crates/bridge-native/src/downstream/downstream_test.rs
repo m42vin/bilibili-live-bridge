@@ -596,7 +596,7 @@ async fn sends_timeout_without_retrying_a_cancelled_sink() {
     let before = Instant::now();
     assert_eq!(
         send_frame(
-            &mut PendingSink,
+            &mut Output::new(PendingSink, ResourceBudget::for_tests()),
             Message::text("event"),
             &mut peer,
             &mut stop
@@ -648,9 +648,12 @@ async fn matching_pong_survives_unsolicited_pong_and_missing_next_pong_ends_it()
 
 struct RecordingSink(mpsc::UnboundedSender<Message>);
 
-fn recording_sink() -> (RecordingSink, mpsc::UnboundedReceiver<Message>) {
+fn recording_sink() -> (Output<RecordingSink>, mpsc::UnboundedReceiver<Message>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (RecordingSink(tx), rx)
+    (
+        Output::new(RecordingSink(tx), ResourceBudget::for_tests()),
+        rx,
+    )
 }
 
 impl Sink<Message> for RecordingSink {
@@ -1378,13 +1381,17 @@ fn sized_event(n: usize) -> LiveEvent {
 }
 
 fn stop_after_send_sink() -> (
-    StopAfterSend,
+    Output<StopAfterSend>,
     mpsc::UnboundedReceiver<Message>,
     watch::Receiver<bool>,
 ) {
     let (output, messages) = mpsc::unbounded_channel();
     let (stop, signal) = watch::channel(false);
-    (StopAfterSend { output, stop }, messages, signal)
+    (
+        Output::new(StopAfterSend { output, stop }, ResourceBudget::for_tests()),
+        messages,
+        signal,
+    )
 }
 
 #[tokio::test]
@@ -1522,7 +1529,7 @@ async fn delivery_interleaving_busy_room_notifications() {
     let acks = Acks::new();
     acks.start("one", 0);
     let (mut sink, mut messages, mut stop) = stop_after_send_sink();
-    let stopper = sink.stop.clone();
+    let stopper = sink.sink.stop.clone();
     let visits = Arc::new(AtomicUsize::new(0));
     let hook_visits = Arc::clone(&visits);
     *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |_| {
@@ -1629,7 +1636,7 @@ async fn delivery_interleaving_busy_room_notifications_keep_status_when_window_i
     acks.start("one", 0);
     acks.reserve(1);
     let (mut sink, mut messages, mut stop) = stop_after_send_sink();
-    let stopper = sink.stop.clone();
+    let stopper = sink.sink.stop.clone();
     let visits = AtomicUsize::new(0);
     *acks.after_snapshot.lock().unwrap() = Some(Box::new(move |_| {
         let turn = visits.fetch_add(1, Ordering::SeqCst);
@@ -1802,6 +1809,231 @@ async fn resource_ws_pending_and_room_refusals_preserve_the_active_stream() {
     assert_eq!(fixture.state.starts.borrow().len(), 1);
     drop((client, other));
     fixture.stop().await;
+}
+
+#[tokio::test]
+async fn sending_bytes_refuse_without_losing_the_stream_and_control_frames_still_work() {
+    let fixture = Fixture::with_resources(ResourcePolicy {
+        max_send_bytes: 256,
+        max_connection_send_bytes: 256,
+        ..Default::default()
+    })
+    .await;
+    let (mut first, ready) = fixture.subscribe_ack(CODE, None).await;
+    let budget = fixture.manager.resource_budget();
+    let held = budget.reserve_send().unwrap();
+    let cursor = json!({"stream_id":ready["stream_id"],"seq":ready["seq"]});
+    let (second, busy) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(busy["code"], "server_busy");
+    assert_eq!(busy["retry_after_ms"], 1000);
+    first.send(Message::Ping(vec![5].into())).await.unwrap();
+    assert_eq!(next_frame(&mut first).await, Message::Pong(vec![5].into()));
+    assert_eq!(budget.snapshot().sending_bytes, 256);
+    drop((held, second));
+    let (resumed, reply) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(reply["resumed"], true);
+    assert_eq!(reply["stream_id"], ready["stream_id"]);
+    assert_eq!(fixture.state.starts.borrow().len(), 1);
+    drop((first, resumed));
+    fixture.stop().await;
+    assert_eq!(budget.snapshot().sending_bytes, 0);
+}
+
+#[tokio::test]
+async fn oversized_event_is_explicit_and_is_not_skipped_on_resume() {
+    let fixture = Fixture::with_resources(ResourcePolicy {
+        max_connection_send_bytes: 256,
+        ..Default::default()
+    })
+    .await;
+    let (mut client, ready) = fixture.subscribe_ack(CODE, None).await;
+    fixture.emit_logged(json!("x".repeat(1000))).await;
+    assert_eq!(next_json(&mut client).await["code"], "message_too_large");
+    assert!(
+        matches!(next_frame(&mut client).await, Message::Close(Some(frame)) if u16::from(frame.code) == 1009)
+    );
+    drop(client);
+    let cursor = json!({"stream_id":ready["stream_id"],"seq":0});
+    let (mut resumed, reply) = fixture.subscribe_ack(CODE, Some(&cursor)).await;
+    assert_eq!(reply["stream_id"], ready["stream_id"]);
+    assert_eq!(reply["seq"], 0);
+    assert_eq!(reply["resumed"], true);
+    assert_eq!(next_json(&mut resumed).await["code"], "message_too_large");
+    assert_eq!(fixture.state.starts.borrow().len(), 1);
+    assert_eq!(
+        fixture.manager.resource_budget().snapshot().sending_bytes,
+        0
+    );
+    drop(resumed);
+    fixture.stop().await;
+}
+
+fn replay_event(value: &str) -> LiveEvent {
+    LiveEvent::Unknown {
+        cmd: "TEST".into(),
+        data: json!(value.repeat(80)),
+    }
+}
+
+fn replay_output(per_sec: u64) -> (Output<RecordingSink>, mpsc::UnboundedReceiver<Message>) {
+    let (mut output, messages) = recording_sink();
+    output.budget = ResourceBudget::new(ResourcePolicy {
+        max_connection_send_bytes: 256,
+        replay: RatePolicy {
+            per_sec,
+            burst: 256,
+        },
+        ..Default::default()
+    })
+    .unwrap();
+    (output, messages)
+}
+
+#[tokio::test(start_paused = true)]
+async fn replay_wait_keeps_ping_status_ack_and_shutdown_responsive_without_holding_bytes() {
+    let (log, status) = delivery_log_fixture(DeliveryPolicy::default());
+    for value in ["a", "b"] {
+        log.append("one", &replay_event(value)).unwrap();
+    }
+    let mut sub = log.test_reader("one", "code", Some(0), None).unwrap();
+    let (mut output, mut messages) = replay_output(1);
+    let budget = output.budget.clone();
+    let acks = Arc::new(Acks::new());
+    acks.start("one", 0);
+    let driver_acks = acks.clone();
+    let pongs = Arc::new(Pongs::new());
+    let driver_pongs = pongs.clone();
+    let (_peer, mut peer) = watch::channel(PeerState::Connected);
+    let (stop, mut stopped) = watch::channel(false);
+    let driver = tokio::spawn(async move {
+        forward_delivery(
+            &mut output,
+            &mut sub,
+            &mut peer,
+            &driver_pongs,
+            &driver_acks,
+            64,
+            &mut stopped,
+        )
+        .await
+    });
+    assert_eq!(recorded_json(&mut messages).await["seq"], 1);
+    acks.acknowledge("one", 1).unwrap();
+    tokio::time::advance(PING_INTERVAL).await;
+    let Message::Ping(payload) = timeout(TEST_TIMEOUT, messages.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("限速等待不能饿死 Ping");
+    };
+    pongs.acknowledge(&payload);
+    status.send_replace(UpstreamStatus::Reconnecting);
+    assert_eq!(
+        recorded_json(&mut messages).await,
+        json!({"type":"status","state":"reconnecting"})
+    );
+    assert_eq!(acks.snapshot().acked, 1);
+    assert_eq!(
+        acks.snapshot().sent,
+        1,
+        "等待回放令牌时不能登记未发送的 ACK 上界"
+    );
+    assert_eq!(budget.snapshot().sending_bytes, 0);
+    stop.send_replace(true);
+    assert_eq!(
+        timeout(TEST_TIMEOUT, driver).await.unwrap().unwrap(),
+        Exit::Restart
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn replay_is_byte_limited_but_new_events_are_live_and_finished_tail_still_waits_for_ack() {
+    let (log, _status) = delivery_log_fixture(DeliveryPolicy::default());
+    for value in ["a", "b"] {
+        log.append("one", &replay_event(value)).unwrap();
+    }
+    let mut sub = log.test_reader("one", "code", Some(0), None).unwrap();
+    let (mut output, mut messages) = replay_output(10);
+    let acks = Arc::new(Acks::new());
+    acks.start("one", 0);
+    let driver_acks = acks.clone();
+    let (_peer, mut peer) = watch::channel(PeerState::Connected);
+    let (_stop, mut stop) = watch::channel(false);
+    let driver = tokio::spawn(async move {
+        forward_delivery(
+            &mut output,
+            &mut sub,
+            &mut peer,
+            &Pongs::new(),
+            &driver_acks,
+            64,
+            &mut stop,
+        )
+        .await
+    });
+    let before = Instant::now();
+    let first = recorded_json(&mut messages).await;
+    let length = serde_json::to_vec(&first).unwrap().len() as u64;
+    assert!(length > 128 && length <= 256);
+    let wait_ms = ((length * 2 - 256) * 1000).div_ceil(10);
+    tokio::time::advance(Duration::from_millis(wait_ms - 1)).await;
+    tokio::task::yield_now().await;
+    assert!(messages.try_recv().is_err());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(recorded_json(&mut messages).await["seq"], 2);
+    assert_eq!(before.elapsed(), Duration::from_millis(wait_ms));
+    log.append("one", &replay_event("c")).unwrap();
+    assert_eq!(recorded_json(&mut messages).await["seq"], 3);
+    assert_eq!(
+        before.elapsed(),
+        Duration::from_millis(wait_ms),
+        "读取器创建后的实时事件不消耗回放额度"
+    );
+    log.finish("one");
+    assert!(!driver.is_finished());
+    acks.acknowledge("one", 3).unwrap();
+    assert_eq!(
+        timeout(TEST_TIMEOUT, driver).await.unwrap().unwrap(),
+        Exit::End
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn replay_eviction_while_rate_limited_reports_gap_instead_of_sending_a_stale_record() {
+    let (log, status) = delivery_log_fixture(DeliveryPolicy {
+        retention: Duration::from_secs(5),
+        ..Default::default()
+    });
+    for value in ["a", "b"] {
+        log.append("one", &replay_event(value)).unwrap();
+    }
+    let mut sub = log.test_reader("one", "code", Some(0), None).unwrap();
+    let (mut output, mut messages) = replay_output(1);
+    let acks = Arc::new(Acks::new());
+    acks.start("one", 0);
+    let driver_acks = acks.clone();
+    let (_peer, mut peer) = watch::channel(PeerState::Connected);
+    let (_stop, mut stop) = watch::channel(false);
+    let driver = tokio::spawn(async move {
+        forward_delivery(
+            &mut output,
+            &mut sub,
+            &mut peer,
+            &Pongs::new(),
+            &driver_acks,
+            64,
+            &mut stop,
+        )
+        .await
+    });
+    assert_eq!(recorded_json(&mut messages).await["seq"], 1);
+    acks.acknowledge("one", 1).unwrap();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    status.send_replace(UpstreamStatus::Reconnecting);
+    let result = timeout(TEST_TIMEOUT, driver).await.unwrap().unwrap();
+    assert!(matches!(result, Exit::Resume(detail) if detail.reason == "cursor_expired"));
+    assert_eq!(acks.snapshot().sent, 1);
 }
 
 async fn management_request(address: std::net::SocketAddr, path: &str) -> String {

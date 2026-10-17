@@ -24,6 +24,11 @@ pub enum ApiError {
         /// serde 的解析说明。不含响应正文。
         message: String,
     },
+    /// 成功 HTTP 响应正文超过本地读取上限，不解析或保存完整正文。
+    ResponseTooLarge {
+        /// 允许读取的最大字节数。
+        limit: usize,
+    },
     /// HTTP 状态不是成功。业务错误仍会以 200 和 [`ApiError::Platform`] 返回。
     Status {
         /// HTTP 状态码。
@@ -74,6 +79,9 @@ impl fmt::Display for ApiError {
             }
             Self::Transport { message, source } => write!(formatter, "{message}：{source}"),
             Self::Status { status } => write!(formatter, "开放平台返回 HTTP {status}"),
+            Self::ResponseTooLarge { limit } => {
+                write!(formatter, "开放平台响应超过 {limit} 字节上限")
+            }
             Self::Platform {
                 code,
                 message,
