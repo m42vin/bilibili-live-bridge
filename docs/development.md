@@ -45,6 +45,7 @@ cargo tree --locked -p bridge-core
 | 原生资源名额、取消和限速 | [native/resource.rs](../crates/bridge-native/src/resource.rs)、[manager.rs](../crates/bridge-native/src/session/manager.rs) | [resource_test.rs](../crates/bridge-native/src/session/resource_test.rs)、下游集成测试 |
 | 配置读取与校验 | [config.rs](../crates/bridge-native/src/config.rs) | [config_test.rs](../crates/bridge-native/src/config_test.rs) |
 | 日志初始化与过滤 | [logging.rs](../crates/bridge-native/src/logging.rs) | [logging_test.rs](../crates/bridge-native/src/logging_test.rs) |
+| 探针、管理 HTTP 与固定标签指标 | [observability.rs](../crates/bridge-native/src/observability.rs)、[metrics.rs](../crates/bridge-native/src/observability/metrics.rs) | [observability_test.rs](../crates/bridge-native/src/observability_test.rs)、[metrics_test.rs](../crates/bridge-native/src/observability/metrics_test.rs) |
 | HTTP API、响应与请求签名 | [api.rs](../crates/bridge-native/src/open_live/api.rs)、[auth.rs](../crates/bridge-core/src/open_live/auth.rs) | [api_test.rs](../crates/bridge-native/src/open_live/api_test.rs)、[auth_test.rs](../crates/bridge-core/src/open_live/auth_test.rs) |
 | API 响应模型与校验 | [model.rs](../crates/bridge-core/src/open_live/model.rs) | [model_test.rs](../crates/bridge-core/src/open_live/model_test.rs) |
 | 平台业务错误码 | [error.rs](../crates/bridge-core/src/open_live/error.rs) | [error_test.rs](../crates/bridge-core/src/open_live/error_test.rs) |
@@ -129,6 +130,18 @@ cargo test --locked -p bridge-native config_test
 本地测试不证明实际进程托管和代理环境的停机效果。部署验收应在有活动连接及开场请求时发送 SIGTERM，
 确认停止新接入、客户端维护重试、预算内本地清理或超时非零退出；托管停止宽限期应大于 `BRIDGE_SHUTDOWN_TIMEOUT_SECS`。
 重启后确认旧游标明确失败，不能把重新从实时位置订阅视为无损恢复。
+
+运维观测测试使用回环 HTTP 检查状态码、Content-Type、固定标签及凭据脱敏，业务连接额度满时仍可访问探针。
+上下游桩固定推进恢复和 end 阻塞，验证上游恢复不影响 ready、退出期间 ready 返回 503 而 live 和指标仍可读取，
+以及管理入口随业务收尾结束。暂停时钟与 duplex 流验证管理请求的读取和写入超时；
+日志测试确认采集不触发过期淘汰，取消守卫测试确认操作结果与耗时只计一次。
+平台错误、心跳恢复及清理失败使用同一观测包装器验证，测试无需真实平台凭据。
+
+```sh
+cargo test --locked -p bridge-native observability
+cargo test --locked -p bridge-native management_
+cargo test --locked -p bridge-native --bin server
+```
 
 ## 常见扩展方式
 

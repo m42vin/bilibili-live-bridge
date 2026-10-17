@@ -83,12 +83,22 @@ async fn transient_error_recovers_and_returns_to_shared_schedule() {
     let mut subscriptions = attach_rooms(&manager, 1).await;
     advance_to(origin + Duration::from_secs(20)).await;
     assert_eq!(mock.batches().len(), 1);
+    let metrics = crate::observability::metrics(&manager);
+    assert!(metrics.contains("bridge_heartbeat_recovering_sessions 1\n"));
+    assert!(metrics.contains("bridge_ready 1\n"));
+    assert!(metrics.contains(
+        "bridge_platform_operations_total{operation=\"batch_heartbeat\",outcome=\"platform\"} 1\n"
+    ));
     let first_retry = retry_at(&manager, "game-000");
     assert!(first_retry >= origin + Duration::from_millis(21600));
     assert!(first_retry <= origin + Duration::from_millis(22400));
     mock.connection(0).emit(danmaku("kept alive"));
     assert_eq!(text(&subscriptions[0].recv().await.unwrap()), "kept alive");
     advance_to(first_retry).await;
+    assert!(
+        crate::observability::metrics(&manager)
+            .contains("bridge_heartbeat_recovering_sessions 0\n")
+    );
     {
         let beats = super::super::lock(&manager.state.beats);
         let slot = beats.get("game-000").unwrap();

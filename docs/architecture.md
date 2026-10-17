@@ -11,7 +11,7 @@
 
 `bridge-core::open_live` 包含签名、API 请求与响应模型、错误码、官方包解析及事件模型；`bridge-core::downstream::protocol` 定义下游消息；`bridge-core::delivery` 定义游标、事件记录与续传失败信息。
 
-`bridge-core::downstream::admission` 定义与部署平台无关的 HTTP 接入协议，native 的 `downstream_client` 保留 HTTP 接入与应用层 ping/pong 支持。仓库当前只提供 `/ws` 服务端，HTTP 接入需要另行提供兼容服务，契约见 [客户端协议](downstream-protocol.md#http-接入协议)。
+`bridge-core::downstream::admission` 定义与部署平台无关的 HTTP 接入协议，native 的 `downstream_client` 保留 HTTP 接入与应用层 ping/pong 支持。当前业务入口只提供 `/ws`，HTTP 接入需要另行提供兼容服务，契约见 [客户端协议](downstream-protocol.md#http-接入协议)。管理 HTTP 入口独立提供运维探针与指标。
 
 原生库沿用 `bilibili_live_bridge` 名称及公共模块路径，重导出共享类型。核心的 `ResponseError` / `ProtocolError` 在原生边界转换成原有 `ApiError` / `WsError` 变体，传输错误及其原始错误链仍由原生库保存。
 
@@ -309,6 +309,25 @@ server 显式管理运行时，在服务收尾返回后调用 shutdown_backgroun
 `Subscription` 的析构只更新计数、发出停止信号，不等待网络清理。`Manager` 的析构也不代替 `shutdown`：退出前应显式等待 `shutdown().await`，它先禁止新接入、停止批量心跳，再关闭并等待所管理的会话，包括接入中的会话和正在清理的重复场次。重复调用不会重复关闭已经完成的会话。
 
 `shutdown` 不返回清理错误。结束失败记入日志后，本地仍完成移除；返回表示本地清理流程结束，不保证平台确认结束成功，也没有结束失败的自动重试。上游有限恢复终止后，调用方需要重新 `attach`。
+
+## 运维观测边界
+
+`observability` 在独立管理监听器上提供 /livez、/readyz 和 Prometheus /metrics，默认地址由
+`BRIDGE_ADMIN_LISTEN` 指定为 127.0.0.1:9090。server 先完成配置及两个监听器的绑定，再并行驱动业务和管理服务。
+管理请求使用独立的固定并发与 I/O 上限，不消耗业务 ResourceBudget。管理监听或请求任务 panic 导致入口退出时，
+server 驱动业务维护收尾并以失败状态返回。普通请求错误只结束该请求。
+
+/livez 只表示管理入口可响应；/readyz 读取 Manager 的接入关闭标记，维护期间返回 503。
+资源暂满、个别房间恢复或平台暂时故障不使整个服务失去就绪；通过上游状态、心跳恢复和平台结果指标单独呈现。
+业务开始退出后，管理服务保留到业务收尾完成或超时，再中止管理请求，不额外等待两秒 I/O 期限。
+
+每个 Manager 的 Counters 使用固定数组和有限标签，与其克隆共享；不同管理器不共享故障统计。
+ObservedPlatform 包装 Platform / LiveSocket 边界，不改变参数、候选顺序、错误、取消或清理责任。
+操作守卫在成功、失败或取消时记录一次结果和已等待耗时，取消不冒充传输失败；外层心跳和关闭超时另有故障计数。
+资源、会话、心跳和日志分别采样，不跨多个状态锁形成原子快照；采集指标不发起平台请求，不触发日志过期淘汰。
+事件日志的累计移除数包含正常过期、容量淘汰、流移除及未保留的超大事件，不等价于业务丢失数量。
+指标不包含身份码、房间或场次标识、候选地址、事件正文、原始错误或任意平台码。
+详细口径见 [运维观测](operations.md)。
 
 ## 配置与日志边界
 

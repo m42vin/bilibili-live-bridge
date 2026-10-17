@@ -25,6 +25,7 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async_with_config};
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
+use crate::observability::Fault;
 use crate::resource::{Permit, Rejection, Resource, ResourceBudget};
 use crate::session::{
     DeliveryError, DeliverySubscription, Manager, RecvError, ResumeUnavailable, Subscription,
@@ -211,6 +212,7 @@ pub async fn serve_with_shutdown_timeout(
         ));
     }
     let budget = manager.resource_budget();
+    let counters = manager.counters();
     let (stopping, _) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -277,6 +279,7 @@ pub async fn serve_with_shutdown_timeout(
     match tokio::time::timeout_at(stopping_at + shutdown_timeout, cleanup).await {
         Ok(result) => result?,
         Err(_) => {
+            counters.fault(Fault::ShutdownTimeout);
             tracing::error!(
                 remaining_connections = connections.len(),
                 remaining_sessions = budget.snapshot().occupied[Resource::Session as usize],
@@ -333,6 +336,7 @@ async fn connection(
             Ok(Ok(socket)) => socket,
             _ => {
                 // 握手错误可能包含客户端提交的头或 URL，不记录错误正文。
+                manager.counters().fault(Fault::DownstreamHandshake);
                 tracing::debug!("下游 WebSocket 握手失败或超时");
                 return;
             }
@@ -373,6 +377,14 @@ async fn connection(
             } else {
                 exit
             };
+            match &exit {
+                Exit::Failed if !*shutdown.borrow() => {
+                    manager.counters().fault(Fault::DownstreamIo)
+                }
+                Exit::Invalid(_) => manager.counters().fault(Fault::DownstreamInvalid),
+                Exit::Resume(_) => manager.counters().fault(Fault::ResumeUnavailable),
+                _ => {}
+            }
             finish(&mut writer, &mut peer, exit).await;
             done.send_replace(true);
         }

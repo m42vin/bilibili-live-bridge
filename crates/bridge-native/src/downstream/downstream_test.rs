@@ -276,6 +276,13 @@ async fn answers_ping_before_subscription_and_hides_platform_error_details() {
     assert!(!error.to_string().contains("private-platform-error"));
     assert!(matches!(next_frame(&mut client).await, Message::Close(_)));
     assert!(fixture.state.ends.borrow().is_empty());
+    let metrics = crate::observability::metrics(&fixture.manager);
+    assert!(metrics.contains(
+        "bridge_platform_operations_total{operation=\"start\",outcome=\"platform\"} 1\n"
+    ));
+    assert!(metrics.contains("bridge_ready 1\n"));
+    assert!(!metrics.contains(CODE));
+    assert!(!metrics.contains("private-platform-error"));
     drop(client);
     fixture.stop().await;
 }
@@ -1795,4 +1802,102 @@ async fn resource_ws_pending_and_room_refusals_preserve_the_active_stream() {
     assert_eq!(fixture.state.starts.borrow().len(), 1);
     drop((client, other));
     fixture.stop().await;
+}
+
+async fn management_request(address: std::net::SocketAddr, path: &str) -> String {
+    timeout(TEST_TIMEOUT, async {
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn management_reports_recovery_separately_and_remains_available_during_cleanup() {
+    let mut fixture = Fixture::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_admin, stopped) = oneshot::channel();
+    let admin = tokio::spawn(crate::observability::serve(
+        listener,
+        fixture.manager.clone(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let (mut client, _) = fixture.subscribe(CODE).await;
+    fixture.emit_logged(json!("private-event-content")).await;
+    assert_eq!(next_json(&mut client).await["type"], "event");
+    fixture.state.socket_gate.send_replace(false);
+    fixture.state.emit(7, Value::Null).await;
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({"type":"status", "state":"reconnecting"})
+    );
+
+    assert!(
+        management_request(address, "/readyz")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let recovering = management_request(address, "/metrics").await;
+    assert!(recovering.contains("bridge_upstream_sessions{state=\"reconnecting\"} 1\n"));
+    assert!(recovering.contains("bridge_failures_total{kind=\"upstream_eof\"} 1\n"));
+    assert!(recovering.contains("bridge_event_log_events 1\n"));
+    assert!(!recovering.contains(CODE));
+    assert!(!recovering.contains("fake-key"));
+    assert!(!recovering.contains("fake-secret"));
+    assert!(!recovering.contains("game-1"));
+    assert!(!recovering.contains("private-event-content"));
+
+    fixture.state.socket_gate.send_replace(true);
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({"type":"status", "state":"connected"})
+    );
+    let restored = management_request(address, "/metrics").await;
+    assert!(restored.contains("bridge_upstream_sessions{state=\"reconnecting\"} 0\n"));
+    assert!(restored.contains("bridge_upstream_sessions{state=\"connected\"} 1\n"));
+    assert!(restored.contains(
+        "bridge_platform_operations_total{operation=\"reconnect\",outcome=\"success\"} 1\n"
+    ));
+
+    fixture.state.end_gate.send_replace(false);
+    fixture.shutdown.take().unwrap().send(()).unwrap();
+    expect_restart(&mut client).await;
+    fixture.state.wait_ends(1).await;
+    assert!(
+        management_request(address, "/readyz")
+            .await
+            .starts_with("HTTP/1.1 503")
+    );
+    assert!(
+        management_request(address, "/livez")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let draining = management_request(address, "/metrics").await;
+    assert!(draining.contains("bridge_ready 0\n"));
+    assert!(draining.contains("bridge_resource_occupied{resource=\"session\"} 1\n"));
+    fixture.state.end_gate.send_replace(true);
+    drop(client);
+    fixture.stop().await;
+    assert!(
+        management_request(address, "/metrics")
+            .await
+            .contains("bridge_resource_occupied{resource=\"session\"} 0\n")
+    );
+    stop_admin.send(()).unwrap();
+    timeout(TEST_TIMEOUT, admin)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

@@ -18,9 +18,11 @@ use tracing::instrument::WithSubscriber;
 
 use super::delivery::{DeliveryError, DeliveryPolicy, DeliverySubscription, EventCursor, EventLog};
 use super::error::SessionError;
+use super::observed::ObservedPlatform;
 use super::platform::{LivePlatform, LiveSocket, Platform};
 use super::recovery::NativeMoment;
 use crate::config::Config;
+use crate::observability::{Counters, Fault, Snapshot};
 use crate::open_live::api::{self, Anchor};
 use crate::open_live::ws::LiveEvent;
 use crate::resource::{Permit, Resource, ResourceBudget, RoomPermit};
@@ -386,6 +388,41 @@ impl Manager {
         self.state.shutdown.load(Ordering::SeqCst)
     }
 
+    /// 获取本管理器的固定故障计数器，不暴露会话或凭据。
+    pub(crate) fn counters(&self) -> Arc<Counters> {
+        self.state.counters.clone()
+    }
+
+    /// 按组件分别采样，避免在多个状态锁之间形成新的嵌套锁顺序。
+    pub(crate) fn render_metrics(&self) -> String {
+        let sessions = snapshot(&lock(&self.state.tables));
+        let mut upstream = [0; 2];
+        for session in sessions {
+            if matches!(&*session.phase.borrow(), Phase::Ready { .. })
+                && !session.stop.is_cancelled()
+            {
+                match *session.upstream.borrow() {
+                    UpstreamStatus::Connected => upstream[0] += 1,
+                    UpstreamStatus::Reconnecting => upstream[1] += 1,
+                    UpstreamStatus::Closed => {}
+                }
+            }
+        }
+        let heartbeat_recovering = lock(&self.state.beats)
+            .values()
+            .filter(|slot| slot.recovery.failures() > 0)
+            .count();
+        self.state.counters.render(Snapshot {
+            ready: !self.is_shutting_down(),
+            resources: self.state.budget.snapshot(),
+            limits: self.state.budget.policy(),
+            upstream,
+            heartbeat_recovering,
+            log: self.state.log.metrics(),
+            delivery: self.state.log.policy,
+        })
+    }
+
     fn from_parts(
         platform: Arc<dyn Platform>,
         app_heartbeat: Duration,
@@ -394,9 +431,12 @@ impl Manager {
         heartbeat_policy: HeartbeatPolicy,
         upstream_policy: UpstreamPolicy,
     ) -> Self {
+        let counters = Arc::new(Counters::default());
+        let platform = Arc::new(ObservedPlatform::new(platform, counters.clone()));
         Self {
             state: Arc::new(State {
                 platform,
+                counters,
                 budget: ResourceBudget::new(Default::default()).expect("默认预算有效"),
                 log: EventLog::new(DeliveryPolicy::default()),
                 app_heartbeat,
@@ -541,6 +581,7 @@ impl std::error::Error for RecvError {}
 
 /// 同一个管理器及其克隆共享的索引、心跳登记和关闭信号。
 struct State {
+    counters: Arc<Counters>,
     budget: ResourceBudget,
     log: Arc<EventLog>,
     platform: Arc<dyn Platform>,
@@ -742,7 +783,13 @@ impl State {
         };
 
         if self.stopping(&session) {
-            close_socket(socket, started.game_id(), started.anchor().room_id).await;
+            close_socket(
+                socket,
+                started.game_id(),
+                started.anchor().room_id,
+                &self.counters,
+            )
+            .await;
             return abort(&mut leader, &session, self.stop_error()).await;
         }
 
@@ -754,7 +801,13 @@ impl State {
             codes,
             session.upstream.subscribe(),
         ) {
-            close_socket(socket, started.game_id(), started.anchor().room_id).await;
+            close_socket(
+                socket,
+                started.game_id(),
+                started.anchor().room_id,
+                &self.counters,
+            )
+            .await;
             return abort(&mut leader, &session, SessionError::invalid(message)).await;
         }
 
@@ -1047,13 +1100,19 @@ enum Action {
 }
 
 /// 取得所有权，确保超时取消关闭 future 后，在 end 请求前释放底层连接。
-async fn close_socket(mut socket: Box<dyn LiveSocket>, game_id: &str, room_id: i64) {
+async fn close_socket(
+    mut socket: Box<dyn LiveSocket>,
+    game_id: &str,
+    room_id: i64,
+    counters: &Counters,
+) {
     match tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, socket.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::warn!(room_id, %game_id, %error, "关闭官方长连接失败");
         }
         Err(_) => {
+            counters.fault(Fault::SocketCloseTimeout);
             tracing::warn!(room_id, %game_id, "关闭官方长连接超时，释放连接并继续清理");
         }
     }

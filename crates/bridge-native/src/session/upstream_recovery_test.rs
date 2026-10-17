@@ -83,6 +83,10 @@ async fn absolute_budget_cancels_pending_connect_even_after_short_recovery() {
     assert_eq!(sub.recv().await.unwrap_err(), RecvError::Closed);
     assert_eq!(origin.elapsed(), Duration::from_secs(120));
     assert_eq!(mock.ends(), vec!["game-1"]);
+    assert!(
+        crate::observability::metrics(&manager)
+            .contains("bridge_failures_total{kind=\"upstream_recovery_exhausted\"} 1\n")
+    );
     let _ = manager.shutdown().await;
 }
 

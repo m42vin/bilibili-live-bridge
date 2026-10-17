@@ -62,7 +62,11 @@ async fn time_eviction_and_finished_stream_expiry_are_explicit() {
     log.append("one", &event(json!(1))).unwrap();
     let reader = log.test_reader("one", "code", Some(0), None).unwrap();
     tokio::time::advance(Duration::from_secs(5)).await;
+    let before = log.metrics();
+    assert_eq!(before[2..], [1, 0], "采样不能主动淘汰已过期事件");
+    assert_eq!(log.metrics(), before, "重复采样不能改变日志");
     let gap = reader.validate_after(0).unwrap_err();
+    assert_eq!(log.metrics()[2..], [0, 1]);
     assert_eq!(gap.reason, "cursor_expired");
     assert_eq!(gap.earliest_after, Some(1));
     log.finish("one");
@@ -95,6 +99,11 @@ async fn global_bytes_and_oversized_event_keep_a_contiguous_suffix() {
         "cursor_expired"
     );
     log.append("two", &event(json!("x".repeat(1000)))).unwrap();
+    assert_eq!(
+        log.metrics()[2..],
+        [0, 3],
+        "包括容量淘汰、清空后缀及未保留的超大事件"
+    );
     assert_eq!(
         log.test_reader("two", "code", Some(1), None)
             .err()

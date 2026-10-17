@@ -102,6 +102,19 @@ async fn heartbeat_and_background_cleanup_failures_are_logged() {
         );
         manager.beat_once().await;
         let _ = manager.shutdown().await;
+        let metrics = crate::observability::metrics(&manager);
+        assert!(metrics.contains(
+            "bridge_platform_operations_total{operation=\"batch_heartbeat\",outcome=\"http\"} 1\n"
+        ));
+        assert!(
+            metrics.contains(
+                "bridge_platform_operations_total{operation=\"end\",outcome=\"http\"} 1\n"
+            )
+        );
+        assert!(
+            metrics.contains("bridge_failures_total{kind=\"heartbeat_recovery_exhausted\"} 1\n")
+        );
+        assert!(!metrics.contains(CODE));
     }
     .with_subscriber(dispatch)
     .await;

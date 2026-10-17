@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout_at};
 
 use super::{Session, State, close_socket, until_idle};
+use crate::observability::Fault;
 use crate::open_live::api::StartResult;
 use crate::open_live::ws::{LiveEvent, WsError};
 use crate::session::platform::LiveSocket;
@@ -86,6 +87,7 @@ pub(super) async fn run(
             break;
         }
         if !recovery.disconnected(NativeMoment(Instant::now())) {
+            state.counters.fault(Fault::UpstreamRecoveryExhausted);
             tracing::warn!(
                 room_id = started.anchor().room_id,
                 game_id = %started.game_id(),
@@ -104,12 +106,18 @@ pub(super) async fn run(
                 deadline,
                 active(
                     &session,
-                    close_socket(old, started.game_id(), started.anchor().room_id)
+                    close_socket(
+                        old,
+                        started.game_id(),
+                        started.anchor().room_id,
+                        &state.counters
+                    )
                 )
             )
             .await,
             Ok(Some(()))
         ) {
+            record_expired_recovery(&state, &session, deadline);
             break;
         }
         let restored = restore(
@@ -121,6 +129,7 @@ pub(super) async fn run(
         )
         .await;
         let Some(restored) = restored else {
+            record_expired_recovery(&state, &session, deadline);
             break;
         };
         socket = Some(restored);
@@ -130,7 +139,13 @@ pub(super) async fn run(
 
     session.begin_close();
     if let Some(socket) = socket {
-        close_socket(socket, started.game_id(), started.anchor().room_id).await;
+        close_socket(
+            socket,
+            started.game_id(),
+            started.anchor().room_id,
+            &state.counters,
+        )
+        .await;
     }
     if let Err(error) = state.platform.end(started.game_id()).await {
         tracing::warn!(room_id = started.anchor().room_id, game_id = %started.game_id(), %error, "关闭官方场次失败");
@@ -142,6 +157,12 @@ pub(super) async fn run(
     session.upstream.send_replace(UpstreamStatus::Closed);
     tracing::info!("直播间会话已结束");
     session.mark_finished();
+}
+
+fn record_expired_recovery(state: &State, session: &Session, deadline: Instant) {
+    if !session.stop.is_cancelled() && Instant::now() >= deadline {
+        state.counters.fault(Fault::UpstreamRecoveryExhausted);
+    }
 }
 
 async fn restore(

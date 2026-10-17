@@ -28,6 +28,7 @@ fn loads_required_values_and_defaults() {
     assert_eq!(config.access_key_secret(), "super-secret");
     assert_eq!(config.app_id(), 165_032_067_539_475);
     assert_eq!(config.listen(), DEFAULT_LISTEN);
+    assert_eq!(config.admin_listen(), "127.0.0.1:9090".parse().unwrap());
     assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
     assert_eq!(config.websocket_heartbeat(), DEFAULT_HEARTBEAT);
     assert_eq!(config.app_heartbeat(), DEFAULT_HEARTBEAT);
@@ -395,4 +396,28 @@ fn shutdown_budget_loads_positive_seconds_and_rejects_invalid_values() {
             "{value}"
         );
     }
+}
+
+#[test]
+fn management_listen_is_independent_and_validated() {
+    for (value, expected) in [
+        (" ", "127.0.0.1:9090"),
+        (" 127.0.0.1:0 ", "127.0.0.1:0"),
+        ("[::1]:9191", "[::1]:9191"),
+    ] {
+        let mut vars = required_vars();
+        vars.push((ENV_ADMIN_LISTEN, value));
+        let config = load(&vars).unwrap();
+        assert_eq!(config.admin_listen(), expected.parse().unwrap());
+        assert_eq!(config.listen(), DEFAULT_LISTEN);
+    }
+    let mut vars = required_vars();
+    vars.push((ENV_ADMIN_LISTEN, "http://localhost:9090"));
+    assert!(matches!(
+        load(&vars),
+        Err(ConfigError::Invalid {
+            var: ENV_ADMIN_LISTEN,
+            ..
+        })
+    ));
 }

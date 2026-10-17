@@ -17,6 +17,7 @@
 - **内存续传与 ACK**：可选确认模式使用共享有界事件日志、流标识和桥侧序号，支持慢消费追赶、断线补发和结束流尾部回放；超出保留范围明确报错。
 - **下游 WebSocket**：每条 `/ws` 连接订阅一个房间，按序推送 JSON 事件；报告缓冲溢出，支持 Ping/Pong、读写限制和优雅退出。服务在最后一个客户端离开后保留上游 30 秒供重连。
 - **维护退出**：维护通知与会话结束分开，客户端保留游标重试；停止接入后的通知与清理受可配置的总预算限制。
+- **运维观测**：独立管理入口提供存活、就绪检查和 Prometheus 指标，呈现资源占用、平台操作结果与耗时、上游恢复及关键故障。
 - **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
 
 ## Workspace 结构
@@ -80,6 +81,7 @@ cargo run --locked --bin multi_client
 | `BILIBILI_ACCESS_KEY_SECRET` | 是 | 无 | 开放平台 Access Key Secret |
 | `BILIBILI_APP_ID` | 是 | 无 | 项目 ID，必须是大于 0 的 `i64` 整数 |
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
+| `BRIDGE_ADMIN_LISTEN` | 否 | `127.0.0.1:9090` | 独立管理 HTTP 地址，提供 `/livez`、`/readyz`、`/metrics`；空白值使用默认地址 |
 | `BRIDGE_SHUTDOWN_TIMEOUT_SECS` | 否 | `30` | server 停止接入后等待维护通知、连接关闭与场次清理的总预算，正整数秒，须在时钟可表示范围内 |
 | `BRIDGE_MAX_CONNECTIONS` | 否 | `512` | 全部下游连接，含握手和等待订阅 |
 | `BRIDGE_MAX_HANDSHAKES` | 否 | `32` | 正在执行下游 HTTP→WS 升级的连接 |
@@ -139,6 +141,22 @@ Ctrl-C 或 Unix SIGTERM 会停止接入，尽力发送 `service_restarting` 并�
 退出总预算由 `BRIDGE_SHUTDOWN_TIMEOUT_SECS` 控制，默认 30 秒；超时记录剩余连接与场次数，中止下游任务并以失败状态退出。
 进程托管的停止宽限期应大于该预算，为运行时退出留出余量；正常返回仅表示本地清理结束，不保证平台确认 end 成功。
 完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
+
+### 健康检查与指标
+
+管理入口默认监听 `127.0.0.1:9090`，与业务 `/ws` 分开，不占业务连接或握手额度：
+
+```sh
+curl --fail http://127.0.0.1:9090/livez
+curl --fail http://127.0.0.1:9090/readyz
+curl http://127.0.0.1:9090/metrics
+```
+
+`/livez` 表示入口可响应；`/readyz` 表示服务已初始化且未停止接入，维护退出期间返回 503。
+上游临时断线、项目心跳恢复和资源暂满通过独立指标呈现，不改变服务就绪状态。
+管理入口在业务清理期间继续响应，直到服务收尾或退出预算耗尽；管理监听失败也会触发业务维护退出。
+TLS 仍由反向代理负责，业务代理只需转发 `/ws`；管理地址按运维网络配置。
+指标定义、固定标签、资源口径与告警示例见 [运维观测](docs/operations.md)。
 
 ### 第一阶段资源保护
 
@@ -281,6 +299,7 @@ cargo doc --no-deps --open
 | --- | --- |
 | [架构说明](docs/architecture.md) | 模块边界、会话复用、心跳、事件分发与关闭流程 |
 | [开发指南](docs/development.md) | 开发环境、测试与调试、常见扩展方式和注释维护 |
+| [运维观测](docs/operations.md) | 存活与就绪检查、管理接口、指标口径和采集告警示例 |
 | [编码规范](docs/coding-convention.md) | 代码组织、中文注释、异步边界、测试分离与文档同步 |
 | [下游客户端协议](docs/downstream-protocol.md) | WebSocket 接入、消息封装、心跳、重连和关闭语义 |
 | [`crates/bridge-native/src/config.rs`](crates/bridge-native/src/config.rs) | 环境变量配置与校验 |

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::observability::Fault;
 pub use bridge_core::session::HeartbeatPolicy;
 use bridge_core::session::failure::{self, ApiFailure, FailureKind};
 use bridge_core::session::recovery::{HeartbeatDecision, HeartbeatOutcome};
@@ -68,9 +69,12 @@ struct Closing {
     failures: u32,
 }
 
-fn close_sessions(closing: Vec<Closing>) {
+fn close_sessions(state: &State, closing: Vec<Closing>) {
     for close in closing {
         if let Some(session) = close.beat.session.upgrade() {
+            if close.reason == "recovery_budget_exhausted" {
+                state.counters.fault(Fault::HeartbeatRecoveryExhausted);
+            }
             tracing::warn!(
                 game_id = %close.beat.game_id,
                 room_id = ?session.room_id(),
@@ -104,7 +108,7 @@ fn expire_recoveries(state: &State) {
         }
         closing
     };
-    close_sessions(closing);
+    close_sessions(state, closing);
 }
 
 fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome) {
@@ -127,6 +131,7 @@ fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome)
             },
         ),
         BatchOutcome::TimedOut => {
+            state.counters.fault(Fault::HeartbeatTimeout);
             tracing::warn!("批量项目心跳请求超时");
             (Some(FailureKind::Retryable), None, None)
         }
@@ -171,6 +176,7 @@ fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome)
             }
             slot.in_flight = false;
             let outcome = if failed.contains(beat.game_id.as_str()) {
+                state.counters.fault(Fault::HeartbeatFailedGame);
                 HeartbeatOutcome::FailedGame
             } else if let Some(kind) = kind {
                 HeartbeatOutcome::Failure(kind)
@@ -211,7 +217,7 @@ fn finish_request(state: &State, pending: &[PendingBeat], outcome: BatchOutcome)
             beats.remove(&close.beat.game_id);
         }
     }
-    close_sessions(closing);
+    close_sessions(state, closing);
     state.heartbeat_wake.notify_one();
 }
 

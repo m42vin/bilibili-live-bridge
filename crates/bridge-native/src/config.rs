@@ -20,6 +20,8 @@ pub const ENV_ACCESS_KEY_SECRET: &str = "BILIBILI_ACCESS_KEY_SECRET";
 pub const ENV_APP_ID: &str = "BILIBILI_APP_ID";
 /// 下游 WebSocket 服务的监听地址。未设置时采用本机回环地址。
 pub const ENV_LISTEN: &str = "BRIDGE_LISTEN";
+/// 管理 HTTP 监听地址，独立于业务连接名额，默认仅回环可访问。
+pub const ENV_ADMIN_LISTEN: &str = "BRIDGE_ADMIN_LISTEN";
 /// server 停止接入后的退出总预算，单位秒，必须为正。
 pub const ENV_SHUTDOWN_TIMEOUT_SECS: &str = "BRIDGE_SHUTDOWN_TIMEOUT_SECS";
 /// 官方 WebSocket 心跳间隔，单位秒。
@@ -77,6 +79,7 @@ pub const ENV_CLIENT_MESSAGE_RATE_PER_SEC: &str = "BRIDGE_CLIENT_MESSAGE_RATE_PE
 pub const ENV_CLIENT_MESSAGE_BURST: &str = "BRIDGE_CLIENT_MESSAGE_BURST";
 
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+const DEFAULT_ADMIN_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090);
 /// 官方文档推荐的心跳间隔。长连接约 30 秒收不到心跳会断开，互动玩法约 60 秒没有项目心跳会关闭场次。
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(20);
 const WEBSOCKET_HEARTBEAT_MAX_SECS: u64 = 30;
@@ -91,6 +94,7 @@ pub struct Config {
     access_key_secret: String,
     app_id: i64,
     listen: SocketAddr,
+    admin_listen: SocketAddr,
     shutdown_timeout: Duration,
     websocket_heartbeat: Duration,
     app_heartbeat: Duration,
@@ -105,6 +109,7 @@ impl Config {
     ///
     /// 必填：`BILIBILI_ACCESS_KEY_ID`、`BILIBILI_ACCESS_KEY_SECRET`、`BILIBILI_APP_ID`。
     /// 可选：`BRIDGE_LISTEN`（默认 `127.0.0.1:8080`）、
+    /// `BRIDGE_ADMIN_LISTEN`（默认 `127.0.0.1:9090`，提供探针与指标）、
     /// `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` 与 `BRIDGE_APP_HEARTBEAT_SECS`（默认都是 20）。
     /// WebSocket 心跳必须小于 30 秒，项目心跳必须小于 60 秒。
     /// `BRIDGE_SHUTDOWN_TIMEOUT_SECS` 是 server 停止接入后的退出总预算，默认 30 秒，必须为正。
@@ -132,6 +137,13 @@ impl Config {
         let listen = match optional(&read, ENV_LISTEN)? {
             Some(value) => parse_listen(&value)?,
             None => DEFAULT_LISTEN,
+        };
+        let admin_listen = match optional(&read, ENV_ADMIN_LISTEN)? {
+            Some(value) => value.parse().map_err(|_| ConfigError::Invalid {
+                var: ENV_ADMIN_LISTEN,
+                message: "不是合法的套接字地址".into(),
+            })?,
+            None => DEFAULT_ADMIN_LISTEN,
         };
         let shutdown_timeout = policy_duration(
             &read,
@@ -303,6 +315,7 @@ impl Config {
             access_key_secret,
             app_id,
             listen,
+            admin_listen,
             shutdown_timeout,
             websocket_heartbeat,
             app_heartbeat,
@@ -335,6 +348,12 @@ impl Config {
     #[must_use]
     pub const fn listen(&self) -> SocketAddr {
         self.listen
+    }
+
+    /// 独立管理入口的监听地址，提供 /livez、/readyz 和 /metrics。
+    #[must_use]
+    pub const fn admin_listen(&self) -> SocketAddr {
+        self.admin_listen
     }
 
     /// server 停止接入后等待维护通知、下游关闭和场次清理的总预算。
@@ -387,6 +406,7 @@ impl fmt::Debug for Config {
             .field("access_key_secret", &"<redacted>")
             .field("app_id", &self.app_id)
             .field("listen", &self.listen)
+            .field("admin_listen", &self.admin_listen)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("websocket_heartbeat", &self.websocket_heartbeat)
             .field("app_heartbeat", &self.app_heartbeat)

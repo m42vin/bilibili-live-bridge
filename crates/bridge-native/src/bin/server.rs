@@ -12,13 +12,14 @@ use std::{future::Future, io, time::Duration};
 
 use bilibili_live_bridge::{
     config::Config,
-    downstream, logging,
+    downstream, logging, observability,
     open_live::api::Client,
     resource::ResourceBudget,
     session::{Manager, ManagerOptions},
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     logging::init()?;
@@ -50,15 +51,57 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?
     .with_resource_budget(budget)?;
     let listener = TcpListener::bind(config.listen()).await?;
+    let admin_listener = TcpListener::bind(config.admin_listen()).await?;
     tracing::info!(listen = %listener.local_addr()?, path = "/ws", "直播桥已开始监听");
-    downstream::serve_with_shutdown_timeout(
+    tracing::info!(listen = %admin_listener.local_addr()?, "管理入口已开始监听");
+    serve_with_admin(
         listener,
+        admin_listener,
         manager,
         shutdown_signal(),
         config.shutdown_timeout(),
     )
     .await?;
     Ok(())
+}
+
+async fn serve_with_admin(
+    listener: TcpListener,
+    admin_listener: TcpListener,
+    manager: Manager,
+    shutdown: impl Future<Output = ()>,
+    shutdown_timeout: Duration,
+) -> io::Result<()> {
+    let admin_manager = manager.clone();
+    let (stop_admin, admin_stopped) = oneshot::channel();
+    let (failed, admin_failed) = oneshot::channel();
+    let admin = tokio::spawn(async move {
+        let result = observability::serve(admin_listener, admin_manager, async {
+            let _ = admin_stopped.await;
+        })
+        .await;
+        if let Err(error) = &result {
+            tracing::error!(%error, "管理入口停止，触发业务维护退出");
+        }
+        // 监听失败或请求任务 panic 都触发业务退出，避免失去探针后继续接入。
+        let _ = failed.send(());
+        result
+    });
+    let result = downstream::serve_with_shutdown_timeout(
+        listener,
+        manager,
+        async {
+            tokio::select! {
+                _ = shutdown => {},
+                _ = admin_failed => {},
+            }
+        },
+        shutdown_timeout,
+    )
+    .await;
+    let _ = stop_admin.send(());
+    let admin_result = admin.await.map_err(io::Error::other)?;
+    result.and(admin_result)
 }
 
 async fn shutdown_signal() {

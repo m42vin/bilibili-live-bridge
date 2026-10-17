@@ -8,6 +8,7 @@
 //! 配置只读取进程环境变量，不自动加载 `.env`。库不自动初始化日志；
 //! 可执行入口可以调用 [`logging::init`]，也可以使用自己的 tracing subscriber。
 //! [`downstream::serve`] 提供下游 WebSocket 服务，`server` 程序组装配置和退出流程。
+//! [`observability`] 提供独立管理 HTTP 入口与固定标签指标，不主动探测平台。
 //!
 //! # 接入示例
 //!
@@ -77,6 +78,7 @@
 pub mod config;
 pub mod downstream;
 pub mod logging;
+pub mod observability;
 pub mod open_live;
 pub mod session;
 

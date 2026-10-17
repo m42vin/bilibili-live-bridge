@@ -14,6 +14,7 @@
 mod delivery;
 mod error;
 mod manager;
+mod observed;
 mod platform;
 mod recovery;
 

@@ -92,6 +92,7 @@ struct Stream {
 struct State {
     streams: HashMap<String, Stream>,
     bytes: usize,
+    dropped_events: u64,
 }
 
 /// 管理全部事件流的有界日志，提供续传读取及变化通知。
@@ -103,6 +104,21 @@ pub(crate) struct EventLog {
 }
 
 impl EventLog {
+    /// 读取实际占用及累计移除数量，不触发过期清理或改变交付状态。
+    pub(crate) fn metrics(&self) -> [u64; 4] {
+        let state = super::manager::lock(&self.state);
+        [
+            state.bytes as u64,
+            state.streams.len() as u64,
+            state
+                .streams
+                .values()
+                .map(|stream| stream.events.len() as u64)
+                .sum(),
+            state.dropped_events,
+        ]
+    }
+
     /// 创建共享事件日志；调用方应先校验策略。
     pub(crate) fn new(policy: DeliveryPolicy) -> Arc<Self> {
         Arc::new(Self {
@@ -189,9 +205,11 @@ impl EventLog {
             stream.tail = stream.tail.checked_add(1).expect("事件序号耗尽");
             if bytes > self.policy.max_bytes {
                 // 无法保存单条大事件时建立明确缺口，并保持日志为连续后缀。
+                let dropped = stream.events.len() as u64 + 1;
                 let removed: usize = stream.events.drain(..).map(|e| e.bytes).sum();
                 stream.events.shrink_to_fit();
                 state.bytes -= removed;
+                state.dropped_events = state.dropped_events.saturating_add(dropped);
             } else {
                 stream.events.push_back(Entry {
                     event: Arc::new(RecordedEvent {
@@ -223,6 +241,7 @@ impl EventLog {
                 .unwrap()
                 .bytes;
             state.bytes -= bytes;
+            state.dropped_events = state.dropped_events.saturating_add(1);
             compact(&mut state.streams.get_mut(&id).unwrap().events);
         }
         drop(state);
@@ -261,6 +280,7 @@ impl EventLog {
                 .is_some_and(|e| now.duration_since(e.at) >= self.policy.retention)
             {
                 state.bytes -= stream.events.pop_front().unwrap().bytes;
+                state.dropped_events = state.dropped_events.saturating_add(1);
             }
             compact(&mut stream.events);
         }
@@ -326,6 +346,9 @@ fn fingerprint(code: &str) -> [u8; 32] {
 fn remove_stream(state: &mut State, id: &str) {
     if let Some(stream) = state.streams.remove(id) {
         state.bytes -= stream.events.iter().map(|e| e.bytes).sum::<usize>();
+        state.dropped_events = state
+            .dropped_events
+            .saturating_add(stream.events.len() as u64);
     }
 }
 

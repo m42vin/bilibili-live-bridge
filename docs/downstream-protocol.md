@@ -243,6 +243,7 @@ server 的退出总预算由 `BRIDGE_SHUTDOWN_TIMEOUT_SECS` 配置，默认 30 �
 
 core 定义 `downstream::admission`，native 的 `downstream_client` 已支持此协议。
 当前仓库只提供该协议的客户端支持；native `server` 仍只提供原有 `/ws`，HTTP 接入需要另行提供兼容服务。
+独立管理端口上的 `/livez`、`/readyz`、`/metrics` 用于 [运维观测](operations.md)，不实现本节的 HTTP 订阅接入。
 
 客户端向配置的完整 HTTP(S) 接入地址发送 POST，Content-Type 为 application/json。
 正文与 subscribe 的订阅参数相同，但不含 `type`：
