@@ -373,6 +373,13 @@ impl Manager {
         self.state.shutdown().await;
     }
 
+    /// 同步禁止新接入；调用方必须继续驱动 shutdown，完成心跳停止与场次清理。
+    pub(crate) fn stop_admission(&self) {
+        // 与接入建索引使用同一把锁，避免后台清理任务尚未被调度时仍能开场。
+        let _tables = lock(&self.state.tables);
+        self.state.shutdown.store(true, Ordering::SeqCst);
+    }
+
     /// 是否已经开始关闭，不再接受新的接入。
     #[must_use]
     pub fn is_shutting_down(&self) -> bool {

@@ -1,4 +1,4 @@
-//! 面向本机客户端的 WebSocket 服务入口，最后一个客户端离开后保留上游 30 秒。
+//! WebSocket 服务入口，最后一个客户端离开后保留上游 30 秒，维护退出受总预算限制。
 
 // Copyright (c) 2026 Marvine
 //
@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::time::Duration;
+use std::{future::Future, io, time::Duration};
 
 use bilibili_live_bridge::{
     config::Config,
@@ -18,10 +18,23 @@ use bilibili_live_bridge::{
     session::{Manager, ManagerOptions},
 };
 use tokio::net::TcpListener;
+use tokio::runtime::Runtime;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     logging::init()?;
+    run_runtime(run())?
+}
+
+fn run_runtime<F: Future>(future: F) -> io::Result<F::Output> {
+    let runtime = Runtime::new()?;
+    let result = runtime.block_on(future);
+    // 服务已按总预算收尾；不能让运行时析构继续无限等待 DNS 等阻塞辅助任务。
+    // 此入口随即退出进程，不将后台关闭策略用于嵌入式库调用方。
+    runtime.shutdown_background();
+    Ok(result)
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
     let budget = ResourceBudget::new(config.resource_policy())?;
     let manager = Manager::with_policies_and_delivery(
@@ -38,7 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .with_resource_budget(budget)?;
     let listener = TcpListener::bind(config.listen()).await?;
     tracing::info!(listen = %listener.local_addr()?, path = "/ws", "直播桥已开始监听");
-    downstream::serve(listener, manager, shutdown_signal()).await?;
+    downstream::serve_with_shutdown_timeout(
+        listener,
+        manager,
+        shutdown_signal(),
+        config.shutdown_timeout(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -59,3 +78,7 @@ async fn shutdown_signal() {
         tracing::warn!(%error, "等待 Ctrl-C 失败");
     }
 }
+
+#[cfg(test)]
+#[path = "../downstream/server_test.rs"]
+mod server_test;

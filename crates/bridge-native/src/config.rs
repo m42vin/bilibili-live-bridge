@@ -20,6 +20,8 @@ pub const ENV_ACCESS_KEY_SECRET: &str = "BILIBILI_ACCESS_KEY_SECRET";
 pub const ENV_APP_ID: &str = "BILIBILI_APP_ID";
 /// 下游 WebSocket 服务的监听地址。未设置时采用本机回环地址。
 pub const ENV_LISTEN: &str = "BRIDGE_LISTEN";
+/// server 停止接入后的退出总预算，单位秒，必须为正。
+pub const ENV_SHUTDOWN_TIMEOUT_SECS: &str = "BRIDGE_SHUTDOWN_TIMEOUT_SECS";
 /// 官方 WebSocket 心跳间隔，单位秒。
 pub const ENV_WEBSOCKET_HEARTBEAT_SECS: &str = "BRIDGE_WEBSOCKET_HEARTBEAT_SECS";
 /// 项目心跳间隔，单位秒。
@@ -89,6 +91,7 @@ pub struct Config {
     access_key_secret: String,
     app_id: i64,
     listen: SocketAddr,
+    shutdown_timeout: Duration,
     websocket_heartbeat: Duration,
     app_heartbeat: Duration,
     heartbeat_policy: HeartbeatPolicy,
@@ -104,6 +107,7 @@ impl Config {
     /// 可选：`BRIDGE_LISTEN`（默认 `127.0.0.1:8080`）、
     /// `BRIDGE_WEBSOCKET_HEARTBEAT_SECS` 与 `BRIDGE_APP_HEARTBEAT_SECS`（默认都是 20）。
     /// WebSocket 心跳必须小于 30 秒，项目心跳必须小于 60 秒。
+    /// `BRIDGE_SHUTDOWN_TIMEOUT_SECS` 是 server 停止接入后的退出总预算，默认 30 秒，必须为正。
     /// 项目心跳恢复期限默认 45 秒，初始退避默认 2000 毫秒、上限 10000 毫秒；
     /// 分别通过 BRIDGE_APP_HEARTBEAT_FAILURE_TIMEOUT_SECS、
     /// BRIDGE_APP_HEARTBEAT_RETRY_INITIAL_MS、BRIDGE_APP_HEARTBEAT_RETRY_MAX_MS 配置。
@@ -129,6 +133,12 @@ impl Config {
             Some(value) => parse_listen(&value)?,
             None => DEFAULT_LISTEN,
         };
+        let shutdown_timeout = policy_duration(
+            &read,
+            ENV_SHUTDOWN_TIMEOUT_SECS,
+            crate::downstream::DEFAULT_SHUTDOWN_TIMEOUT,
+            Duration::from_secs,
+        )?;
         let websocket_heartbeat = match optional(&read, ENV_WEBSOCKET_HEARTBEAT_SECS)? {
             Some(value) => parse_interval(
                 &value,
@@ -293,6 +303,7 @@ impl Config {
             access_key_secret,
             app_id,
             listen,
+            shutdown_timeout,
             websocket_heartbeat,
             app_heartbeat,
             heartbeat_policy,
@@ -324,6 +335,12 @@ impl Config {
     #[must_use]
     pub const fn listen(&self) -> SocketAddr {
         self.listen
+    }
+
+    /// server 停止接入后等待维护通知、下游关闭和场次清理的总预算。
+    #[must_use]
+    pub const fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
     }
 
     /// 官方 WebSocket 心跳发送间隔。
@@ -370,6 +387,7 @@ impl fmt::Debug for Config {
             .field("access_key_secret", &"<redacted>")
             .field("app_id", &self.app_id)
             .field("listen", &self.listen)
+            .field("shutdown_timeout", &self.shutdown_timeout)
             .field("websocket_heartbeat", &self.websocket_heartbeat)
             .field("app_heartbeat", &self.app_heartbeat)
             .field("heartbeat_policy", &self.heartbeat_policy)

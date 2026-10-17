@@ -38,6 +38,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_CLIENT_MESSAGE: usize = 8 * 1024;
 
+/// 停止接入后等待连接和会话清理的默认总预算。
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+const RESTART_RETRY_AFTER_MS: u64 = 1000;
+
 type Socket = WebSocketStream<TcpStream>;
 type Writer = SplitSink<Socket, Message>;
 type Reader = SplitStream<Socket>;
@@ -53,6 +58,7 @@ enum PeerState {
 #[derive(Debug, PartialEq, Eq)]
 enum Exit {
     End,
+    Restart,
     Invalid(&'static str),
     AttachFailed,
     Resource(Rejection),
@@ -166,18 +172,44 @@ impl Acks {
 /// 入站消息最多 8 KiB；活动连接每 20 秒发送 Ping，10 秒内未收到对应 Pong 时断开。
 /// 客户端断开后释放订阅和待接入名额；共享开场任务继续持有开场与清理责任。
 ///
-/// 退出时停止接入，关闭下游，等待所有连接任务和 [`Manager::shutdown`] 完成。
+/// 退出时停止接入，通知下游维护退出，并在 [`DEFAULT_SHUTDOWN_TIMEOUT`] 内等待清理。
 /// 本函数负责关闭传入管理器及其所有克隆共享的会话。调用方应通过 `shutdown` 退出，
-/// 并等待本函数返回，而非取消此 future。
+/// 并等待本函数返回，而非取消此 future。预算耗尽的行为见 [`serve_with_shutdown_timeout`]。
 ///
 /// # Errors
 ///
-/// 监听器接入失败时，在完成会话清理后返回 I/O 错误。单个客户端失败只记录日志。
+/// 监听失败或清理超时返回 I/O 错误。单个客户端失败只记录日志。
 pub async fn serve(
     listener: TcpListener,
     manager: Manager,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    serve_with_shutdown_timeout(listener, manager, shutdown, DEFAULT_SHUTDOWN_TIMEOUT).await
+}
+
+/// 使用指定的退出总预算运行下游服务。
+///
+/// 接入行为与 [`serve`] 相同。预算从退出信号或监听失败时停止接入起算，
+/// 覆盖维护通知、下游关闭以及全部场次清理，不包含正常服务时间。
+/// 超时中止下游连接任务并返回 [`io::ErrorKind::TimedOut`]，不保证维护消息送达或平台场次已结束。
+/// 管理器已发起的后台清理保留所有权，运行时存活时仍可继续；可执行程序应以失败状态退出，
+/// 终止运行时后未完成清理不会持久化，也不会在下次启动时恢复。
+///
+/// # Errors
+///
+/// 预算为零或超出时钟范围时返回 [`io::ErrorKind::InvalidInput`]；其余错误见 [`serve`]。
+pub async fn serve_with_shutdown_timeout(
+    listener: TcpListener,
+    manager: Manager,
+    shutdown: impl Future<Output = ()>,
+    shutdown_timeout: Duration,
+) -> io::Result<()> {
+    if shutdown_timeout.is_zero() || Instant::now().checked_add(shutdown_timeout).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "退出预算必须为时钟可表示的正时长",
+        ));
+    }
     let budget = manager.resource_budget();
     let (stopping, _) = watch::channel(false);
     let mut connections = JoinSet::new();
@@ -220,13 +252,49 @@ pub async fn serve(
             }
         }
     };
+    let stopping_at = Instant::now();
     drop(listener);
+    manager.stop_admission();
     stopping.send_replace(true);
-    tokio::join!(manager.shutdown(), async {
-        while let Some(result) = connections.join_next().await {
-            log_join(Some(result));
+    tracing::info!(
+        shutdown_timeout_secs = shutdown_timeout.as_secs_f64(),
+        "停止接入，开始维护退出"
+    );
+    // 等待超时只结束 serve 的等待，不取消停止心跳、关闭全部会话的后续步骤。
+    let manager_cleanup = tokio::spawn(
+        async move { manager.shutdown().await }
+            .instrument(tracing::Span::current())
+            .with_current_subscriber(),
+    );
+    let cleanup = async {
+        let (manager_result, ()) = tokio::join!(manager_cleanup, async {
+            while let Some(result) = connections.join_next().await {
+                log_join(Some(result));
+            }
+        });
+        manager_result.map_err(io::Error::other)
+    };
+    match tokio::time::timeout_at(stopping_at + shutdown_timeout, cleanup).await {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::error!(
+                remaining_connections = connections.len(),
+                remaining_sessions = budget.snapshot().occupied[Resource::Session as usize],
+                elapsed_secs = stopping_at.elapsed().as_secs_f64(),
+                "维护退出预算耗尽，场次清理可能未完成"
+            );
+            // 仅中止下游连接；共享开场与平台清理仍由 Manager 后台任务持有。
+            connections.abort_all();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "维护退出预算耗尽，场次清理可能未完成",
+            ));
         }
-    });
+    }
+    tracing::info!(
+        elapsed_secs = stopping_at.elapsed().as_secs_f64(),
+        "维护退出清理完成"
+    );
     result
 }
 
@@ -299,6 +367,12 @@ async fn connection(
                 &mut shutdown,
             )
             .await;
+            // 维护信号优先于同时完成的会话关闭；已取消的发送不再重用写端。
+            let exit = if *shutdown.borrow() && exit != Exit::Failed {
+                Exit::Restart
+            } else {
+                exit
+            };
             finish(&mut writer, &mut peer, exit).await;
             done.send_replace(true);
         }
@@ -426,7 +500,7 @@ async fn write_peer(
         let mut attach = std::pin::pin!(attach);
         let result = tokio::select! {
             biased;
-            _ = stopped(shutdown) => return Exit::End,
+            _ = stopped(shutdown) => return Exit::Restart,
             exit = peer_exit(peer) => return exit,
             result = &mut attach => result,
         };
@@ -469,7 +543,7 @@ async fn write_peer(
     let mut attach = std::pin::pin!(attach);
     let result = tokio::select! {
         biased;
-        _ = stopped(shutdown) => return Exit::End,
+        _ = stopped(shutdown) => return Exit::Restart,
         exit = peer_exit(peer) => return exit,
         result = &mut attach => result,
     };
@@ -498,7 +572,7 @@ async fn receive_code(
 ) -> Result<Subscribe, Exit> {
     tokio::select! {
         biased;
-        _ = stopped(shutdown) => Err(Exit::End),
+        _ = stopped(shutdown) => Err(Exit::Restart),
         exit = peer_exit(peer) => Err(exit),
         result = timeout(IO_TIMEOUT, first) => match result {
             Ok(Ok(code)) => Ok(code),
@@ -540,7 +614,7 @@ async fn forward<S: Sink<Message> + Unpin>(
     loop {
         tokio::select! {
             biased;
-            _ = stopped(shutdown) => return Exit::End,
+            _ = stopped(shutdown) => return Exit::Restart,
             exit = peer_exit(peer) => return exit,
             _ = pong.changed() => {
                 if *pong.borrow_and_update() == expected_pong {
@@ -671,7 +745,7 @@ async fn forward_delivery<S: Sink<Message> + Unpin>(
         let waiting_for_ack = drained || progress.sent - progress.acked >= window;
         tokio::select! {
             biased;
-            _ = stopped(shutdown) => return Exit::End,
+            _ = stopped(shutdown) => return Exit::Restart,
             exit = peer_exit(peer) => return exit,
             _ = pong.changed() => {
                 if *pong.borrow_and_update() == expected_pong {
@@ -783,6 +857,12 @@ async fn finish(writer: &mut Writer, peer: &mut watch::Receiver<PeerState>, exit
     }
     let (message, code) = match &exit {
         Exit::End => (ServerMessage::Closed, CloseCode::Normal),
+        Exit::Restart => (
+            ServerMessage::ServiceRestarting {
+                retry_after_ms: RESTART_RETRY_AFTER_MS,
+            },
+            CloseCode::from(1012),
+        ),
         Exit::Invalid(message) => (
             ServerMessage::Error {
                 code: "invalid_request",

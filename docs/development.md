@@ -112,6 +112,24 @@ RUST_LOG=info cargo run --locked --bin auth_reauth -- --wait-secs 60
 令牌桶用显式时间或暂停时钟；WS 消息限速测试冻结仅测试编译的消息时钟，网络调度延迟不会补充令牌。
 客户端重试测试等待实际重新握手并检查 resume_after，不用固定 sleep 猜测重试时刻。
 
+维护退出测试用 start/end 桩的 gate 固定清理交错，验证 ready 前、活动订阅及 ACK 窗口满时的
+service_restarting / 1012，与正常结束的 closed / 1000 区分。预算测试先等待桩确认阻塞点，再暂停时钟并推进期限，
+覆盖 start、end 及下游关闭握手阻塞；超时后解除桩并确认清理仅一次、资源名额归还。
+客户端桩验证维护重试建议、原游标重连、HTTP 重新接入，以及旧流丢失后明确退出而不自动新开流。
+`server_test.rs` 通过通道确认阻塞辅助任务已经启动，验证入口返回超时错误时不会继续等待运行时析构；
+观察返回之后才解除辅助任务，测试不遗留阻塞线程。
+
+```sh
+cargo test --locked -p bridge-native downstream::downstream_test
+cargo test --locked -p bridge-native --bin downstream_client
+cargo test --locked -p bridge-native --bin server
+cargo test --locked -p bridge-native config_test
+```
+
+本地测试不证明实际进程托管和代理环境的停机效果。部署验收应在有活动连接及开场请求时发送 SIGTERM，
+确认停止新接入、客户端维护重试、预算内本地清理或超时非零退出；托管停止宽限期应大于 `BRIDGE_SHUTDOWN_TIMEOUT_SECS`。
+重启后确认旧游标明确失败，不能把重新从实时位置订阅视为无损恢复。
+
 ## 常见扩展方式
 
 ### 新增或调整直播事件

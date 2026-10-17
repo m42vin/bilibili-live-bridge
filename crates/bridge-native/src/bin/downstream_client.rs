@@ -2,7 +2,8 @@
 //!
 //! 先启动 `server`，再设置 `AUTH_CODE` 并运行本程序；无需平台 Access Key。
 //! `BRIDGE_URL` 可设为 HTTP(S) 接入地址，先 POST 获取短期连接凭证；默认直连地址为 `ws://127.0.0.1:8080/ws`。网络断开按 2–10 秒退避重连；
-//! `closed`、服务端 `error`、续传失败或无效业务消息结束程序。游标仅存于进程内。
+//! `service_restarting` 保留游标并退避重试；`closed`、终止性错误、续传失败或无效业务消息结束程序。
+//! 游标仅存于进程内，服务重启后旧流不可用时也不自动清除。
 //! 业务处理独立于网络读取，Ctrl-C 在连接和退避期间均有效。
 
 use std::future::Future;
@@ -260,6 +261,9 @@ enum ServerMessage {
     },
     Error {
         code: String,
+        retry_after_ms: Option<u64>,
+    },
+    ServiceRestarting {
         retry_after_ms: Option<u64>,
     },
     Closed,
@@ -590,6 +594,10 @@ async fn receive<F: Future<Output = std::io::Result<()>>>(
                         }
                         tracing::error!(%code, "桥接服务报告接入错误");
                         return Err("接入失败，请检查身份码和服务端日志".into());
+                    }
+                    ServerMessage::ServiceRestarting { retry_after_ms } => {
+                        tracing::warn!(?retry_after_ms, "桥接服务维护退出，保留游标重试");
+                        return Ok(Outcome::Retry { retry_after_ms });
                     }
                     ServerMessage::Closed => {
                         tracing::info!("桥接会话结束");

@@ -28,6 +28,7 @@ fn loads_required_values_and_defaults() {
     assert_eq!(config.access_key_secret(), "super-secret");
     assert_eq!(config.app_id(), 165_032_067_539_475);
     assert_eq!(config.listen(), DEFAULT_LISTEN);
+    assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
     assert_eq!(config.websocket_heartbeat(), DEFAULT_HEARTBEAT);
     assert_eq!(config.app_heartbeat(), DEFAULT_HEARTBEAT);
     assert_eq!(config.heartbeat_policy(), HeartbeatPolicy::default());
@@ -361,4 +362,37 @@ fn resource_defaults_limits_and_conflicts_are_checked() {
     let p = load(&vars).unwrap().resource_policy();
     assert_eq!(p.max_pending_attaches, 3);
     assert_eq!(p.start.burst, 5);
+}
+
+#[test]
+fn shutdown_budget_loads_positive_seconds_and_rejects_invalid_values() {
+    for (value, expected) in [(" 7 ", 7), ("", 30), (" ", 30)] {
+        let mut vars = required_vars();
+        vars.push((ENV_SHUTDOWN_TIMEOUT_SECS, value));
+        assert_eq!(
+            load(&vars).unwrap().shutdown_timeout(),
+            Duration::from_secs(expected)
+        );
+    }
+    for value in [
+        "0",
+        "-1",
+        "1.5",
+        "nope",
+        "18446744073709551615",
+        "18446744073709551616",
+    ] {
+        let mut vars = required_vars();
+        vars.push((ENV_SHUTDOWN_TIMEOUT_SECS, value));
+        assert!(
+            matches!(
+                load(&vars),
+                Err(ConfigError::Invalid {
+                    var: ENV_SHUTDOWN_TIMEOUT_SECS,
+                    ..
+                })
+            ),
+            "{value}"
+        );
+    }
 }

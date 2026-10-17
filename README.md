@@ -16,6 +16,7 @@
 - **会话清理**：最后一个订阅者离开、互动结束、上游恢复终止或项目心跳达到关闭条件时，尝试关闭官方场次；支持等待全部会话关闭。
 - **内存续传与 ACK**：可选确认模式使用共享有界事件日志、流标识和桥侧序号，支持慢消费追赶、断线补发和结束流尾部回放；超出保留范围明确报错。
 - **下游 WebSocket**：每条 `/ws` 连接订阅一个房间，按序推送 JSON 事件；报告缓冲溢出，支持 Ping/Pong、读写限制和优雅退出。服务在最后一个客户端离开后保留上游 30 秒供重连。
+- **维护退出**：维护通知与会话结束分开，客户端保留游标重试；停止接入后的通知与清理受可配置的总预算限制。
 - **结构化日志**：基于 tracing 记录 API 请求、连接与会话生命周期、心跳及清理失败；异步任务的日志携带房间和场次上下文。
 
 ## Workspace 结构
@@ -79,6 +80,7 @@ cargo run --locked --bin multi_client
 | `BILIBILI_ACCESS_KEY_SECRET` | 是 | 无 | 开放平台 Access Key Secret |
 | `BILIBILI_APP_ID` | 是 | 无 | 项目 ID，必须是大于 0 的 `i64` 整数 |
 | `BRIDGE_LISTEN` | 否 | `127.0.0.1:8080` | 下游 WebSocket 监听地址，格式为 IP 和端口 |
+| `BRIDGE_SHUTDOWN_TIMEOUT_SECS` | 否 | `30` | server 停止接入后等待维护通知、连接关闭与场次清理的总预算，正整数秒，须在时钟可表示范围内 |
 | `BRIDGE_MAX_CONNECTIONS` | 否 | `512` | 全部下游连接，含握手和等待订阅 |
 | `BRIDGE_MAX_HANDSHAKES` | 否 | `32` | 正在执行下游 HTTP→WS 升级的连接 |
 | `BRIDGE_MAX_PENDING_ATTACHES` | 否 | `64` | 等待接入结果的请求，含进程内和同码等待者 |
@@ -133,7 +135,10 @@ cargo run --locked --bin server
 
 接入成功后先收到 `ready`，再收到带 `cmd` 和 `data` 的 `event`。多条同码连接共享一场上游互动；
 最后一个客户端离开后保留上游 30 秒，期间重连复用原场次；上述原实时模式不补发，确认模式可按游标续传。
-Ctrl-C 或 Unix SIGTERM 会停止接入并等待清理。完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
+Ctrl-C 或 Unix SIGTERM 会停止接入，尽力发送 `service_restarting` 并用 1012 关闭连接，同时等待场次清理。
+退出总预算由 `BRIDGE_SHUTDOWN_TIMEOUT_SECS` 控制，默认 30 秒；超时记录剩余连接与场次数，中止下游任务并以失败状态退出。
+进程托管的停止宽限期应大于该预算，为运行时退出留出余量；正常返回仅表示本地清理结束，不保证平台确认 end 成功。
+完整消息、超时和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
 ### 第一阶段资源保护
 
@@ -186,13 +191,15 @@ BRIDGE_URL='ws://127.0.0.1:8080/ws' RUST_LOG=info,downstream_client=debug cargo 
 保留范围内补发桥已记录的事件，重复事件按流标识与序号去重，序号出现缺口时报错退出。
 上游恢复时保持下游连接等待；上游没有到达桥的事件无法补发。
 
-收到 closed 正常退出；server_busy、rate_limited、subscription_limit 和 HTTP 429/503 采用退避重试，
+收到 `closed` 正常退出；收到 `service_restarting` 时保留已处理游标，采用同一套退避及重试建议规则重新接入。
+尚未收到 ready 时没有游标，可重新申请首次接入；维护通知不代表日志能跨服务重启保留。
+server_busy、rate_limited、subscription_limit 和 HTTP 429/503 采用退避重试，
 等待至少为基础退避与 retry_after_ms 建议的较大者，再增加抖动（远端建议最多采纳一天）。
 缺少建议值也可重试；重试保留进程内已处理游标。attach_failed、invalid_request、续传不可用、
 无效消息或其他 HTTP 4xx 握手拒绝时报错退出，不自动放弃游标重新开启场次。桥重启或日志过期后无法续传。
 示例只在进程内保留游标，需要跨客户端重启恢复时应将业务结果和游标一起持久化。
 Ctrl-C 可中断建连、事件等待和退避，关闭清理最多等待 2 秒。
-HTTP 接入最多等待 30 秒，为平台请求及对象间交接预留时间；WebSocket 握手和单次发送最多等待 10 秒。
+HTTP 接入最多等待 30 秒，为接入服务准备连接资格预留时间；WebSocket 握手和单次发送最多等待 10 秒。
 完整 ACK、范围和错误语义见 [客户端协议](docs/downstream-protocol.md)。
 
 ### 日志
@@ -243,6 +250,10 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 定制两套策略，`UpstreamPolicy::reconnect = None` 禁用上游重连。
 库的 `Manager::attach_delivery(code, resume_after)` 返回日志订阅，配合 `DeliveryPolicy` 和
 `Manager::with_policies_and_delivery` 可定制内存保留范围；ACK 流量控制由下游服务实现。
+
+`downstream::serve` 默认使用 30 秒退出总预算；库调用方可用 `serve_with_shutdown_timeout` 指定预算。
+返回 `TimedOut` 后，管理器后台清理在运行时存活期间仍可继续；直接调用 `Manager::shutdown` 的等待语义不变。
+当前不持久化日志或清理责任，进程重启后旧游标失效。客户端会明确报告续传失败，必须由业务决定是否重新订阅，不能自动清除游标或静默新开流。
 `Subscription::recv()` 仍保持原实时广播语义。
 `subscription.watch_status()` 返回 `UpstreamStatus` 的 watch 接收器，与直播事件独立，慢接收者可合并中间状态。
 

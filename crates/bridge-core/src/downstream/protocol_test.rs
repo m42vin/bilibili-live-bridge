@@ -84,3 +84,18 @@ fn retry_advice_is_optional_and_keeps_the_existing_error_shape() {
         }
     }
 }
+
+#[test]
+fn maintenance_and_session_end_have_distinct_messages() {
+    assert_eq!(
+        serde_json::to_value(ServerMessage::ServiceRestarting {
+            retry_after_ms: 1000
+        })
+        .unwrap(),
+        json!({"type":"service_restarting", "retry_after_ms":1000})
+    );
+    assert_eq!(
+        serde_json::to_value(ServerMessage::Closed).unwrap(),
+        json!({"type":"closed"})
+    );
+}

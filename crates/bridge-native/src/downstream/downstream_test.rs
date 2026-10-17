@@ -304,8 +304,17 @@ async fn shutdown_closes_active_clients_and_rejects_new_attaches() {
     let mut fixture = Fixture::new().await;
     let (mut client, _) = fixture.subscribe(CODE).await;
     fixture.shutdown.take().unwrap().send(()).unwrap();
-    assert_eq!(next_json(&mut client).await, json!({"type":"closed"}));
-    assert!(matches!(next_frame(&mut client).await, Message::Close(_)));
+    expect_restart(&mut client).await;
+    assert!(
+        TcpStream::connect(
+            fixture
+                .url
+                .trim_start_matches("ws://")
+                .trim_end_matches("/ws")
+        )
+        .await
+        .is_err()
+    );
     drop(client);
     let manager = fixture.manager.clone();
     fixture.stop().await;
@@ -336,12 +345,164 @@ async fn shutdown_during_start_waits_for_end_and_notifies_the_client() {
     .await
     .unwrap();
     assert!(fixture.state.ends.borrow().is_empty());
+    // 通知不等待平台 start 完成，但 serve 必须继续等待共享开场任务的清理。
+    expect_restart(&mut client).await;
+    assert!(!fixture.server.is_finished());
     fixture.state.start_gate.send_replace(true);
-    assert_eq!(next_json(&mut client).await, json!({"type":"closed"}));
-    assert!(matches!(next_frame(&mut client).await, Message::Close(_)));
     fixture.state.wait_ends(1).await;
     assert_eq!(*fixture.state.ends.borrow(), ["game-1"]);
     drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn maintenance_notifies_before_subscribe_and_with_a_full_ack_window() {
+    for ack_mode in [false, true] {
+        let mut fixture = Fixture::with_delivery(
+            Duration::from_secs(20),
+            DeliveryPolicy {
+                ack_window: 1,
+                ..DeliveryPolicy::default()
+            },
+        )
+        .await;
+        let mut client = if ack_mode {
+            let (mut client, _) = fixture.subscribe_ack(CODE, None).await;
+            fixture.emit_logged(json!(1)).await;
+            assert_eq!(next_json(&mut client).await["seq"], 1);
+            client
+        } else {
+            fixture.connect().await
+        };
+        fixture.shutdown.take().unwrap().send(()).unwrap();
+        expect_restart(&mut client).await;
+        drop(client);
+        let state = fixture.state.clone();
+        fixture.stop().await;
+        assert_eq!(state.ends.borrow().len(), usize::from(ack_mode));
+    }
+}
+
+#[tokio::test]
+async fn shutdown_budget_bounds_blocked_start_and_end_without_cancelling_cleanup() {
+    for block_start in [true, false] {
+        let mut fixture = Fixture::with_shutdown_budget(
+            Duration::from_secs(20),
+            DeliveryPolicy::default(),
+            ResourceBudget::for_tests(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let mut client = if block_start {
+            fixture.state.start_gate.send_replace(false);
+            let mut client = fixture.connect().await;
+            client
+                .send(Message::text(
+                    json!({"type":"subscribe", "code":CODE}).to_string(),
+                ))
+                .await
+                .unwrap();
+            fixture.state.wait_starts(1).await;
+            client
+        } else {
+            fixture.state.end_gate.send_replace(false);
+            fixture.subscribe(CODE).await.0
+        };
+        fixture.shutdown.take().unwrap().send(()).unwrap();
+        expect_restart(&mut client).await;
+        if !block_start {
+            fixture.state.wait_ends(1).await;
+        }
+        assert!(fixture.manager.is_shutting_down());
+        assert!(!fixture.server.is_finished());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!fixture.server.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let error = timeout(TEST_TIMEOUT, &mut fixture.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        tokio::time::resume();
+        assert_eq!(
+            fixture.manager.resource_budget().snapshot().occupied[Resource::Session as usize],
+            1
+        );
+        // serve 返回超时不会丢掉已发出 start/end 的所有权；解除桩后仍清理一次并归还名额。
+        fixture.state.start_gate.send_replace(true);
+        fixture.state.end_gate.send_replace(true);
+        let budget = fixture.manager.resource_budget();
+        timeout(TEST_TIMEOUT, async {
+            while budget.snapshot().occupied[Resource::Session as usize] != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*fixture.state.ends.borrow(), ["game-1"]);
+        assert_eq!(
+            fixture.manager.resource_budget().snapshot().occupied[Resource::Session as usize],
+            0
+        );
+        drop(client);
+        fixture.stop_platform().await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_budget_also_bounds_an_unresponsive_downstream_close() {
+    let mut fixture = Fixture::with_shutdown_budget(
+        Duration::from_secs(20),
+        DeliveryPolicy::default(),
+        ResourceBudget::for_tests(),
+        Duration::from_secs(2),
+    )
+    .await;
+    let mut client = fixture.connect().await;
+    fixture.shutdown.take().unwrap().send(()).unwrap();
+    assert_eq!(next_json(&mut client).await["type"], "service_restarting");
+    assert!(matches!(next_frame(&mut client).await, Message::Close(_)));
+    // 不 flush 客户端的关闭应答，让服务端真实停在关闭握手等待中。
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = timeout(TEST_TIMEOUT, &mut fixture.server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    tokio::time::resume();
+    let budget = fixture.manager.resource_budget();
+    timeout(TEST_TIMEOUT, async {
+        while budget.snapshot().occupied[Resource::Connection as usize] != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fixture.state.starts.borrow().is_empty());
+    drop(client);
+    fixture.stop_platform().await;
+}
+
+#[tokio::test]
+async fn invalid_shutdown_budget_is_rejected_before_serving() {
+    let fixture = Fixture::new().await;
+    for budget in [Duration::ZERO, Duration::MAX] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = serve_with_shutdown_timeout(
+            listener,
+            fixture.manager.clone(),
+            std::future::pending(),
+            budget,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!fixture.manager.is_shutting_down());
+    }
     fixture.stop().await;
 }
 
@@ -377,8 +538,8 @@ async fn forward_reports_lagged_then_continues_with_retained_events() {
     assert_eq!(lagged, json!({"type":"lagged", "skipped":44}));
     assert_eq!(recorded_json(&mut messages).await["data"], 44);
     shutdown.send_replace(true);
-    // 信号在单次发送期间到达时会取消写入并直接断开；空闲时返回 End。
-    assert!(matches!(task.await.unwrap(), Exit::End | Exit::Failed));
+    // 信号在单次发送期间到达时会取消写入并直接断开；空闲时返回维护退出。
+    assert!(matches!(task.await.unwrap(), Exit::Restart | Exit::Failed));
     drop(probe);
     fixture.stop().await;
 }
@@ -398,7 +559,7 @@ async fn first_subscription_times_out_and_stops_on_shutdown() {
     stop_tx.send_replace(true);
     assert_eq!(
         receive_code(first, &mut peer, &mut stop).await,
-        Err(Exit::End)
+        Err(Exit::Restart)
     );
 }
 
@@ -535,6 +696,18 @@ async fn next_json(client: &mut ClientSocket) -> Value {
     }
 }
 
+async fn expect_restart(client: &mut ClientSocket) {
+    assert_eq!(
+        next_json(client).await,
+        json!({"type":"service_restarting", "retry_after_ms":1000})
+    );
+    assert!(
+        matches!(next_frame(client).await, Message::Close(Some(frame)) if u16::from(frame.code) == 1012)
+    );
+    // 完成关闭握手，避免测试自身占用服务退出预算。
+    let _ = client.flush().await;
+}
+
 struct Fixture {
     url: String,
     manager: Manager,
@@ -552,6 +725,7 @@ struct PlatformState {
     starts: watch::Sender<Vec<String>>,
     ends: watch::Sender<Vec<String>>,
     start_gate: watch::Sender<bool>,
+    end_gate: watch::Sender<bool>,
     fail_start: AtomicBool,
     heartbeats: AtomicUsize,
     early_event: std::sync::Mutex<Option<Value>>,
@@ -585,6 +759,21 @@ impl Fixture {
         delivery_policy: DeliveryPolicy,
         budget: ResourceBudget,
     ) -> Self {
+        Self::with_shutdown_budget(
+            app_heartbeat,
+            delivery_policy,
+            budget,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn with_shutdown_budget(
+        app_heartbeat: Duration,
+        delivery_policy: DeliveryPolicy,
+        budget: ResourceBudget,
+        shutdown_timeout: Duration,
+    ) -> Self {
         let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let official = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -595,6 +784,7 @@ impl Fixture {
             starts: watch::channel(Vec::new()).0,
             ends: watch::channel(Vec::new()).0,
             start_gate: watch::channel(true).0,
+            end_gate: watch::channel(true).0,
             fail_start: AtomicBool::new(false),
             heartbeats: AtomicUsize::new(0),
             early_event: Default::default(),
@@ -623,9 +813,14 @@ impl Fixture {
         let url = format!("ws://{}/ws", downstream.local_addr().unwrap());
         let (shutdown, signal) = oneshot::channel();
         let server_manager = manager.clone();
-        let server = tokio::spawn(serve(downstream, server_manager, async {
-            let _ = signal.await;
-        }));
+        let server = tokio::spawn(serve_with_shutdown_timeout(
+            downstream,
+            server_manager,
+            async {
+                let _ = signal.await;
+            },
+            shutdown_timeout,
+        ));
         let (platform_stop, _) = watch::channel(false);
         let platform_tasks = vec![
             tokio::spawn(stub(api, state.clone(), platform_stop.subscribe(), false)),
@@ -672,12 +867,16 @@ impl Fixture {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        timeout(TEST_TIMEOUT, self.server)
+        timeout(TEST_TIMEOUT, &mut self.server)
             .await
             .expect("server cleanup timed out")
             .unwrap()
             .unwrap();
         assert!(self.manager.is_shutting_down());
+        self.stop_platform().await;
+    }
+
+    async fn stop_platform(self) {
         self.platform_stop.send_replace(true);
         for task in self.platform_tasks {
             timeout(TEST_TIMEOUT, task).await.unwrap().unwrap();
@@ -801,6 +1000,7 @@ async fn api_request(mut stream: TcpStream, state: Arc<PlatformState>) {
         }
         "/v2/app/end" => {
             state.ends.send_modify(|ends| ends.push(body["game_id"].as_str().unwrap().into()));
+            state.end_gate.subscribe().wait_for(|open| *open).await.unwrap();
             json!({"code":0})
         }
         "/v2/app/batchHeartbeat" => json!({"code":0,"data":{"failed_game_ids":[]}}),
@@ -1223,7 +1423,7 @@ async fn delivery_interleaving_ack_advances_before_eviction() {
     );
     assert_eq!(
         result,
-        Exit::End,
+        Exit::Restart,
         "应交付事件 2 后退出；不能使用过期的 ACK=0 快照报错"
     );
     let Message::Text(text) = messages.try_recv().unwrap() else {
@@ -1344,7 +1544,7 @@ async fn delivery_interleaving_busy_room_notifications() {
         visits.load(Ordering::SeqCst) > 0,
         "必须实际插入其他房间通知"
     );
-    assert_eq!(result, Exit::End);
+    assert_eq!(result, Exit::Restart);
     let message = messages
         .try_recv()
         .expect("窗口空闲、事件已就绪，连续 1000 次其他房间通知不能阻止一次发送");
@@ -1449,7 +1649,7 @@ async fn delivery_interleaving_busy_room_notifications_keep_status_when_window_i
     )
     .await
     .unwrap();
-    assert_eq!(result, Exit::End);
+    assert_eq!(result, Exit::Restart);
     let Message::Text(text) = messages.try_recv().expect("满窗口时也必须交付上游状态")
     else {
         panic!("应发送状态文本");

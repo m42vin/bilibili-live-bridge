@@ -156,6 +156,84 @@ async fn event_before_ready_and_resume_failure_stop_the_client() {
 }
 
 #[tokio::test]
+async fn maintenance_retries_with_cursor_and_never_falls_back_after_a_lost_stream() {
+    for lost_stream in [false, true] {
+        let (listener, settings) = fixture().await;
+        let client =
+            tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+        timeout(Duration::from_secs(12), async {
+            let mut peer = subscriber(&listener, None).await;
+            send(&mut peer, ready(0, false)).await;
+            send(
+                &mut peer,
+                json!({
+                    "type":"event", "room_id":123, "stream_id":"stream-1",
+                    "seq":1, "cmd":"TEST", "data":null,
+                }),
+            )
+            .await;
+            let Message::Text(ack) = peer.next().await.unwrap().unwrap() else {
+                panic!("应先处理并确认事件");
+            };
+            assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"], 1);
+
+            let restarting_at = Instant::now();
+            send(
+                &mut peer,
+                json!({"type":"service_restarting", "retry_after_ms":3000}),
+            )
+            .await;
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+            peer.flush().await.unwrap();
+            let mut peer = subscriber(&listener, Some(1)).await;
+            assert!(restarting_at.elapsed() >= Duration::from_secs(3));
+            if lost_stream {
+                send(
+                    &mut peer,
+                    json!({
+                        "type":"resume_unavailable", "reason":"stream_unavailable",
+                        "earliest_after":null, "latest_seq":null,
+                    }),
+                )
+                .await;
+                assert!(client.await.unwrap().unwrap_err().contains("续传不可用"));
+            } else {
+                send(&mut peer, ready(1, true)).await;
+                send(&mut peer, json!({"type":"closed"})).await;
+                assert_eq!(client.await.unwrap(), Ok(()));
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn maintenance_before_ready_retries_without_inventing_a_cursor() {
+    let (listener, settings) = fixture().await;
+    let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
+    timeout(Duration::from_secs(8), async {
+        let mut peer = subscriber(&listener, None).await;
+        // 缺少建议值也使用已有退避，尚未 ready 时不存在可清除或续传的游标。
+        send(&mut peer, json!({"type":"service_restarting"})).await;
+        assert!(matches!(
+            peer.next().await.unwrap().unwrap(),
+            Message::Close(_)
+        ));
+        peer.flush().await.unwrap();
+        let mut peer = subscriber(&listener, None).await;
+        send(&mut peer, ready(0, false)).await;
+        send(&mut peer, json!({"type":"closed"})).await;
+        assert_eq!(client.await.unwrap(), Ok(()));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn duplicate_processed_event_is_acknowledged_and_sequence_gap_is_rejected() {
     let (listener, settings) = fixture().await;
     let client = tokio::spawn(async move { run_client(&settings, std::future::pending()).await });
@@ -376,7 +454,7 @@ async fn admission_waits_for_platform_timeout_response_instead_of_retrying_at_te
 }
 
 #[tokio::test]
-async fn http_admission_reconnects_with_cursor_and_answers_application_ping() {
+async fn http_admission_reconnects_after_maintenance_with_cursor_and_answers_application_ping() {
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let settings = Settings {
@@ -427,7 +505,16 @@ async fn http_admission_reconnects_with_cursor_and_answers_application_ping() {
                     panic!("expected ack");
                 };
                 assert_eq!(serde_json::from_str::<Value>(&ack).unwrap()["seq"], 1);
-                drop(peer);
+                send(
+                    &mut peer,
+                    json!({"type":"service_restarting", "retry_after_ms":1}),
+                )
+                .await;
+                assert!(matches!(
+                    peer.next().await.unwrap().unwrap(),
+                    Message::Close(_)
+                ));
+                peer.flush().await.unwrap();
             } else {
                 send(&mut peer, json!({"type":"closed"})).await;
             }

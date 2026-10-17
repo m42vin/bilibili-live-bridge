@@ -169,7 +169,12 @@ pub enum ServerMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
     },
-    /// 会话已经结束。
+    /// 服务正在维护退出；客户端保留游标并退避重试，不表示互动结束。
+    ServiceRestarting {
+        /// 重连前建议等待的毫秒数，不保证届时服务已恢复。
+        retry_after_ms: u64,
+    },
+    /// 会话已经结束，客户端不再自动重试该订阅。
     Closed,
 }
 
