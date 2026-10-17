@@ -26,13 +26,12 @@ RUSTDOCFLAGS="-D warnings -W missing_docs" cargo doc --locked --workspace --no-d
 `cargo run --locked --bin server` 启动下游 WebSocket 服务，联调方式见 [客户端协议](downstream-protocol.md)；
 手动验证上游也可以使用 README 中的三个示例程序。
 下游客户端使用 `cargo run --locked --bin downstream_client`，只需设置 `AUTH_CODE`，
-可选 `BRIDGE_URL`；客户端行为测试使用本地 WebSocket 桩，无需真实平台。
+可选 `BRIDGE_URL`；客户端行为测试使用本地 HTTP / WebSocket 桩，覆盖 HTTP 接入、游标重连及应用层 ping/pong，无需真实平台。
 
-单独检查核心及 Wasm 编译（需预先安装 `wasm32-unknown-unknown` target）：
+单独检查核心及依赖边界：
 
 ```sh
 cargo test --locked -p bridge-core
-cargo check --locked -p bridge-core --target wasm32-unknown-unknown
 cargo tree --locked -p bridge-core
 ```
 
@@ -209,22 +208,3 @@ cargo test --locked health_test
 cargo test --locked upstream_recovery
 cargo clippy --locked --all-targets -- -D warnings
 ```
-
-## Workers 适配验证
-
-新增 `bridge-worker` 时不改变原生服务的 Tokio 运行时。修改 Worker 后除 workspace 测试外，还需执行：
-
-```sh
-cargo check --locked -p bridge-worker --target wasm32-unknown-unknown
-cargo clippy --locked -p bridge-worker --target wasm32-unknown-unknown -- -D warnings
-cd crates/bridge-worker
-npm ci
-npm test
-npm run check
-```
-
-安装与配置见 [Worker 指南](../crates/bridge-worker/README.md)。`npm test` 在 workerd 中加载生成的 WASM，
-通过本地桩测试场次接入、双心跳、ACK 续传、闲置回收、DO 重建与鉴权拒绝，无需平台凭据。
-`npm run check` 是 Wrangler dry-run，不会发布。真实 Cloudflare 出口与 Bilibili 的联通性需部署后另行验证。
-
-Worker 日志与 ACK 窗口的单元测试位于 `delivery_test.rs`；运行时集成测试通过平台桩通知等待心跳与清理完成，并使用超时限制等待，不依赖固定 sleep 推断完成状态。

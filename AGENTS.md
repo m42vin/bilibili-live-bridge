@@ -2,4 +2,4 @@
 
 - 新增和实质修改代码前，阅读并遵循 [编码规范](docs/coding-convention.md)。该规范适用于本仓库所有 crate、可执行入口和测试代码。
 - 存量代码随改随补，不为满足规范发起无关的批量回填；修改时保持行为、并发与资源生命周期约束，并同步相关注释和文档。
-- 模块职责与运行时边界见 [架构说明](docs/architecture.md)；按 [开发指南](docs/development.md) 执行与改动相关的验证，Worker 改动还需执行其中的 Workers 适配验证。
+- 模块职责与运行时边界见 [架构说明](docs/architecture.md)；按 [开发指南](docs/development.md) 执行与改动相关的验证。

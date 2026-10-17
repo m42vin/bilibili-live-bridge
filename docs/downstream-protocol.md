@@ -212,10 +212,10 @@ Ctrl-C 或 Unix SIGTERM 停止接入、通知下游关闭，并等待共享开�
 发送字节预算、历史回放限速和失败身份码冷却不在此阶段实现。
 
 
-## HTTP 接入协议（为 Worker 适配预留）
+## HTTP 接入协议
 
 core 定义 `downstream::admission`，native 的 `downstream_client` 已支持此协议。
-当前 native `server` 仍只提供原有 `/ws`；`bridge-worker` 提供 HTTP 接入服务与 Room DO，详见 [Worker 指南](../crates/bridge-worker/README.md)。
+当前仓库只提供该协议的客户端支持；native `server` 仍只提供原有 `/ws`，HTTP 接入需要另行提供兼容服务。
 
 客户端向配置的完整 HTTP(S) 接入地址发送 POST，Content-Type 为 application/json。
 正文与 subscribe 的订阅参数相同，但不含 `type`：
@@ -248,8 +248,8 @@ HTTP 接入到 WebSocket 建连之间的预留资源由服务端租约负责回�
 HTTP Retry-After 支持整数秒，与正文建议同时存在时取较大值。原有退避上限和抖动规则保持不变。
 
 每次重连都携带最新已处理游标重新 POST，不能复用旧凭证或自动清除游标。
-Room WebSocket 升级以 401 或 410 表示凭证无效/过期时，客户端重新接入；403 等其他终止性拒绝不重试。
-示例客户端的接入 POST 最多等待 30 秒，为平台请求及对象间交接预留时间；
+WebSocket 升级以 401 或 410 表示凭证无效/过期时，客户端重新接入；403 等其他终止性拒绝不重试。
+示例客户端的接入 POST 最多等待 30 秒，为接入服务处理平台请求及准备连接资格预留时间；
 WebSocket 升级和单次发送仍最多等待 10 秒，Ctrl-C 可以取消接入请求及退避。
 
 ### 应用层保活

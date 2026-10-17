@@ -26,9 +26,5 @@ rustc-ice-*.txt
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-# Cloudflare Worker 构建产物、本地状态与凭据
-crates/bridge-worker/build/
-crates/bridge-worker/node_modules/
-crates/bridge-worker/.wrangler/
-.dev.vars*
-!.dev.vars.example
+# 保留旧适配目录的忽略规则，避免遗留本地凭据、状态及构建缓存入库
+/crates/bridge-worker/

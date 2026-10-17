@@ -21,7 +21,6 @@
 ## Workspace 结构
 
 - `bridge-core`：请求签名、API 数据模型与响应解析、官方二进制协议和事件、下游 JSON 协议、交付模型，以及健康/心跳/重连的纯策略、失败分类、退避计算、恢复状态及接入/关闭生命周期。不依赖 Tokio、HTTP 客户端或系统网络。
-- `bridge-worker`：Cloudflare Workers / Durable Objects 适配，提供 HTTP 接入、Room DO、上游连接和内存 ACK 续传；运行方式及当前边界见 [Worker 指南](crates/bridge-worker/README.md)。
 - `bridge-native`：原生 HTTP / WebSocket、会话管理、心跳与恢复、内存日志、配置、日志初始化和所有可执行入口，单向依赖 `bridge-core`。
 
 `bridge-native` 保留库名 `bilibili_live_bridge`，原公共类型路径通过重导出保持可用。Cargo 包名已从 `bilibili-live-bridge` 改为 `bridge-native`；外部项目的本地依赖改为：
@@ -32,7 +31,7 @@ bilibili-live-bridge = { package = "bridge-native", path = "../bilibili-live-bri
 ```
 
 在仓库根目录仍可执行 `cargo run --locked --bin server`。验证所有成员使用 `cargo test --locked --workspace`；仅验证纯核心使用 `cargo test --locked -p bridge-core`。
-心跳、上游恢复和单会话接入/关闭决策已移入 core；native 保留索引、锁、通知、网络清理及调度。Workers 最小链路由 `bridge-worker` 提供；尚不包含持久化事件日志。
+心跳、上游恢复和单会话接入/关闭决策由 core 定义；native 负责索引、锁、通知、网络清理及调度。事件日志保存在内存中，不支持跨进程重启续传。
 
 ## 快速开始
 
@@ -168,8 +167,8 @@ cargo run --locked --bin downstream_client
 
 客户端也支持 HTTP 接入模式：将 `BRIDGE_URL` 设置为完整的 `http://` 或 `https://` 接入地址。
 它会 POST 身份码与续传参数，取得短期 WebSocket 地址，连接后等待 ready；每次重连重新申请凭证并保留已处理游标。
-支持应用层 ping/pong 与原有标准 WebSocket 保活。协议见 [HTTP 接入协议](docs/downstream-protocol.md#http-接入协议为-worker-适配预留)。
-当前 native server 尚未提供该 HTTP 接口，此模式可连接 `bridge-worker` 或其他实现相同协议的服务。
+支持应用层 ping/pong 与原有标准 WebSocket 保活。协议见 [HTTP 接入协议](docs/downstream-protocol.md#http-接入协议)。
+当前仓库只提供该协议的客户端支持；native server 仍只提供 `/ws`，HTTP 模式需要另行提供兼容的接入服务。
 
 客户端只需要身份码，无需平台 Access Key 或 `BILIBILI_APP_ID`，也不会自动读取 `.env`。
 可通过 `BRIDGE_URL` 修改地址，默认是 `ws://127.0.0.1:8080/ws`；例如：
