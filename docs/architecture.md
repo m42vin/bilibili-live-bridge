@@ -44,6 +44,7 @@ native 保留批量心跳组批、正常周期优先、单请求在途及场次�
 | --- | --- | --- |
 | `config` | 读取和校验进程环境变量，保存项目配置 | `Config::from_env` |
 | `logging` | 为可执行程序安装全局 tracing subscriber | `logging::init` |
+| `server` | 配置装配、业务与管理监听器的共同生命周期 | `server::run` |
 | `open_live::api` | 对 JSON 请求签名，调用开启、关闭、单场和批量心跳 API | `Client`、`StartResult` |
 | `open_live::ws` | 官方连接鉴权、WebSocket 心跳、包解码和直播事件解析 | `Connection`、`LiveEvent` |
 | `session` | 按身份码和房间复用会话，维护订阅、批量项目心跳及清理流程 | `Manager`、`Subscription` |
@@ -223,6 +224,8 @@ core 的 `AdmissionPhase` 保存纯接入阶段；native 的 `Phase` 使用 watc
 
 传输失败、EOF、普通 Close 或健康超时可以恢复；协议错误、业务解码错误、明确鉴权拒绝以及
 Close 1002/1003/1007/1008 终止。InteractionEnd 先转发，再终止；shutdown、闲置到期及项目心跳关闭信号优先取消恢复。
+底层 ResetWithoutClosingHandshake 表示未完成 WebSocket 关闭握手的 TCP 丢失，必须转换为 Transport；
+不能因底层错误枚举名称含 Protocol 就把它误判为终止性业务协议错误。其他协议错误的终止边界不变。
 重连仅重新鉴权，原场次失效后不自动 start；原鉴权复用已用 `auth_reauth` 连真实平台验证通过，跨集群切换仍只由本地桩覆盖。
 预算耗尽或终止错误共用现有清理路径，end 只调用一次。
 
@@ -347,6 +350,10 @@ ObservedPlatform 包装 Platform / LiveSocket 边界，不改变参数、候选�
 事件日志的累计移除数包含正常过期、容量淘汰、流移除及未保留的超大事件，不等价于业务丢失数量。
 指标不包含身份码、房间或场次标识、候选地址、事件正文、原始错误或任意平台码。
 详细口径见 [运维观测](operations.md)。
+
+server 的生产装配与共同驱动器由库模块集中维护，二进制仅持有运行时、日志初始化和信号入口。
+本地验收在独立测试进程中复用这些驱动器，源站替换与压测控制仅位于 cfg(test)，不会给正式入口增加平台源站覆盖配置。
+活动任务数按当前 Tokio 运行时采样，OS 内存与 FD 由父进程观测，避免把发生器或模拟平台的资源计入被测服务。
 
 ## 配置与日志边界
 

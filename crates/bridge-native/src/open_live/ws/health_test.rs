@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Context;
@@ -152,31 +153,77 @@ async fn pair() -> (Connection, WebSocketStream<TcpStream>) {
     (client.unwrap(), server)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn heartbeats_on_the_wire_keep_an_eventless_connection_alive() {
-    let (mut connection, mut server) = pair().await;
+    wire_keepalive_round().await;
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "重复验证暂停时钟与真实线缆 I/O，见 docs/validation.md"]
+async fn heartbeat_repeatability() {
+    for _ in 0..100 {
+        wire_keepalive_round().await;
+    }
+}
+
+async fn wire_keepalive_round() {
+    let (mut connection, mut server) = wire_progress(pair()).await;
     connection.health.activity_timeout = Duration::from_millis(100);
     connection.activity_deadline = Instant::now() + connection.health.activity_timeout;
     connection.heartbeat_every = Duration::from_millis(20);
     connection.heartbeat_at = Instant::now() + connection.heartbeat_every;
-    let client = tokio::spawn(async move { connection.recv().await });
     for _ in 0..8 {
-        let frame = tokio::time::timeout(Duration::from_secs(2), server.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        advance(Duration::from_millis(20)).await;
+        let frame = wire_progress(async {
+            tokio::select! {
+                result = connection.recv() => panic!("无事件连接不应结束：{result:?}"),
+                frame = server.next() => frame.unwrap().unwrap(),
+            }
+        })
+        .await;
         assert!(matches!(frame, Message::Binary(_)));
-        server
-            .send(Message::binary(
-                packet::encode(Operation::HeartbeatReply, b"").unwrap(),
-            ))
-            .await
-            .unwrap();
+        wire_progress(server.send(Message::binary(
+            packet::encode(Operation::HeartbeatReply, b"").unwrap(),
+        )))
+        .await
+        .unwrap();
+        let expected = Instant::now() + connection.health.activity_timeout;
+        wire_progress(std::future::poll_fn(|cx| {
+            let result = {
+                let future = connection.recv();
+                std::pin::pin!(future).poll(cx)
+            };
+            assert!(result.is_pending(), "心跳不能结束事件读取：{result:?}");
+            if connection.activity_deadline == expected {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+        .await;
     }
-    assert!(!client.is_finished());
-    server.send(Message::Close(None)).await.unwrap();
-    assert!(client.await.unwrap().unwrap().is_none());
+    wire_progress(server.send(Message::Close(None)))
+        .await
+        .unwrap();
+    assert!(wire_progress(connection.recv()).await.unwrap().is_none());
+}
+
+// 暂停时钟下持续轮询真实 I/O，避免运行时空闲自动把虚拟时间推进到活动截止时间。
+// 墙钟只限制测试等待，不参与被测期限；不以 sleep 猜测内核数据已经可读。
+async fn wire_progress<F: std::future::Future>(future: F) -> F::Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut future = std::pin::pin!(future);
+    loop {
+        let result = std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+        if let Poll::Ready(value) = result {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "本地线缆 I/O 未在墙钟保护期限内完成"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 fn incoming(connection: &mut Connection, operation: Operation) {

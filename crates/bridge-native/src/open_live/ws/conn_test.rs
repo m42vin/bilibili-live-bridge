@@ -10,6 +10,24 @@ use super::super::cmd::LiveEvent;
 use super::super::packet::{Operation, decode_packets, encode};
 use super::*;
 
+#[test]
+fn reset_without_close_is_recoverable_but_other_protocol_errors_stay_fatal() {
+    assert!(matches!(
+        socket_error(
+            "read",
+            SocketError::Protocol(SocketProtocolError::ResetWithoutClosingHandshake)
+        ),
+        WsError::Transport { .. }
+    ));
+    assert!(matches!(
+        socket_error(
+            "read",
+            SocketError::Protocol(SocketProtocolError::SendAfterClosing)
+        ),
+        WsError::Protocol { .. }
+    ));
+}
+
 #[tokio::test]
 async fn rejects_invalid_arguments_before_connecting() {
     let error = Connection::connect(["ws://127.0.0.1:9"], "  ", Duration::from_secs(1))

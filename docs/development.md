@@ -44,6 +44,7 @@ cargo tree --locked -p bridge-core
 | 纯资源策略、拒绝原因与显式时间令牌桶 | [core/resource.rs](../crates/bridge-core/src/resource.rs) | 同文件单元测试 |
 | 原生资源名额、取消和限速 | [native/resource.rs](../crates/bridge-native/src/resource.rs)、[manager.rs](../crates/bridge-native/src/session/manager.rs) | [resource_test.rs](../crates/bridge-native/src/session/resource_test.rs)、下游集成测试 |
 | 配置读取与校验 | [config.rs](../crates/bridge-native/src/config.rs) | [config_test.rs](../crates/bridge-native/src/config_test.rs) |
+| 服务装配、共同退出与故障验收 | [server.rs](../crates/bridge-native/src/server.rs) | [server_test.rs](../crates/bridge-native/src/server/server_test.rs)、[validation_test.rs](../crates/bridge-native/src/server/validation_test.rs) |
 | 日志初始化与过滤 | [logging.rs](../crates/bridge-native/src/logging.rs) | [logging_test.rs](../crates/bridge-native/src/logging_test.rs) |
 | 探针、管理 HTTP 与固定标签指标 | [observability.rs](../crates/bridge-native/src/observability.rs)、[metrics.rs](../crates/bridge-native/src/observability/metrics.rs) | [observability_test.rs](../crates/bridge-native/src/observability_test.rs)、[metrics_test.rs](../crates/bridge-native/src/observability/metrics_test.rs) |
 | HTTP API、响应与请求签名 | [api.rs](../crates/bridge-native/src/open_live/api.rs)、[auth.rs](../crates/bridge-core/src/open_live/auth.rs) | [api_test.rs](../crates/bridge-native/src/open_live/api_test.rs)、[auth_test.rs](../crates/bridge-core/src/open_live/auth_test.rs) |
@@ -216,6 +217,19 @@ cargo doc --locked --workspace --no-deps --open
 提交前运行与改动相关的测试，并完成格式、默认测试和严格文档构建。对纯文档改动，重点确认链接与描述匹配当前实现；对新增 Rust 示例，还要确认 doctest 编译通过。
 
 ## 上游健康与恢复验证
+
+完整本地进程验收见 [故障验证与压测](validation.md)。该套件默认 ignored，显式执行 release 测试进程，
+复用生产 server 装配及共同驱动器，仅在测试模块内注入本地源站与短闲置宽限期。
+普通 workspace 测试不启动压测，不读取真实凭据。验收失败会输出报告并回收自建子进程。
+
+旧线缆心跳测试已改为暂停时钟加有界真实 I/O 轮询，另有 100 轮重复用例；
+不要通过增大活动期限或反复重跑失败用例代替修复时序问题。
+
+```sh
+cargo test --locked -p bridge-native --lib heartbeat_repeatability -- --ignored --nocapture
+./scripts/validate.sh smoke
+./scripts/validate.sh load
+```
 
 健康期限测试使用暂停时钟及可控 Sink，覆盖发送准备/flush 阻塞、取消恢复和缓存事件不保活。
 `upstream_recovery_test.rs` 使用平台桩验证原场次恢复、稳定窗口、预算、闲置、项目心跳及 shutdown。

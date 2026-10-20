@@ -23,7 +23,14 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// 标签仅使用固定类别。不同组件分别取快照，不保证跨组件原子一致。
 pub fn metrics(manager: &Manager) -> String {
-    manager.render_metrics()
+    let mut text = manager.render_metrics();
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        text.push_str(&format!(
+            "# TYPE bridge_runtime_alive_tasks gauge\nbridge_runtime_alive_tasks {}\n",
+            runtime.metrics().num_alive_tasks()
+        ));
+    }
+    text
 }
 
 /// 在已绑定的独立监听器上提供 GET /livez、/readyz 和 /metrics。

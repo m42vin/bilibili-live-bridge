@@ -17,6 +17,7 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::Error as SocketError;
+use tokio_tungstenite::tungstenite::error::ProtocolError as SocketProtocolError;
 use tokio_tungstenite::tungstenite::http::header::{HeaderValue, USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -495,6 +496,10 @@ fn deadline_error(reason: &'static str) -> WsError {
 
 fn socket_error(message: &'static str, error: SocketError) -> WsError {
     match error {
+        // 未完成关闭握手的 TCP 断开属于传输丢失，不能当作远端拒绝协议而终止场次。
+        SocketError::Protocol(SocketProtocolError::ResetWithoutClosingHandshake) => {
+            WsError::transport(message, error)
+        }
         SocketError::Protocol(_) | SocketError::Utf8(_) | SocketError::Capacity(_) => {
             WsError::protocol("官方长连接传输协议错误")
         }

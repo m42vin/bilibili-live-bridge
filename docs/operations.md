@@ -36,6 +36,7 @@ server 在两个监听器都成功绑定后才启动服务，管理地址绑定�
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
 | `bridge_ready` | gauge | 与 ready 探针相同的接入状态，1 为可接入，0 为关闭中 |
+| `bridge_runtime_alive_tasks` | gauge | 当前 Tokio 运行时的活动异步任务数，包含采样请求；不等于线程数或单个 Manager 的任务数 |
 | `bridge_resource_occupied{resource}` | gauge | 连接、握手、待接入、开场及会话名额的当前占用 |
 | `bridge_resource_limit{resource}` | gauge | 上述五类名额的配置上限 |
 | `bridge_resource_rejections_total{resource}` | counter | 十类资源拒绝累计次数 |
@@ -125,4 +126,6 @@ rate(bridge_platform_operation_duration_seconds_sum{operation="start"}[5m])
 ```
 
 退出超时后进程会结束，最后一次 counter 增量可能来不及被拉取；退出状态与对应结构化日志仍需由进程托管收集。
-这套指标不提供主机 CPU、RSS、文件描述符或跨进程聚合，主机资源观测由部署环境补充。
+运行时任务数来自 Tokio 稳定 API，多线程读数不是强一致快照；在运行时之外直接调用指标编码函数时不输出此项，不能把缺失当作零。
+同一运行时多个管理器可能重复呈现同一任务数，不应相加。同步阻塞任务、线程数、CPU、RSS 和文件描述符仍由部署环境补充。
+本地 [故障与压测验收](validation.md) 会对隔离子进程采样 RSS、数字 FD 和任务，并检查多轮收尾后的回落。

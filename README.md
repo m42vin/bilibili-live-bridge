@@ -310,6 +310,9 @@ RUST_LOG=info,bilibili_live_bridge=debug,multi_client=debug cargo run --locked -
 
 ## 开发与文档
 
+故障矩阵、进程级信号演练和多轮负载可通过 `./scripts/validate.sh smoke`、`load` 或 `soak` 显式执行。
+验收只连接本地平台桩，输出吞吐、延迟、RSS、任务、FD 与资源回落报告；参数和判据见 [故障验证与压测](docs/validation.md)。
+
 ```sh
 cargo test --locked
 cargo fmt --check
@@ -323,6 +326,7 @@ cargo doc --no-deps --open
 | [架构说明](docs/architecture.md) | 模块边界、会话复用、心跳、事件分发与关闭流程 |
 | [开发指南](docs/development.md) | 开发环境、测试与调试、常见扩展方式和注释维护 |
 | [运维观测](docs/operations.md) | 存活与就绪检查、管理接口、指标口径和采集告警示例 |
+| [故障验证与压测](docs/validation.md) | 可重复的本地故障矩阵、进程终止与重启、负载及资源回落判据 |
 | [编码规范](docs/coding-convention.md) | 代码组织、中文注释、异步边界、测试分离与文档同步 |
 | [下游客户端协议](docs/downstream-protocol.md) | WebSocket 接入、消息封装、心跳、重连和关闭语义 |
 | [`crates/bridge-native/src/config.rs`](crates/bridge-native/src/config.rs) | 环境变量配置与校验 |
